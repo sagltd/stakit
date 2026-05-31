@@ -1,13 +1,11 @@
-//! End-to-end coverage of the v1 garde rule set through `#[derive(Model)]`.
-// `&()` ctx is required by garde's custom-validator signature; the case table is
-// intentionally a slice of `(name, fn)` pairs.
-#![allow(dead_code, clippy::trivially_copy_pass_by_ref, clippy::type_complexity)]
+//! End-to-end coverage of the `#[validate(...)]` rule set through `#[derive(Model)]`.
+#![allow(dead_code, clippy::type_complexity)]
 
-use stakit_model::{Model, garde};
+use stakit_model::{Model, Validate, ValidationError};
 
-fn non_empty(value: &str, _ctx: &()) -> Result<(), garde::Error> {
+fn non_empty(value: &str) -> Result<(), ValidationError> {
     if value.trim().is_empty() {
-        Err(garde::Error::new("must not be blank"))
+        Err(ValidationError::new("non_empty", "must not be blank"))
     } else {
         Ok(())
     }
@@ -15,27 +13,27 @@ fn non_empty(value: &str, _ctx: &()) -> Result<(), garde::Error> {
 
 #[derive(Model)]
 struct Item {
-    #[garde(ascii)]
+    #[validate(ascii)]
     ascii: String,
-    #[garde(alphanumeric)]
+    #[validate(alphanumeric)]
     alnum: String,
-    #[garde(url)]
+    #[validate(url)]
     website: String,
-    #[garde(contains("foo"))]
+    #[validate(contains = "foo")]
     has_foo: String,
-    #[garde(prefix("pre"))]
+    #[validate(prefix = "pre")]
     starts: String,
-    #[garde(suffix("post"))]
+    #[validate(suffix = "post")]
     ends: String,
-    #[garde(pattern("^[0-9]+$"))]
+    #[validate(pattern = "^[0-9]+$")]
     digits: String,
-    #[garde(length(min = 2, max = 4))]
+    #[validate(min_len = 2, max_len = 4)]
     code: String,
-    #[garde(range(min = 1, max = 10))]
+    #[validate(min = 1, max = 10)]
     qty: i32,
-    #[garde(custom(non_empty))]
+    #[validate(custom = non_empty)]
     label: String,
-    #[garde(skip)]
+    #[validate(skip)]
     anything: String,
 }
 
@@ -57,7 +55,7 @@ fn valid() -> Item {
 
 #[test]
 fn fully_valid_item_passes() {
-    assert!(valid().validate_model().is_ok());
+    assert!(valid().validate().is_ok());
 }
 
 #[test]
@@ -77,7 +75,7 @@ fn each_rule_rejects_bad_input() {
     for (field, mutate) in cases {
         let mut item = valid();
         mutate(&mut item);
-        let err = item.validate_model().unwrap_err().to_string();
+        let err = item.validate().unwrap_err().to_string();
         assert!(
             err.contains(field),
             "expected `{field}` in error, got: {err}"
@@ -89,20 +87,20 @@ fn each_rule_rejects_bad_input() {
 fn skip_field_is_never_validated() {
     let mut item = valid();
     item.anything = "literally anything ☃".into();
-    assert!(item.validate_model().is_ok());
+    assert!(item.validate().is_ok());
 }
 
 // --- nested validation via `dive` ---
 
 #[derive(Model)]
 struct Tag {
-    #[garde(length(min = 1))]
+    #[validate(min_len = 1)]
     name: String,
 }
 
 #[derive(Model)]
 struct Post {
-    #[garde(dive)]
+    #[validate(dive)]
     tags: Vec<Tag>,
 }
 
@@ -113,12 +111,14 @@ fn dive_validates_nested_elements() {
             name: "rust".into(),
         }],
     };
-    assert!(ok.validate_model().is_ok());
+    assert!(ok.validate().is_ok());
 
     let bad = Post {
         tags: vec![Tag {
             name: String::new(),
         }],
     };
-    assert!(bad.validate_model().is_err());
+    let err = bad.validate().unwrap_err();
+    // path should point at the nested element + field
+    assert_eq!(err.iter().next().unwrap().path, "tags[0].name", "{err}");
 }

@@ -69,46 +69,59 @@ and emit `export interface`/`export type` blocks once, with fields referencing
 named types by identifier. The derive already knows a type's name and its field
 types, so it can generate `collect` later with no API churn. Not built in v1.
 
-### `Model` + errors
+### `Validate` + `Model` + errors
+
+Validation is **our own**, garde-free, built for speed (see `docs/performance.md`
+— ~62 M validations/sec, ~49× a garde-derive baseline).
+
 ```rust
-pub trait Model: garde::Validate<Context = ()> + TSType {
-    fn validate_model(&self) -> Result<(), ModelError>;
-}
-// blanket impl for everything that is Validate<Context=()> + TSType
+pub trait Validate { fn validate(&self) -> Result<(), ValidationErrors>; }
+pub trait Model: Validate + TSType {}          // blanket-impl umbrella
 ```
-`ModelError` (thiserror) wraps `garde::Report` (whose `Display` prints each
-failing path + message). `garde` is re-exported (`stakit_model::garde`) so
-downstream crates need only depend on `stakit-model`.
+- Rule functions live in `mod validate` (`length`, `range`, `email`, `url`,
+  `pattern`, `ascii`, `alphanumeric`, `contains`, `prefix`, `suffix`). Each is
+  `#[inline]`, returns a single `ValidationError`, and is reusable + `?`-able on
+  its own. The derive calls these exact functions.
+- `ValidationError { path, code, message }`; `ValidationErrors` aggregates **all**
+  failures. Backed by a `Vec` — `Vec::new()` doesn't allocate, so the happy path
+  is allocation-free and the success `Result` stays thin (a `SmallVec` inline
+  buffer measured *slower*, as it bloats every return).
+- **Cascading** `Validate` impls for `Option`, `Vec`, arrays, slices, sets,
+  `HashMap`/`BTreeMap`/`hashbrown`/`indexmap`, and tuples mean `#[validate(dive)]`
+  recurses through arbitrary nesting (`Vec<HashMap<String, Inner>>`), tagging each
+  error with its index/key path (`rows[0][home].n`).
+- `ValidationErrors::field_errors()` returns a `BTreeMap<&str, Vec<&str>>` for a
+  structured per-field view.
 
 ### File layout (no `mod.rs`)
 ```
-src/lib.rs                     # root, re-exports, __private (for derive)
-src/model.rs                   # Model trait + generate_typescript
-src/error.rs                   # ModelError
-src/ts_type.rs                 # TSType trait
-src/ts_type/impl_primitives.rs # scalar impls
-src/ts_type/impl_collections.rs# container / generic impls
+src/lib.rs                     # root, re-exports, prelude
+src/model.rs                   # Model umbrella trait + generate_typescript
+src/ts_type.rs (+ ts_type/)    # TSType trait + impls
+src/validate.rs                # Validate trait + rule re-exports
+src/validate/error.rs          # ValidationError / ValidationErrors
+src/validate/{string,range,email,url,pattern}.rs   # rule fns (+ *_test.rs)
+src/validate/collections.rs    # cascading Validate impls
 benches/validation.rs          # divan benchmarks
-tests/                         # integration + derive tests
+tests/                         # e2e derive tests
 ```
 
 ## `stakit-model-derive`
 
-`#[derive(Model)]` reads **native garde attributes** (`#[garde(...)]`) and emits:
+`#[derive(Model)]` reads flat `#[validate(...)]` attributes and emits:
 
-1. **`impl garde::Validate`** — hand-generated (we do *not* use garde's own
-   derive). Mirrors garde's codegen: destructure `self`, and per field emit
+1. **`impl Validate`** — direct, inlined. Destructure `self`, and per field emit
    ```rust
-   { let mut __p = nested_path!(__p, "field");
-     if let Err(e) = (rules::<rule>::apply)(&*binding, args) { report.append(__p(), e); } }
+   if let Err(e) = validate::length(name, Some(3), Some(20)) { __errors.push(e.at_field("name")); }
    ```
+   collecting **all** failures. `pattern` emits a `LazyLock<Regex>` static
+   (compiled once). `dive` calls `Validate::validate(field)` and prefixes paths.
    Enums: `match self { Self::Variant { .. } => { …field rules… }, Self::Unit => {} }`.
 
-   **v1 rule set:** `skip`, `length(min/max/equal)`, `range(min/max/equal)`,
-   `email`, `url`, `ascii`, `alphanumeric`, `contains/prefix/suffix`,
-   `pattern(regex literal)`, `custom(fn)`, `dive`. Fields with no `#[garde]`
-   attribute default to **skip** (rendered in TS, not validated).
-   Deferred: conditional `if`, custom `context`, `inner`, `transparent`, `ip`.
+   **Rule set (flat, easy DX):** `skip`, `min_len`/`max_len`, `min`/`max`,
+   `email`, `url`, `ascii`, `alphanumeric`, `contains`/`prefix`/`suffix`,
+   `pattern = "regex"`, `custom = fn` (`fn(&T) -> Result<(), ValidationError>`),
+   `dive`. Fields with no `#[validate]` are not validated (still rendered in TS).
 
 2. **`impl TSType`**:
    - **struct** → `export interface Name {\n  field: Ty;\n  opt?: Ty;\n}`.
@@ -120,8 +133,8 @@ tests/                         # integration + derive tests
      `export type UserType = "Normal" | { aha: string };`.
      Tuple variant with one field → the inner type; with N fields → `[a, b, …]`.
 
-Generated code references `stakit-model`'s `__private` re-exports
-(`::stakit_model::__private::…`), so a user crate depends on `stakit-model` only.
+Generated code references `::stakit_model::validate::*` and the `Validate` trait
+by absolute path, so a user crate depends on `stakit-model` only.
 
 ## Quality gates
 

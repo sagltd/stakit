@@ -1,7 +1,7 @@
 //! End-to-end tests for `#[derive(Model)]` on enums.
 #![allow(dead_code)]
 
-use stakit_model::{Model, generate_typescript};
+use stakit_model::{Model, Validate, generate_typescript};
 
 #[derive(Model)]
 enum Status {
@@ -34,5 +34,5 @@ fn data_enum_mixes_literal_and_object() {
 
 #[test]
 fn unit_variant_validates_ok() {
-    assert!(Status::Active.validate_model().is_ok());
+    assert!(Status::Active.validate().is_ok());
 }

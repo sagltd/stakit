@@ -1,7 +1,8 @@
 //! Divan benchmarks for `stakit-model`: validation hot path + TS generation.
+#![allow(dead_code)]
 
 use divan::{Bencher, black_box};
-use stakit_model::{Model, generate_typescript};
+use stakit_model::{Model, Validate, generate_typescript};
 
 fn main() {
     divan::main();
@@ -9,14 +10,13 @@ fn main() {
 
 #[derive(Model)]
 struct User {
-    #[garde(length(min = 3, max = 20))]
+    #[validate(min_len = 3, max_len = 20)]
     name: String,
-    #[garde(email)]
+    #[validate(email)]
     email: String,
-    #[garde(range(min = 18, max = 120))]
+    #[validate(min = 18, max = 120)]
     age: u8,
-    #[garde(url)]
-    website: String,
+    bio: Option<String>,
 }
 
 fn valid_user() -> User {
@@ -24,7 +24,7 @@ fn valid_user() -> User {
         name: "alice".to_owned(),
         email: "alice@example.com".to_owned(),
         age: 30,
-        website: "https://example.com".to_owned(),
+        bio: None,
     }
 }
 
@@ -33,7 +33,7 @@ fn invalid_user() -> User {
         name: "a".to_owned(),
         email: "not-an-email".to_owned(),
         age: 5,
-        website: "nope".to_owned(),
+        bio: None,
     }
 }
 
@@ -42,7 +42,7 @@ fn invalid_user() -> User {
 fn validate_valid(bencher: Bencher<'_, '_>) {
     bencher
         .with_inputs(valid_user)
-        .bench_refs(|user| black_box(user.validate_model().is_ok()));
+        .bench_refs(|user| black_box(user.validate().is_ok()));
 }
 
 /// Validating a struct that fails every rule (error aggregation path).
@@ -50,7 +50,7 @@ fn validate_valid(bencher: Bencher<'_, '_>) {
 fn validate_invalid(bencher: Bencher<'_, '_>) {
     bencher
         .with_inputs(invalid_user)
-        .bench_refs(|user| black_box(user.validate_model().is_err()));
+        .bench_refs(|user| black_box(user.validate().is_err()));
 }
 
 /// Generating the TypeScript interface for a model.

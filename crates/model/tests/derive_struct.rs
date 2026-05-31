@@ -1,15 +1,15 @@
 //! End-to-end tests for `#[derive(Model)]` on structs.
 #![allow(dead_code)]
 
-use stakit_model::{Model, generate_typescript};
+use stakit_model::{Model, Validate, generate_typescript};
 
 #[derive(Model)]
 struct User {
-    #[garde(length(min = 3, max = 20))]
+    #[validate(min_len = 3, max_len = 20)]
     name: String,
-    #[garde(email)]
+    #[validate(email)]
     email: String,
-    #[garde(range(min = 18))]
+    #[validate(min = 18)]
     age: u8,
     bio: Option<String>,
 }
@@ -32,7 +32,7 @@ fn valid_user_passes_validation() {
         age: 20,
         bio: None,
     };
-    assert!(user.validate_model().is_ok());
+    assert!(user.validate().is_ok());
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn short_name_fails_validation() {
         age: 20,
         bio: None,
     };
-    let err = user.validate_model().unwrap_err();
+    let err = user.validate().unwrap_err();
     assert!(err.to_string().contains("name"), "{err}");
 }
 
@@ -55,7 +55,7 @@ fn bad_email_fails_validation() {
         age: 20,
         bio: None,
     };
-    let err = user.validate_model().unwrap_err();
+    let err = user.validate().unwrap_err();
     assert!(err.to_string().contains("email"), "{err}");
 }
 
@@ -67,6 +67,22 @@ fn underage_fails_validation() {
         age: 5,
         bio: None,
     };
-    let err = user.validate_model().unwrap_err();
+    let err = user.validate().unwrap_err();
     assert!(err.to_string().contains("age"), "{err}");
+}
+
+#[test]
+fn multiple_failures_are_all_collected() {
+    let user = User {
+        name: "x".into(),
+        email: "nope".into(),
+        age: 5,
+        bio: None,
+    };
+    let err = user.validate().unwrap_err();
+    assert_eq!(err.len(), 3, "{err}");
+    let fields = err.field_errors();
+    assert!(fields.contains_key("name"));
+    assert!(fields.contains_key("email"));
+    assert!(fields.contains_key("age"));
 }

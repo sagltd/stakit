@@ -1,28 +1,15 @@
 //! The [`Model`] trait and the [`generate_typescript`] entrypoint.
 
-use crate::{ModelError, TSType};
+use crate::{TSType, Validate};
 
-/// A type that can be validated and exported to TypeScript.
+/// A validatable, TypeScript-exportable type.
 ///
-/// Blanket-implemented for everything that is both [`garde::Validate`] (with the
-/// unit context) and [`TSType`] — which `#[derive(Model)]` provides.
-pub trait Model: garde::Validate<Context = ()> + TSType {
-    /// Validates `self`, mapping any failure to [`ModelError`].
-    ///
-    /// # Errors
-    /// Returns [`ModelError::Invalid`] if any `#[garde(...)]` rule fails; the
-    /// error aggregates every failing field.
-    fn validate_model(&self) -> Result<(), ModelError>;
-}
+/// Blanket-implemented for everything that is both [`Validate`] and [`TSType`]
+/// — which `#[derive(Model)]` provides. Use it as a single bound (`T: Model`)
+/// when you need both capabilities.
+pub trait Model: Validate + TSType {}
 
-impl<T> Model for T
-where
-    T: garde::Validate<Context = ()> + TSType,
-{
-    fn validate_model(&self) -> Result<(), ModelError> {
-        self.validate().map_err(ModelError::from)
-    }
-}
+impl<T: Validate + TSType> Model for T {}
 
 /// Generates the TypeScript definition for model `M`.
 ///

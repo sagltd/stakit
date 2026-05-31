@@ -9,10 +9,9 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-garde.workspace = true
-thiserror.workspace = true
 hashbrown.workspace = true
 indexmap.workspace = true
+regex.workspace = true
 stakit-model-derive.workspace = true
 
 [dev-dependencies]

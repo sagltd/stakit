@@ -1,25 +1,24 @@
 //! Parsed intermediate representation of a `#[derive(Model)]` input.
 
 use quote::format_ident;
-use syn::meta::ParseNestedMeta;
 use syn::{Attribute, Data, DeriveInput, Expr, Fields, Ident, LitStr, Type};
 
-/// A single garde validation rule attached to a field.
+/// A single validation rule attached to a field.
 pub(crate) enum Rule {
     Email,
     Url,
     Ascii,
     Alphanumeric,
     Dive,
+    /// Character-count length (`min_len` / `max_len`).
     Length {
         min: Option<Expr>,
         max: Option<Expr>,
-        equal: Option<Expr>,
     },
+    /// Numeric range (`min` / `max`).
     Range {
         min: Option<Expr>,
         max: Option<Expr>,
-        equal: Option<Expr>,
     },
     Contains(Expr),
     Prefix(Expr),
@@ -121,11 +120,14 @@ fn parse_fields(fields: &Fields) -> syn::Result<Body> {
     }
 }
 
+/// Parses the flat `#[validate(...)]` attributes on a field.
 fn parse_rules(attrs: &[Attribute]) -> syn::Result<(Vec<Rule>, bool)> {
     let mut rules = Vec::new();
     let mut skip = false;
+    let (mut min_len, mut max_len, mut min, mut max) = (None, None, None, None);
+
     for attr in attrs {
-        if !attr.path().is_ident("garde") {
+        if !attr.path().is_ident("validate") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
@@ -141,58 +143,31 @@ fn parse_rules(attrs: &[Attribute]) -> syn::Result<(Vec<Rule>, bool)> {
                 "ascii" => rules.push(Rule::Ascii),
                 "alphanumeric" => rules.push(Rule::Alphanumeric),
                 "dive" => rules.push(Rule::Dive),
-                "length" => {
-                    let (min, max, equal) = parse_bounds(&meta)?;
-                    rules.push(Rule::Length { min, max, equal });
-                }
-                "range" => {
-                    let (min, max, equal) = parse_bounds(&meta)?;
-                    rules.push(Rule::Range { min, max, equal });
-                }
-                "contains" => rules.push(Rule::Contains(parse_paren_expr(&meta)?)),
-                "prefix" => rules.push(Rule::Prefix(parse_paren_expr(&meta)?)),
-                "suffix" => rules.push(Rule::Suffix(parse_paren_expr(&meta)?)),
-                "pattern" => rules.push(Rule::Pattern(parse_paren_litstr(&meta)?)),
-                "custom" => rules.push(Rule::Custom(parse_paren_expr(&meta)?)),
+                "min_len" => min_len = Some(meta.value()?.parse()?),
+                "max_len" => max_len = Some(meta.value()?.parse()?),
+                "min" => min = Some(meta.value()?.parse()?),
+                "max" => max = Some(meta.value()?.parse()?),
+                "contains" => rules.push(Rule::Contains(meta.value()?.parse()?)),
+                "prefix" => rules.push(Rule::Prefix(meta.value()?.parse()?)),
+                "suffix" => rules.push(Rule::Suffix(meta.value()?.parse()?)),
+                "pattern" => rules.push(Rule::Pattern(meta.value()?.parse()?)),
+                "custom" => rules.push(Rule::Custom(meta.value()?.parse()?)),
                 other => {
-                    return Err(meta.error(format!(
-                        "unsupported garde rule `{other}` in stakit-model v1"
-                    )));
+                    return Err(meta.error(format!("unsupported `#[validate]` rule `{other}`")));
                 }
             }
             Ok(())
         })?;
     }
+
+    if min_len.is_some() || max_len.is_some() {
+        rules.push(Rule::Length {
+            min: min_len,
+            max: max_len,
+        });
+    }
+    if min.is_some() || max.is_some() {
+        rules.push(Rule::Range { min, max });
+    }
     Ok((rules, skip))
-}
-
-fn parse_bounds(
-    meta: &ParseNestedMeta<'_>,
-) -> syn::Result<(Option<Expr>, Option<Expr>, Option<Expr>)> {
-    let (mut min, mut max, mut equal) = (None, None, None);
-    meta.parse_nested_meta(|m| {
-        if m.path.is_ident("min") {
-            min = Some(m.value()?.parse()?);
-        } else if m.path.is_ident("max") {
-            max = Some(m.value()?.parse()?);
-        } else if m.path.is_ident("equal") {
-            equal = Some(m.value()?.parse()?);
-        } else {
-            return Err(m.error("expected `min`, `max`, or `equal`"));
-        }
-        Ok(())
-    })?;
-    Ok((min, max, equal))
-}
-
-fn parse_paren_expr(meta: &ParseNestedMeta<'_>) -> syn::Result<Expr> {
-    let content;
-    syn::parenthesized!(content in meta.input);
-    content.parse()
-}
-
-fn parse_paren_litstr(meta: &ParseNestedMeta<'_>) -> syn::Result<LitStr> {
-    let content;
-    syn::parenthesized!(content in meta.input);
-    content.parse()
 }
