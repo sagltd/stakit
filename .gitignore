@@ -1,0 +1,61 @@
+target/
+node_modules/
+
+
+# dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# bun
+bun.lock
+.bun/
+
+# build output
+dist/
+build/
+out/
+*.tsbuildinfo
+.turbo/
+
+# test / coverage
+coverage/
+*.lcov
+.vitest/
+.nyc_output/
+
+# caches
+.cache/
+.eslintcache
+.prettiercache
+
+# env
+.env
+.env.*
+!.env.example
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# expo / react-native (future apps)
+.expo/
+.expo-shared/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+web-build/
+
+# misc
+*.tgz
+.tmp/
