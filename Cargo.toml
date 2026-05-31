@@ -16,6 +16,11 @@ hashbrown = "0.17"
 indexmap = "2.14"
 thiserror = "2.0"
 regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+async-stream = "0.3"
+tokio = { version = "1", default-features = false }
 # Proc-macro toolchain (model-derive)
 syn = { version = "2.0", features = ["full", "extra-traits"] }
 quote = "1.0"
@@ -25,6 +30,8 @@ divan = "0.1"
 # Internal crates
 stakit-model = { path = "crates/model", version = "0.1.0" }
 stakit-model-derive = { path = "crates/model-derive", version = "0.1.0" }
+stakit-router = { path = "crates/router", version = "0.1.0" }
+stakit-router-derive = { path = "crates/router-derive", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -42,6 +49,9 @@ must_use_candidate = "allow"
 # Conflicts with the `unreachable_pub` rust lint (which we enable); that lint
 # wants `pub(crate)` for items in private modules, this one wants bare `pub`.
 redundant_pub_crate = "allow"
+# Noisy nursery lint: not every future needs to be `Send` (the router's erasure
+# layer enforces `Send` where it actually matters).
+future_not_send = "allow"
 
 [profile.dev]
 opt-level = 0

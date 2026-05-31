@@ -2,6 +2,13 @@
 
 use crate::TSType;
 
+/// The unit type maps to TypeScript `null` (used for param-less actions).
+impl TSType for () {
+    fn to_ts() -> String {
+        String::from("null")
+    }
+}
+
 macro_rules! ts_scalar {
     ($($t:ty => $name:literal),* $(,)?) => {
         $(

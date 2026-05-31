@@ -1,0 +1,32 @@
+[package]
+name = "stakit-router"
+description = "Framework-agnostic action router: validation, routing, action-to-action calls, and TypeScript generation."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+stakit-model.workspace = true
+stakit-router-derive.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+divan.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+
+[[bench]]
+name = "dispatch"
+harness = false
+
+[lints]
+workspace = true

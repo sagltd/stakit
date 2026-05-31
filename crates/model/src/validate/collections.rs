@@ -25,6 +25,12 @@ impl<T: Validate + ?Sized> Validate for Box<T> {
     }
 }
 
+impl Validate for () {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        Ok(())
+    }
+}
+
 impl<T: Validate> Validate for Option<T> {
     fn validate(&self) -> Result<(), ValidationErrors> {
         self.as_ref().map_or(Ok(()), Validate::validate)

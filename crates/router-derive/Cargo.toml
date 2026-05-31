@@ -1,5 +1,6 @@
 [package]
-name = "stakit"
+name = "stakit-router-derive"
+description = "The `#[action]` attribute macro for stakit-router."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -7,9 +8,13 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[lib]
+proc-macro = true
+
 [dependencies]
-stakit-model.workspace = true
-stakit-router.workspace = true
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true
 
 [lints]
 workspace = true
