@@ -353,8 +353,12 @@ async fn duplex_streams_over_websocket() {
 #[test]
 fn generates_typescript() {
     let ts = router().generate_ts();
-    assert!(ts.contains("export type greetParams = "), "{ts}");
-    assert!(ts.contains("export type greetResult = "), "{ts}");
+    // valid TS: deduped interface declarations + an action index
+    assert!(ts.contains("export interface Greet {"), "{ts}");
+    assert!(ts.contains("export interface Greeting {"), "{ts}");
     assert!(ts.contains("message: string"), "{ts}");
-    assert!(ts.contains("export type countItem = number"), "{ts}");
+    assert!(ts.contains("//   greet: Greet => Greeting"), "{ts}");
+    assert!(ts.contains("//   count: Count => stream<number>"), "{ts}");
+    // no malformed `export type X = export interface …`
+    assert!(!ts.contains("= export interface"), "{ts}");
 }

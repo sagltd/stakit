@@ -62,7 +62,7 @@ where
         req: R,
         action: &str,
         params: Value,
-    ) -> impl Stream<Item = Frame> + 'static {
+    ) -> impl Stream<Item = Frame> + use<G, R> {
         let app = Arc::clone(&self.app);
         let handler = self.streams.get(action).cloned();
         let name = action.to_owned();

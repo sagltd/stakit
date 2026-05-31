@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["examples/axum-server"]
 resolver = "3"
 
 [workspace.package]
