@@ -1,0 +1,26 @@
+[package]
+name = "stakit-model"
+description = "Derive-based validation + TypeScript type export. Inspired by ggtype."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+garde.workspace = true
+thiserror.workspace = true
+hashbrown.workspace = true
+indexmap.workspace = true
+stakit-model-derive.workspace = true
+
+[dev-dependencies]
+divan.workspace = true
+
+[[bench]]
+name = "validation"
+harness = false
+
+[lints]
+workspace = true
