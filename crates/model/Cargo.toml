@@ -12,11 +12,15 @@ rust-version.workspace = true
 hashbrown.workspace = true
 indexmap.workspace = true
 regex.workspace = true
+serde_json = { workspace = true, optional = true }
 stakit-model-derive.workspace = true
 
 [features]
 # camelCase TypeScript field names + validation paths (snake_case Rust structs).
 camel = ["stakit-model-derive/camel"]
+# JSON Schema export via `#[derive(JsonSchema)]` + the `JsonSchema` trait.
+# Opt-in (pulls `serde_json`): only tool-argument types need it.
+schema = ["dep:serde_json", "stakit-model-derive/schema"]
 
 [dev-dependencies]
 divan.workspace = true

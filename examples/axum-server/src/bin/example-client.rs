@@ -3,7 +3,9 @@
 //! Start the server first (`cargo run --bin axum-server-example`), then:
 //!   cargo run --bin example-client
 
-use axum_server_example::{Count, Greet, SaveImage, count, greet, progress, save_image};
+use axum_server_example::{
+    Count, Greet, Greeting, SaveImage, count, greet, progress, save_image, version,
+};
 use futures::StreamExt as _;
 use stakit_client::{CallOpts, Client, ServerFrame};
 
@@ -30,32 +32,22 @@ async fn main() {
         .unwrap();
     println!("  greet(\"\") -> error {:?}", r.error());
 
-    println!("== HTTP: MANY actions in ONE request (heterogeneous) ==");
-    let out = client
-        .fetch_raw(
-            serde_json::json!({ "greet": { "name": "alice", "userId": 1 }, "version": null }),
-            CallOpts::new(),
-        )
+    println!("== HTTP: fetch MANY actions in ONE request (typed batch) ==");
+    let results = client
+        .batch()
+        .add(greet, Greet { name: "alice".to_owned(), user_id: Some(1) })
+        .add(greet, Greet { name: "bob".to_owned(), user_id: None })
+        .add(version, ())
+        .send()
         .await
         .unwrap();
-    println!("  greet   -> {}", out["greet"]["data"]["message"]);
-    println!("  version -> {}", out["version"]["data"]);
-
-    println!("== HTTP: MANY (ordered array, duplicates allowed) ==");
-    let out = client
-        .fetch_raw(
-            serde_json::json!([
-                ["greet", { "name": "a" }],
-                ["greet", { "name": "b" }],
-                ["version", null]
-            ]),
-            CallOpts::new(),
-        )
-        .await
-        .unwrap();
-    println!("  [0] -> {}", out[0]["data"]["message"]);
-    println!("  [1] -> {}", out[1]["data"]["message"]);
-    println!("  [2] -> {}", out[2]["data"]);
+    println!("  {} results in one round-trip:", results.len());
+    let g0 = results.get::<Greeting>(0).unwrap();
+    let g1 = results.get::<Greeting>(1).unwrap();
+    let ver = results.get::<String>(2).unwrap();
+    println!("  [0] greet   -> {:?}", g0.data().map(|g| g.message.as_str()));
+    println!("  [1] greet   -> {:?}", g1.data().map(|g| g.message.as_str()));
+    println!("  [2] version -> {:?}", ver.data());
 
     println!("== HTTP files: save_image (multipart) ==");
     let r = client

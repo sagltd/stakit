@@ -1,5 +1,8 @@
 //! WebSocket / duplex transport.
 
+use std::sync::{Arc, Once};
+use std::time::Duration;
+
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt as _, StreamExt as _};
 use serde::Serialize;
@@ -8,7 +11,9 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+};
 
 use stakit_router::{Endpoint, ErrorBody};
 
@@ -18,6 +23,19 @@ use crate::options::CallOpts;
 use crate::result::ActionResult;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// How long the `wss`/`ws` handshake may take before giving up.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Installs the process-wide rustls crypto provider once, so `wss://` works.
+/// Matches reqwest's backend (aws-lc-rs), so a single provider serves both; the
+/// call is a no-op if something already installed one.
+fn ensure_crypto_provider() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
 
 /// A live duplex websocket connection.
 ///
@@ -65,6 +83,7 @@ impl Client {
     /// # Errors
     /// Returns `Err` if the handshake fails.
     pub async fn connect(&self, opts: CallOpts) -> Result<Connection, TransportError> {
+        ensure_crypto_provider();
         let url = opts
             .url
             .as_deref()
@@ -85,8 +104,19 @@ impl Client {
             }
         }
 
-        let (socket, _response) = connect_async(request)
+        // `None` connector → tokio-tungstenite builds the default rustls (webpki
+        // roots) connector for `wss://`; `Some` overrides it to skip verification.
+        let connector = if self.accept_invalid_certs() {
+            Some(Connector::Rustls(Arc::new(no_verify_config())))
+        } else {
+            None
+        };
+
+        // Bound the handshake (TLS + upgrade) so a black-holed host can't hang us.
+        let connecting = connect_async_tls_with_config(request, None, false, connector);
+        let (socket, _response) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
             .await
+            .map_err(|_| TransportError::WebSocket("websocket handshake timed out".to_owned()))?
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
         let (sink, stream) = socket.split();
         Ok(Connection {
@@ -144,11 +174,26 @@ impl Connection {
             match self.stream.next().await? {
                 Ok(Message::Text(text)) => return Some(parse_frame(text.as_bytes())),
                 Ok(Message::Binary(bytes)) => return Some(parse_frame(bytes.as_ref())),
+                // Keepalive: answer server pings (the split sink isn't auto-ponged).
+                Ok(Message::Ping(payload)) => {
+                    let _ = self.sink.send(Message::Pong(payload)).await;
+                }
+                Ok(Message::Pong(_) | Message::Frame(_)) => {}
                 Ok(Message::Close(_)) => return None,
-                Ok(_) => {}
                 Err(error) => return Some(Err(TransportError::WebSocket(error.to_string()))),
             }
         }
+    }
+
+    /// Sends a ping (client-initiated keepalive / liveness probe).
+    ///
+    /// # Errors
+    /// Returns `Err` if the ping cannot be sent.
+    pub async fn ping(&mut self) -> Result<(), TransportError> {
+        self.sink
+            .send(Message::Ping(Vec::new().into()))
+            .await
+            .map_err(|e| TransportError::WebSocket(e.to_string()))
     }
 
     /// Closes the connection.
@@ -217,4 +262,56 @@ fn to_ws_url(url: &str) -> String {
         }
     }
     url.to_owned()
+}
+
+/// Builds a rustls client config that skips certificate verification (used only
+/// when [`Builder::danger_accept_invalid_certs`](crate::Builder::danger_accept_invalid_certs)
+/// is set — trusted internal networks).
+fn no_verify_config() -> rustls::ClientConfig {
+    rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertVerification))
+        .with_no_client_auth()
+}
+
+/// A `ServerCertVerifier` that accepts any certificate. Deliberately insecure;
+/// gated behind the explicit `danger_accept_invalid_certs` opt-in.
+#[derive(Debug)]
+struct NoCertVerification;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }

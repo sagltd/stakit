@@ -484,6 +484,55 @@ async fn set_headers_replace_and_update() {
     assert_eq!(updated.data().unwrap().message, "updated");
 }
 
+#[tokio::test] // 14: many actions in one request (typed batch)
+async fn batch_runs_multiple_actions_in_one_request() {
+    let client = client_for(&spawn_server("A").await);
+    let results = client
+        .batch()
+        .add(
+            greet,
+            Greet {
+                name: "a".to_owned(),
+            },
+        )
+        .add(
+            greet,
+            Greet {
+                name: "b".to_owned(),
+            },
+        )
+        .add(whoami, ())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results.get::<Greeting>(0).unwrap().data().unwrap().message,
+        "hello a from A"
+    );
+    assert_eq!(
+        results.get::<Greeting>(1).unwrap().data().unwrap().message,
+        "hello b from A"
+    );
+    // whoami echoes the base `authorization` header ("root").
+    assert_eq!(
+        results.get::<Greeting>(2).unwrap().data().unwrap().message,
+        "root"
+    );
+}
+
+#[tokio::test] // 15: real wss:// TLS handshake against a public echo server
+#[ignore = "network: connects to a public wss echo server"]
+async fn wss_tls_handshake_works() {
+    let client = Client::new("https://unused.invalid");
+    let conn = client
+        .connect(CallOpts::new().url("wss://echo.websocket.events"))
+        .await;
+    assert!(conn.is_ok(), "wss handshake failed: {:?}", conn.err());
+    conn.unwrap().close().await.ok();
+}
+
 #[tokio::test] // 13
 async fn transport_failure_is_err() {
     // Port 1 refuses connections.

@@ -219,19 +219,26 @@ where
     }
 }
 
-/// Parses an array payload `[["action", params], …]` into ordered entries,
-/// skipping any malformed element.
+/// Parses an array payload `[["action", params], …]` into ordered entries.
+///
+/// Every input element maps to exactly one output entry, so the response array
+/// stays index-aligned with the request. A malformed element (not a
+/// `[string, value]` pair) becomes an empty action name, which dispatches to a
+/// `404` error envelope in that slot rather than silently vanishing.
 fn parse_array(items: Vec<Value>) -> Vec<(String, Value)> {
     items
         .into_iter()
-        .filter_map(|element| {
+        .map(|element| {
             let Value::Array(pair) = element else {
-                return None;
+                return (String::new(), Value::Null);
             };
             let mut pair = pair.into_iter();
-            let action = pair.next()?.as_str()?.to_owned();
+            let action = pair
+                .next()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default();
             let params = pair.next().unwrap_or(Value::Null);
-            Some((action, params))
+            (action, params)
         })
         .collect()
 }

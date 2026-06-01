@@ -34,7 +34,7 @@ mod result;
 mod stream;
 mod ws;
 
-pub use client::{Builder, Client};
+pub use client::{Batch, BatchResults, Builder, Client};
 pub use error::TransportError;
 pub use options::{CallOpts, Method};
 pub use result::ActionResult;

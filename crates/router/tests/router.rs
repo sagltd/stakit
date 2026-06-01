@@ -231,6 +231,20 @@ fn array_payload_preserves_order_and_allows_duplicates() {
     assert_eq!(array[2]["data"], json!("pong"));
 }
 
+#[test]
+fn array_payload_keeps_index_alignment_on_malformed_entries() {
+    let out = block_on(router().on_request(
+        Auth { admin: true },
+        json!([["greet", { "name": "a" }], "garbage", ["ping", null]]),
+    ));
+    let array = out.as_array().expect("array response");
+    // every input element maps to exactly one output slot (no index shift)
+    assert_eq!(array.len(), 3);
+    assert_eq!(array[0]["data"]["message"], "Hello, a!");
+    assert_eq!(array[1]["status"], "error"); // malformed → error envelope, slot kept
+    assert_eq!(array[2]["data"], json!("pong"));
+}
+
 // Mirrors how you'd wire this into axum: the router lives in shared state; one
 // HTTP handler extracts the request ctx + decoded payload, calls `on_request`,
 // and serializes the response. The action name is *in the payload*, not the URL.

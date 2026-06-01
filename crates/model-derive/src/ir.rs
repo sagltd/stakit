@@ -62,6 +62,11 @@ pub(crate) struct Field {
     pub(crate) ty: Type,
     pub(crate) rules: Vec<Rule>,
     pub(crate) skip: bool,
+    /// Field description for JSON Schema, from `///` doc-comments (joined) or an
+    /// explicit `#[arg(description = "…")]` override. `None` if undocumented.
+    /// Only read by the JSON Schema emitter (the `schema` feature).
+    #[cfg_attr(not(feature = "schema"), allow(dead_code))]
+    pub(crate) description: Option<String>,
 }
 
 /// Shape of a struct or of an enum variant's payload.
@@ -124,6 +129,7 @@ fn parse_fields(fields: &Fields) -> syn::Result<Body> {
                     ty: f.ty.clone(),
                     rules,
                     skip,
+                    description: parse_description(&f.attrs)?,
                 });
             }
             Ok(Body::Named(out))
@@ -138,6 +144,7 @@ fn parse_fields(fields: &Fields) -> syn::Result<Body> {
                     ty: f.ty.clone(),
                     rules,
                     skip,
+                    description: parse_description(&f.attrs)?,
                 });
             }
             Ok(Body::Tuple(out))
@@ -195,4 +202,46 @@ fn parse_rules(attrs: &[Attribute]) -> syn::Result<(Vec<Rule>, bool)> {
         rules.push(Rule::Range { min, max });
     }
     Ok((rules, skip))
+}
+
+/// Collects a field description for JSON Schema: an explicit
+/// `#[arg(description = "…")]` wins; otherwise `///` doc-comments are trimmed
+/// per line and joined with newlines. Returns `None` when neither is present.
+fn parse_description(attrs: &[Attribute]) -> syn::Result<Option<String>> {
+    for attr in attrs {
+        if !attr.path().is_ident("arg") {
+            continue;
+        }
+        let mut desc = None;
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("description") {
+                let lit: LitStr = meta.value()?.parse()?;
+                desc = Some(lit.value());
+                Ok(())
+            } else {
+                Err(meta.error("unsupported `#[arg]` key (expected `description`)"))
+            }
+        })?;
+        if desc.is_some() {
+            return Ok(desc);
+        }
+    }
+
+    let mut lines = Vec::new();
+    for attr in attrs {
+        if !attr.path().is_ident("doc") {
+            continue;
+        }
+        if let syn::Meta::NameValue(nv) = &attr.meta {
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) = &nv.value
+            {
+                lines.push(s.value().trim().to_owned());
+            }
+        }
+    }
+    let joined = lines.join("\n").trim().to_owned();
+    Ok((!joined.is_empty()).then_some(joined))
 }

@@ -15,13 +15,17 @@ use crate::client::ClientHandle;
 use crate::reply::ErrorBody;
 use crate::{Cx, Error, Router};
 
+/// Outbound-frame buffer per connection. Bounds memory and applies backpressure
+/// to action execution when a client drains its socket slowly.
+const OUTGOING_BUFFER: usize = 1024;
+
 /// A live duplex session over one connection.
 pub struct Session<G, R> {
     router: Arc<Router<G, R>>,
     req: R,
     client: ClientHandle,
-    out_tx: mpsc::UnboundedSender<Value>,
-    out_rx: Option<mpsc::UnboundedReceiver<Value>>,
+    out_tx: mpsc::Sender<Value>,
+    out_rx: Option<mpsc::Receiver<Value>>,
 }
 
 impl<G, R> Session<G, R>
@@ -30,7 +34,7 @@ where
     R: Clone + Send + Sync + 'static,
 {
     pub(crate) fn new(router: Arc<Router<G, R>>, req: R) -> Self {
-        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::channel(OUTGOING_BUFFER);
         let client = ClientHandle::connected(out_tx.clone());
         Self {
             router,
@@ -45,7 +49,7 @@ where
     ///
     /// # Panics
     /// Panics if called more than once.
-    pub const fn outgoing(&mut self) -> mpsc::UnboundedReceiver<Value> {
+    pub const fn outgoing(&mut self) -> mpsc::Receiver<Value> {
         self.out_rx.take().expect("Session::outgoing already taken")
     }
 
@@ -84,25 +88,28 @@ where
             let cx = Cx { app, req, client };
             if let Some(action) = action {
                 let result = action.dispatch(&cx, params).await;
-                let _ = tx.send(result_frame(id, result));
+                let _ = tx.send(result_frame(id, result)).await;
             } else if let Some(stream) = stream {
                 match stream.dispatch(&cx, params) {
                     Err(error) => {
-                        let _ = tx.send(result_frame(id, Err(error)));
+                        let _ = tx.send(result_frame(id, Err(error))).await;
                     }
                     Ok(mut items) => {
                         while let Some(item) = items.next().await {
                             let is_err = item.is_err();
-                            let _ = tx.send(result_frame(id, item));
-                            if is_err {
+                            // Bounded send: applies backpressure to a slow client;
+                            // errors only once the receiver (socket) is gone.
+                            if tx.send(result_frame(id, item)).await.is_err() || is_err {
                                 return;
                             }
                         }
-                        let _ = tx.send(json!({ "kind": "end", "id": id }));
+                        let _ = tx.send(json!({ "kind": "end", "id": id })).await;
                     }
                 }
             } else {
-                let _ = tx.send(result_frame(id, Err(Error::not_found(&name))));
+                let _ = tx
+                    .send(result_frame(id, Err(Error::not_found(&name))))
+                    .await;
             }
         });
     }

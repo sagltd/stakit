@@ -15,6 +15,9 @@ proc-macro = true
 # Emit camelCase field names in generated TypeScript + validation paths
 # (pairs with serde `#[serde(rename_all = "camelCase")]`).
 camel = []
+# Enable the `#[derive(JsonSchema)]` macro (JSON Schema emitter). Opt-in: only
+# tool-argument types need it, so plain validation/TS users don't pay for it.
+schema = []
 
 [dependencies]
 syn.workspace = true

@@ -1,0 +1,43 @@
+[package]
+name = "stakit-ai-sdk"
+description = "Provider-agnostic primitives for building LLM agents: providers, tools, an injectable agent loop, MCP, skills, usage/cost telemetry."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+bytes.workspace = true
+indexmap.workspace = true
+hashbrown = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "fs"] }
+reqwest = { workspace = true, optional = true }
+stakit-model = { workspace = true, features = ["schema"] }
+stakit-ai-sdk-derive.workspace = true
+
+[features]
+default = ["claude", "openai"]
+# Built-in Anthropic Claude provider.
+claude = ["dep:reqwest"]
+# Built-in OpenAI provider (Responses + Chat Completions).
+openai = ["dep:reqwest"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+dotenvy.workspace = true
+
+[[example]]
+name = "chat"
+
+[[example]]
+name = "weather_agent"
+
+[lints]
+workspace = true

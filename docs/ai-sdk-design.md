@@ -525,4 +525,62 @@ pub enum AiError { Provider(ProviderError), Tool(ToolError), Schema(/* validatio
 10. `examples/` incl. a stakit-router integration showing client-tools via `Ctx`.
 
 Quality gate every step: `./code-check.sh` (fmt + clippy -D warnings + build + nextest + doctests).
+
+---
+
+## 17. Implementation status (built + verified)
+
+All layers below are implemented in `crates/ai-sdk` (+ `crates/ai-sdk-derive`,
+`crates/model` JSON Schema) and pass the full gate (`./code-check.sh`: rustfmt,
+clippy `pedantic`+`nursery` `-D warnings`, build, nextest, doctests) with
+**no `unsafe`** (forbidden workspace-wide). ~50 unit/integration tests, plus a
+live e2e suite that passes against **real Claude + OpenAI**.
+
+| Layer | Module(s) | Status |
+|---|---|---|
+| JSON Schema | `model::json_schema`, `model-derive::emit_jsonschema` | ✅ `#[derive(JsonSchema)]`, `///`+`#[arg]` docs |
+| Core types | `message`, `usage`, `cache`, `error` | ✅ unified model, `Usage`/`Pricing`, `CacheStrategy` |
+| Providers | `provider`, `provider::claude`, `provider::openai` | ✅ Claude + OpenAI: complete + streaming SSE, whole-`ToolCall` accumulation, usage/cost |
+| Tools + macro | `tool`, `ai-sdk-derive` | ✅ `Tool`/`ToolDyn`/`TypedTool`/`ToolRegistry`/`ToolSet`, `#[tool]` (4 sig shapes) |
+| Agent loop | `agent`, `loop_event`, `cancel`, `cx` | ✅ event stream, `can_use_tool`→`on_ask`, `CancelToken`, `prepare_step`, `run_with_input` injection, per-step usage/cost, `stop_when` |
+| Tool search | `tool` (deferred + search) + loop | ✅ `register_deferred`, built-in `tool_search` |
+| Context loaders | `context` | ✅ `ContextLoader` (multi-source), `FsContextLoader` |
+| Skills | `skill` + loop | ✅ `SkillLoader`/`FsSkillLoader`, frontmatter parse, progressive disclosure, `load_skill`/`search_skills` |
+| MCP | `mcp` | ✅ config parse + `${VAR}` expansion, `McpTransport` trait, `McpToolSet` (client-mode, namespaced) |
+| Parallel tools | `agent` loop | ✅ concurrent `join_all` (default; deterministic barrier test) |
+| Reasoning | `provider` `ThinkingConfig` / `extra` | ✅ Claude `thinking` budget; OpenAI `reasoning_effort` via `extra` |
+| Examples + e2e | `examples/`, `tests/e2e.rs` | ✅ `chat` + `weather_agent`; live e2e (`#[ignore]`) — see matrix |
+
+### Live e2e coverage (both providers unless noted)
+
+`e2e_claude_all` + `e2e_openai_all` each assert, against the real API: tool
+round-trip, **multi-step agentic loop**, **parallel tool calls**, **skill
+loading** (`load_skill`), **prompt injection** (`run_with_input`), and **tool
+approval** (`can_use_tool` deny → error result). **Both** providers also have
+live **prompt caching** (`cache_read_tokens > 0` on the 2nd call — Anthropic
+explicit breakpoint, OpenAI automatic) and **streaming** text-delta tests.
+Parallel-execution concurrency is additionally proven offline with a barrier
+deadlock test.
+
+### Deltas from the sketch (all deliberate)
+
+- **`ContextLoader`** added (multi-source context loading: file/DB/HTTP/RAG),
+  merged into system + seed history before the loop. Same loader pattern as skills.
+- **`TypedTool<T>` wrapper** instead of a blanket `impl ToolDyn for T: Tool` —
+  Rust coherence forbids the blanket alongside concrete `ToolDyn` impls (MCP).
+  `register()` wraps automatically.
+- **MCP** is a `McpTransport` trait + adapter (client-mode, any transport plugs
+  in: `rmcp`, custom). The concrete `rmcp`-backed transport + MCP `Native`
+  passthrough are the remaining follow-up (gated behind a future `mcp` feature);
+  config parsing, namespacing and tool-wrapping are done and tested.
+- **`schema` is opt-in** on `model`/`model-derive` (pulls `serde_json`) so plain
+  validation/TS users don't pay for it; ai-sdk enables it.
+
+### Running
+
+```bash
+./code-check.sh                                              # full offline gate
+cargo nextest run -p stakit-ai-sdk --run-ignored all -E 'test(e2e)'   # live e2e (.env keys)
+cargo run -p stakit-ai-sdk --example weather_agent          # live demo (from repo root)
+```
 ```

@@ -8,6 +8,8 @@
 //! See the `stakit-model` crate docs and `docs/architecture.md` for the
 //! supported rule set and the generated TypeScript shapes.
 
+#[cfg(feature = "schema")]
+mod emit_jsonschema;
 mod emit_ts;
 mod emit_validate;
 mod ir;
@@ -22,6 +24,23 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(&input)
         .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Derives `JsonSchema` (a JSON Schema fragment) for a struct or enum.
+///
+/// Reuses the `#[validate(...)]` rule grammar to lower constraints to schema
+/// keywords (`min_len`→`minLength`, `min`→`minimum`, `pattern`→`pattern`, …)
+/// and `///` doc-comments / `#[arg(description = "…")]` to property
+/// descriptions. Opt-in (the `schema` feature); pair with `#[derive(Model)]`.
+#[cfg(feature = "schema")]
+#[proc_macro_derive(JsonSchema, attributes(validate, arg))]
+pub fn derive_json_schema(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    ir::parse(&input)
+        .map_or_else(syn::Error::into_compile_error, |(ident, ir)| {
+            emit_jsonschema::expand(&ident, &ir)
+        })
         .into()
 }
 

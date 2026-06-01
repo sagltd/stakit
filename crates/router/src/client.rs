@@ -41,14 +41,14 @@ pub(crate) struct ClientMeta {
 pub(crate) struct ClientHandle(Option<Arc<Inner>>);
 
 struct Inner {
-    outgoing: mpsc::UnboundedSender<Value>,
+    outgoing: mpsc::Sender<Value>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, Error>>>>,
     next_id: AtomicU64,
 }
 
 impl ClientHandle {
     /// Builds a connected handle wired to a session's outgoing channel.
-    pub(crate) fn connected(outgoing: mpsc::UnboundedSender<Value>) -> Self {
+    pub(crate) fn connected(outgoing: mpsc::Sender<Value>) -> Self {
         Self(Some(Arc::new(Inner {
             outgoing,
             pending: Mutex::new(HashMap::new()),
@@ -75,6 +75,7 @@ impl ClientHandle {
         inner
             .outgoing
             .send(frame)
+            .await
             .map_err(|_| Error::new(500, "client connection closed"))?;
         match tokio::time::timeout(CLIENT_CALL_TIMEOUT, rx).await {
             Ok(Ok(result)) => result,

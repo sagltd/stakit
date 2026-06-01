@@ -21,6 +21,12 @@ pub enum TransportError {
     /// The response did not contain the requested action's result.
     #[error("response missing result for action `{0}`")]
     MissingAction(&'static str),
+    /// A batch result was indexed out of range.
+    #[error("batch result index {0} out of range")]
+    IndexOutOfRange(usize),
+    /// The server returned a response shape the client did not expect.
+    #[error("unexpected response shape: {0}")]
+    UnexpectedResponse(&'static str),
     /// A websocket-level failure.
     #[error("websocket error: {0}")]
     WebSocket(String),

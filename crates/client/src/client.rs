@@ -29,6 +29,7 @@ struct Inner {
     headers: RwLock<Vec<(String, String)>>,
     stream_url: Option<String>,
     ws_url: Option<String>,
+    accept_invalid_certs: bool,
 }
 
 impl Client {
@@ -40,6 +41,7 @@ impl Client {
             http: None,
             stream_url: None,
             ws_url: None,
+            accept_invalid_certs: false,
         }
     }
 
@@ -109,8 +111,8 @@ impl Client {
 
     /// Sends a raw payload — an object `{action: params, …}` or an ordered array
     /// `[[action, params], …]` — and returns the response value verbatim (an
-    /// object or array of envelopes). Use this to run **several actions in one
-    /// request** when their result types differ; deserialize each entry yourself.
+    /// object or array of envelopes). Lower-level than [`Client::batch`]; use it
+    /// when you want full control over the payload shape.
     ///
     /// # Errors
     /// See [`TransportError`].
@@ -121,6 +123,27 @@ impl Client {
     ) -> Result<serde_json::Value, TransportError> {
         let q = serde_json::to_string(&payload).map_err(TransportError::Encode)?;
         self.send_payload(q, opts).await
+    }
+
+    /// Starts a typed multi-action request: add several calls, then `send()` them
+    /// in **one** round-trip. Results come back in order (the ordered-array
+    /// payload, so the same action may be added more than once).
+    ///
+    /// ```ignore
+    /// let results = client.batch()
+    ///     .add(greet, Greet { name: "a".into() })
+    ///     .add(version, ())
+    ///     .send().await?;
+    /// let g = results.get::<Greeting>(0)?;   // typed per index
+    /// ```
+    #[must_use]
+    pub fn batch(&self) -> Batch<'_> {
+        Batch {
+            client: self,
+            calls: Vec::new(),
+            opts: CallOpts::default(),
+            error: None,
+        }
     }
 
     /// Issues the HTTP request for an encoded `q` payload and decodes the JSON
@@ -186,6 +209,15 @@ impl Client {
         self.inner.ws_url.as_deref()
     }
 
+    /// Whether websocket TLS certificate verification is disabled.
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "deref through Arc is not const"
+    )]
+    pub(crate) fn accept_invalid_certs(&self) -> bool {
+        self.inner.accept_invalid_certs
+    }
+
     /// The base headers merged with per-call `extra` (extra wins on key clash).
     pub(crate) fn merged_headers(&self, extra: &[(String, String)]) -> Vec<(String, String)> {
         let mut headers = self
@@ -225,6 +257,114 @@ pub(crate) fn encode_query<P: Serialize>(
     serde_json::to_string(&serde_json::Value::Object(map)).map_err(TransportError::Encode)
 }
 
+/// A typed multi-action request builder (see [`Client::batch`]). Collects several
+/// calls and sends them in one round-trip as an ordered-array payload.
+pub struct Batch<'a> {
+    client: &'a Client,
+    calls: Vec<(String, serde_json::Value)>,
+    opts: CallOpts,
+    error: Option<TransportError>,
+}
+
+impl Batch<'_> {
+    /// Adds a call. The same action may be added more than once (order is kept).
+    #[must_use]
+    pub fn add<E>(mut self, _endpoint: E, params: E::Params) -> Self
+    where
+        E: Endpoint,
+        E::Params: Serialize,
+    {
+        if self.error.is_none() {
+            match serde_json::to_value(&params) {
+                Ok(value) => self.calls.push((E::ACTION.to_owned(), value)),
+                Err(error) => self.error = Some(TransportError::Encode(error)),
+            }
+        }
+        self
+    }
+
+    /// Applies per-call options (url / headers / files) to the whole batch.
+    #[must_use]
+    pub fn options(mut self, opts: CallOpts) -> Self {
+        self.opts = opts;
+        self
+    }
+
+    /// Sends every queued call in a single request; results come back in order.
+    ///
+    /// # Errors
+    /// See [`TransportError`].
+    pub async fn send(self) -> Result<BatchResults, TransportError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let payload = serde_json::Value::Array(
+            self.calls
+                .iter()
+                .map(|(action, params)| {
+                    serde_json::Value::Array(vec![
+                        serde_json::Value::String(action.clone()),
+                        params.clone(),
+                    ])
+                })
+                .collect(),
+        );
+        let response = self.client.fetch_raw(payload, self.opts).await?;
+        // We sent an ordered-array payload, so the server must answer with an
+        // array of the same length; anything else is a protocol violation.
+        let serde_json::Value::Array(envelopes) = response else {
+            return Err(TransportError::UnexpectedResponse(
+                "batch expected an array response",
+            ));
+        };
+        let actions = self.calls.into_iter().map(|(action, _)| action).collect();
+        Ok(BatchResults { actions, envelopes })
+    }
+}
+
+/// The ordered results of a [`Batch::send`], decoded per index.
+pub struct BatchResults {
+    actions: Vec<String>,
+    envelopes: Vec<serde_json::Value>,
+}
+
+impl BatchResults {
+    /// Number of results.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.envelopes.len()
+    }
+
+    /// Whether the batch returned no results.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.envelopes.is_empty()
+    }
+
+    /// The action name at `index` (in the order added).
+    #[must_use]
+    pub fn action(&self, index: usize) -> Option<&str> {
+        self.actions.get(index).map(String::as_str)
+    }
+
+    /// Decodes the result at `index` as a typed [`ActionResult`].
+    ///
+    /// # Errors
+    /// `IndexOutOfRange` if `index` is past the end; `Decode` on a type mismatch.
+    pub fn get<T: DeserializeOwned>(
+        &self,
+        index: usize,
+    ) -> Result<ActionResult<T>, TransportError> {
+        let value = self
+            .envelopes
+            .get(index)
+            .ok_or(TransportError::IndexOutOfRange(index))?;
+        let envelope: Envelope<T> =
+            serde_json::from_value(value.clone()).map_err(TransportError::Decode)?;
+        Ok(envelope.into())
+    }
+}
+
 /// Builder for [`Client`].
 pub struct Builder {
     base_url: String,
@@ -232,6 +372,7 @@ pub struct Builder {
     http: Option<HttpClient>,
     stream_url: Option<String>,
     ws_url: Option<String>,
+    accept_invalid_certs: bool,
 }
 
 impl Builder {
@@ -264,6 +405,17 @@ impl Builder {
         self
     }
 
+    /// Disables websocket TLS certificate verification (`wss://`).
+    ///
+    /// **Dangerous** — only for trusted internal networks (self-signed / private
+    /// CA, e.g. an internal microVM fleet). Never enable it against the public
+    /// internet; it defeats MITM protection. Public `wss://` works without this.
+    #[must_use]
+    pub const fn danger_accept_invalid_certs(mut self, accept: bool) -> Self {
+        self.accept_invalid_certs = accept;
+        self
+    }
+
     /// Finalizes the client.
     #[must_use]
     pub fn build(self) -> Client {
@@ -274,6 +426,7 @@ impl Builder {
                 headers: RwLock::new(self.headers),
                 stream_url: self.stream_url,
                 ws_url: self.ws_url,
+                accept_invalid_certs: self.accept_invalid_certs,
             }),
         }
     }
