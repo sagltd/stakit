@@ -6,8 +6,10 @@ use std::sync::Arc;
 use futures::{Stream, StreamExt as _};
 use serde_json::Value;
 
+use stakit_model::TSType;
+
 use crate::action::{ErasedAction, ErasedStreamAction};
-use crate::client::ClientHandle;
+use crate::client::{ClientAction, ClientHandle, ClientMeta};
 use crate::session::Session;
 use crate::{Action, Cx, Error, Frame, Reply, StreamAction};
 
@@ -20,6 +22,7 @@ pub struct Router<G, R> {
     pub(crate) app: Arc<G>,
     pub(crate) actions: HashMap<&'static str, Arc<dyn ErasedAction<G, R>>>,
     pub(crate) streams: HashMap<&'static str, Arc<dyn ErasedStreamAction<G, R>>>,
+    pub(crate) client_actions: Vec<ClientMeta>,
 }
 
 impl<G, R> Router<G, R>
@@ -34,6 +37,7 @@ where
             app: None,
             actions: HashMap::new(),
             streams: HashMap::new(),
+            client_actions: Vec::new(),
         }
     }
 
@@ -93,7 +97,7 @@ where
     /// Generates a TypeScript client definition for every registered action.
     #[must_use]
     pub fn generate_ts(&self) -> String {
-        crate::ts::generate(&self.actions, &self.streams)
+        crate::ts::generate(&self.actions, &self.streams, &self.client_actions)
     }
 }
 
@@ -116,6 +120,7 @@ pub struct Builder<G, R> {
     app: Option<Arc<G>>,
     actions: HashMap<&'static str, Arc<dyn ErasedAction<G, R>>>,
     streams: HashMap<&'static str, Arc<dyn ErasedStreamAction<G, R>>>,
+    client_actions: Vec<ClientMeta>,
 }
 
 impl<G, R> Builder<G, R>
@@ -145,6 +150,18 @@ where
         self
     }
 
+    /// Declares a client action (server→client). Used by `cx.client_call::<C>()`
+    /// and included in the generated TypeScript.
+    #[must_use]
+    pub fn client_action<C: ClientAction>(mut self) -> Self {
+        self.client_actions.push(ClientMeta {
+            name: C::NAME,
+            params_ts: <C::Params as TSType>::to_ts(),
+            return_ts: <C::Return as TSType>::to_ts(),
+        });
+        self
+    }
+
     /// Finalizes the router.
     ///
     /// # Panics
@@ -157,6 +174,7 @@ where
                 .expect("Router::builder().ctx(...) must be set before build()"),
             actions: self.actions,
             streams: self.streams,
+            client_actions: self.client_actions,
         }
     }
 }

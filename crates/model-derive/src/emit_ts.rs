@@ -72,7 +72,7 @@ fn struct_ts(name: &str, body: &Body) -> TokenStream {
 }
 
 fn named_field_line(field: &Field) -> TokenStream {
-    let label = &field.label;
+    let label = crate::ir::wire_name(&field.label);
     let expr = field_ts_expr(&field.ty);
     let sep = if option_inner(&field.ty).is_some() {
         format!("  {label}?: ")
@@ -104,10 +104,11 @@ fn variant_part(variant: &Variant) -> TokenStream {
         Body::Named(fields) => {
             let entries = fields.iter().map(|f| {
                 let expr = field_ts_expr(&f.ty);
+                let name = crate::ir::wire_name(&f.label);
                 let head = if option_inner(&f.ty).is_some() {
-                    format!("{}?: ", f.label)
+                    format!("{name}?: ")
                 } else {
-                    format!("{}: ", f.label)
+                    format!("{name}: ")
                 };
                 quote! {{ let mut __e = String::from(#head); __e.push_str(&#expr); __e }}
             });

@@ -406,6 +406,8 @@ dependencies = [
  "hashbrown",
  "indexmap",
  "regex",
+ "serde",
+ "serde_json",
  "stakit-model-derive",
 ]
 

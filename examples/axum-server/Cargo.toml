@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-stakit-model = { path = "../../crates/model" }
+stakit-model = { path = "../../crates/model", features = ["camel"] }
 stakit-router = { path = "../../crates/router" }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }

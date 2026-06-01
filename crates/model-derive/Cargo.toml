@@ -11,6 +11,11 @@ rust-version.workspace = true
 [lib]
 proc-macro = true
 
+[features]
+# Emit camelCase field names in generated TypeScript + validation paths
+# (pairs with serde `#[serde(rename_all = "camelCase")]`).
+camel = []
+
 [dependencies]
 syn.workspace = true
 quote.workspace = true

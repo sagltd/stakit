@@ -2,17 +2,74 @@
 
 export interface Greet {
   name: string;
-  user_id?: number;
+  userId?: number;
 }
 
 export interface Greeting {
   message: string;
 }
 
+export interface SaveImage {
+  fileName: string;
+}
+
+export interface Saved {
+  bytes: number;
+  path: string;
+}
+
 export interface Count {
   n: number;
 }
 
-// Actions (params => result):
-//   greet: Greet => Greeting
-//   count: Count => stream<number>
+export interface Toast {
+  text: string;
+}
+
+export interface ActionParameters {
+  greet: Greet;
+  notify: Greet;
+  save_image: SaveImage;
+  count: Count;
+  progress: Count;
+}
+
+export interface ActionResults {
+  greet: Greeting;
+  notify: Greeting;
+  save_image: Saved;
+  count: number;
+  progress: number;
+}
+
+export interface ActionKinds {
+  greet: "unary";
+  notify: "unary";
+  save_image: "unary";
+  count: "stream";
+  progress: "stream";
+}
+
+export interface ClientActionParameters {
+  showToast: Toast;
+}
+
+export interface ClientActionResults {
+  showToast: string;
+}
+
+export interface Router {
+  serverActions: {
+    [K in keyof ActionParameters]: {
+      params: ActionParameters[K];
+      result: ActionResults[K];
+      kind: ActionKinds[K];
+    };
+  };
+  clientActions: {
+    [K in keyof ClientActionParameters]: {
+      params: ClientActionParameters[K];
+      return: ClientActionResults[K];
+    };
+  };
+}

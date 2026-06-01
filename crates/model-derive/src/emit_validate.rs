@@ -91,12 +91,12 @@ fn pattern(body: &Body, fields: &[Field]) -> TokenStream {
 }
 
 fn field_block(field: &Field) -> TokenStream {
-    let label = &field.label;
+    let label = crate::ir::wire_name(&field.label);
     let binding = &field.binding;
     let rules = field
         .rules
         .iter()
-        .map(|rule| rule_tokens(rule, binding, label));
+        .map(|rule| rule_tokens(rule, binding, &label));
     quote! { #(#rules)* }
 }
 

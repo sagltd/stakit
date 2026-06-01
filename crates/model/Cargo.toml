@@ -14,8 +14,14 @@ indexmap.workspace = true
 regex.workspace = true
 stakit-model-derive.workspace = true
 
+[features]
+# camelCase TypeScript field names + validation paths (snake_case Rust structs).
+camel = ["stakit-model-derive/camel"]
+
 [dev-dependencies]
 divan.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [[bench]]
 name = "validation"

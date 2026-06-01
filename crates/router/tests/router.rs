@@ -116,7 +116,7 @@ async fn risky(_params: Greet) -> Result<Greeting, TodoError> {
 }
 
 // --- client action (server -> client) for duplex ---
-#[derive(Serialize, Deserialize)]
+#[derive(Model, Serialize, Deserialize)]
 struct Toast {
     text: String,
 }
@@ -150,6 +150,7 @@ fn router() -> Router<App, Auth> {
         .register(risky)
         .register(notify_user)
         .register_stream(count)
+        .client_action::<ShowToast>()
         .build()
 }
 
@@ -353,12 +354,32 @@ async fn duplex_streams_over_websocket() {
 #[test]
 fn generates_typescript() {
     let ts = router().generate_ts();
-    // valid TS: deduped interface declarations + an action index
+    // model declarations
     assert!(ts.contains("export interface Greet {"), "{ts}");
     assert!(ts.contains("export interface Greeting {"), "{ts}");
+    assert!(ts.contains("export interface Toast {"), "{ts}");
     assert!(ts.contains("message: string"), "{ts}");
-    assert!(ts.contains("//   greet: Greet => Greeting"), "{ts}");
-    assert!(ts.contains("//   count: Count => stream<number>"), "{ts}");
-    // no malformed `export type X = export interface …`
+    // typed maps
+    assert!(ts.contains("export interface ActionParameters {"), "{ts}");
+    assert!(ts.contains("greet: Greet;"), "{ts}");
+    assert!(ts.contains("export interface ActionResults {"), "{ts}");
+    assert!(ts.contains("count: number;"), "{ts}"); // stream item type
+    assert!(ts.contains("export interface ActionKinds {"), "{ts}");
+    assert!(ts.contains("count: \"stream\";"), "{ts}");
+    assert!(
+        ts.contains("export interface ClientActionParameters {"),
+        "{ts}"
+    );
+    assert!(ts.contains("showToast: Toast;"), "{ts}");
+    assert!(
+        ts.contains("export interface ClientActionResults {"),
+        "{ts}"
+    );
+    assert!(ts.contains("showToast: string;"), "{ts}");
+    // the single inferable Router type
+    assert!(ts.contains("export interface Router {"), "{ts}");
+    assert!(ts.contains("serverActions:"), "{ts}");
+    assert!(ts.contains("clientActions:"), "{ts}");
+    // never malformed
     assert!(!ts.contains("= export interface"), "{ts}");
 }

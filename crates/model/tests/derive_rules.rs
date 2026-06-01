@@ -20,7 +20,7 @@ struct Item {
     #[validate(url)]
     website: String,
     #[validate(contains = "foo")]
-    has_foo: String,
+    hasfoo: String,
     #[validate(prefix = "pre")]
     starts: String,
     #[validate(suffix = "post")]
@@ -42,7 +42,7 @@ fn valid() -> Item {
         ascii: "abc".into(),
         alnum: "abc123".into(),
         website: "https://example.com".into(),
-        has_foo: "xfooy".into(),
+        hasfoo: "xfooy".into(),
         starts: "prefix".into(),
         ends: "the-post".into(),
         digits: "12345".into(),
@@ -64,7 +64,7 @@ fn each_rule_rejects_bad_input() {
         ("ascii", |i| i.ascii = "café".into()),
         ("alnum", |i| i.alnum = "no spaces!".into()),
         ("website", |i| i.website = "not a url".into()),
-        ("has_foo", |i| i.has_foo = "bar".into()),
+        ("hasfoo", |i| i.hasfoo = "bar".into()),
         ("starts", |i| i.starts = "nope".into()),
         ("ends", |i| i.ends = "nope".into()),
         ("digits", |i| i.digits = "12a".into()),

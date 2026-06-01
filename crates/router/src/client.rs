@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use stakit_model::TSType;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -15,11 +16,18 @@ use crate::Error;
 /// A client-side action the server may invoke over a duplex connection.
 pub trait ClientAction {
     /// Parameters sent to the client.
-    type Params: Serialize;
+    type Params: TSType + Serialize;
     /// Value returned by the client.
-    type Return: DeserializeOwned;
+    type Return: TSType + DeserializeOwned;
     /// Stable name (matched on the client).
     const NAME: &'static str;
+}
+
+/// TypeScript metadata for a registered client action.
+pub(crate) struct ClientMeta {
+    pub(crate) name: &'static str,
+    pub(crate) params_ts: String,
+    pub(crate) return_ts: String,
 }
 
 /// Handle used by [`Cx::client_call`](crate::Cx::client_call) to invoke client

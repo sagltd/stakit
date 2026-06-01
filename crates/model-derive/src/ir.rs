@@ -3,6 +3,31 @@
 use quote::format_ident;
 use syn::{Attribute, Data, DeriveInput, Expr, Fields, Ident, LitStr, Type};
 
+/// The wire/TS name for a field: `camelCase` under the `camel` feature,
+/// otherwise the original (`snake_case`) name.
+pub(crate) fn wire_name(label: &str) -> String {
+    #[cfg(feature = "camel")]
+    {
+        let mut out = String::with_capacity(label.len());
+        let mut upper = false;
+        for ch in label.chars() {
+            if ch == '_' {
+                upper = true;
+            } else if upper {
+                out.extend(ch.to_uppercase());
+                upper = false;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+    #[cfg(not(feature = "camel"))]
+    {
+        label.to_owned()
+    }
+}
+
 /// A single validation rule attached to a field.
 pub(crate) enum Rule {
     Email,

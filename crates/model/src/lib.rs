@@ -9,23 +9,24 @@
 //! The validation rule functions live in [`mod@validate`] and are reusable on
 //! their own. Design notes: `docs/architecture.md`. Inspired by `ggtype`.
 
-mod model;
+#[path = "model.rs"]
+mod model_trait;
 mod ts_type;
 pub mod validate;
 
-pub use model::{Model, generate_typescript};
+pub use model_trait::{Model, generate_typescript};
 pub use ts_type::TSType;
 pub use validate::{Validate, ValidationError, ValidationErrors};
 
 /// Common imports. `use stakit_model::prelude::*;` brings the traits (so
-/// `.validate()` / `.to_ts()` resolve), the derive, and the error types.
+/// `.validate()` / `.to_ts()` resolve), the derives, and the error types.
 pub mod prelude {
     pub use crate::{
-        Model, TSType, Validate, ValidationError, ValidationErrors, generate_typescript,
+        Model, TSType, Validate, ValidationError, ValidationErrors, generate_typescript, model,
     };
 }
 
-// The derive macro shares the name `Model` with the trait above (macro vs type
-// namespace), so `use stakit_model::Model;` enables both `#[derive(Model)]` and
-// the `T: Model` bound — same ergonomics as serde's `Serialize`.
-pub use stakit_model_derive::Model;
+// The `Model` derive shares its name with the `Model` trait above (macro vs type
+// namespace), like serde's `Serialize`. `#[model]` is the one-annotation form
+// that also wires up serde (+ camelCase under the `camel` feature).
+pub use stakit_model_derive::{Model, model};
