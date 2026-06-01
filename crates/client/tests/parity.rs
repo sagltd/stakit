@@ -4,7 +4,6 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -23,7 +22,7 @@ use tokio::net::TcpListener;
 
 use stakit_client::{ActionResult, CallOpts, Client, ServerFrame, TransportError};
 use stakit_model::Model;
-use stakit_router::{ClientAction, Cx, Error, Reply, Router, action};
+use stakit_router::{ClientAction, Cx, Error, Router, action};
 
 // ── models ─────────────────────────────────────────────────────────────────
 
@@ -174,20 +173,16 @@ async fn dispatch(
     headers: &HeaderMap,
     q: &str,
     files: Vec<Vec<u8>>,
-) -> Json<BTreeMap<String, Reply>> {
+) -> Json<Value> {
     let token = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let calls: serde_json::Map<String, Value> = serde_json::from_str(q).unwrap_or_default();
-    Json(router.on_batch(Req { token, files }, calls).await)
+    let payload: Value = serde_json::from_str(q).unwrap_or(Value::Null);
+    Json(router.on_request(Req { token, files }, payload).await)
 }
 
-async fn rpc(
-    State(router): Shared,
-    headers: HeaderMap,
-    Query(q): Query<Q>,
-) -> Json<BTreeMap<String, Reply>> {
+async fn rpc(State(router): Shared, headers: HeaderMap, Query(q): Query<Q>) -> Json<Value> {
     dispatch(&router, &headers, &q.q, Vec::new()).await
 }
 
@@ -196,7 +191,7 @@ async fn rpc_upload(
     headers: HeaderMap,
     Query(q): Query<Q>,
     mut multipart: Multipart,
-) -> Json<BTreeMap<String, Reply>> {
+) -> Json<Value> {
     let mut files = Vec::new();
     while let Some(field) = multipart.next_field().await.unwrap() {
         files.push(field.bytes().await.unwrap().to_vec());
@@ -205,19 +200,14 @@ async fn rpc_upload(
 }
 
 async fn stream_handler(State(router): Shared, Query(q): Query<Q>) -> Response {
-    let calls: serde_json::Map<String, Value> = serde_json::from_str(&q.q).unwrap_or_default();
-    let (action, params) = calls
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| (String::new(), Value::Null));
+    let payload: Value = serde_json::from_str(&q.q).unwrap_or(Value::Null);
     let frames = router
         .on_stream(
             Req {
                 token: None,
                 files: Vec::new(),
             },
-            &action,
-            params,
+            payload,
         )
         .map(|frame| {
             let mut bytes = serde_json::to_vec(&frame).unwrap();

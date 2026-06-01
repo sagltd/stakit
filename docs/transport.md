@@ -34,6 +34,18 @@ Response: HTTP **200 always** (per-action errors live in the envelope), body:
   "count": { "status": "error", "error": { "code": 422, "message": "…" } } }
 ```
 
+### Payload shape — object or array
+
+The action name is **in the payload**, never the URL. A payload is either:
+
+- **object** — `{ "greet": {…}, "count": {…} }` (keyed; response is an object of
+  envelopes). Most common.
+- **array** — `[["greet", {…}], ["greet", {…}]]` (ordered, duplicates allowed;
+  response is an array of envelopes in the same order).
+
+The router resolves each entry to its action via an O(1) name lookup, so one
+endpoint serves the whole API. This shape is identical across HTTP and stream.
+
 ## HTTP — stream (JSONL)
 
 `POST {streamUrl}?q=<json>`. Response is newline-delimited JSON frames, one per

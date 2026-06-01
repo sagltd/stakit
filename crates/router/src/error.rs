@@ -1,8 +1,8 @@
 //! The router error type.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
+use indexmap::IndexMap;
 use stakit_model::ValidationErrors;
 
 /// An error produced while dispatching or running an action.
@@ -13,7 +13,7 @@ pub struct Error {
     /// Human-readable message.
     pub message: String,
     /// Per-field validation messages, when this is a validation error.
-    pub fields: Option<BTreeMap<String, Vec<String>>>,
+    pub fields: Option<IndexMap<String, Vec<String>>>,
 }
 
 impl Error {
@@ -50,7 +50,7 @@ impl Error {
     /// Validation failed (422), carrying per-field messages.
     #[must_use]
     pub fn validation(errors: ValidationErrors) -> Self {
-        let mut fields: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut fields: IndexMap<String, Vec<String>> = IndexMap::new();
         for error in errors {
             fields
                 .entry(error.path)

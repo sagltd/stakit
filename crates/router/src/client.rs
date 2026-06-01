@@ -1,10 +1,10 @@
 //! Server→client actions (the duplex `cx.client_call` path).
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use hashbrown::HashMap;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};

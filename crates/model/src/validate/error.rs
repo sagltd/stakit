@@ -1,8 +1,9 @@
 //! Validation error types.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::fmt;
+
+use indexmap::IndexMap;
 
 /// A single validation failure.
 ///
@@ -134,8 +135,8 @@ impl ValidationErrors {
 
     /// Groups the failures by field path, mapping each path to its messages.
     #[must_use]
-    pub fn field_errors(&self) -> BTreeMap<&str, Vec<&str>> {
-        let mut map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    pub fn field_errors(&self) -> IndexMap<&str, Vec<&str>> {
+        let mut map: IndexMap<&str, Vec<&str>> = IndexMap::new();
         for error in &self.0 {
             map.entry(error.path.as_str())
                 .or_default()

@@ -95,6 +95,41 @@ impl Client {
         E::Output: DeserializeOwned,
     {
         let q = encode_query(E::ACTION, &params)?;
+        let response = self.send_payload(q, opts).await?;
+        let serde_json::Value::Object(mut map) = response else {
+            return Err(TransportError::MissingAction(E::ACTION));
+        };
+        let entry = map
+            .remove(E::ACTION)
+            .ok_or(TransportError::MissingAction(E::ACTION))?;
+        let envelope: Envelope<E::Output> =
+            serde_json::from_value(entry).map_err(TransportError::Decode)?;
+        Ok(envelope.into())
+    }
+
+    /// Sends a raw payload — an object `{action: params, …}` or an ordered array
+    /// `[[action, params], …]` — and returns the response value verbatim (an
+    /// object or array of envelopes). Use this to run **several actions in one
+    /// request** when their result types differ; deserialize each entry yourself.
+    ///
+    /// # Errors
+    /// See [`TransportError`].
+    pub async fn fetch_raw(
+        &self,
+        payload: serde_json::Value,
+        opts: CallOpts,
+    ) -> Result<serde_json::Value, TransportError> {
+        let q = serde_json::to_string(&payload).map_err(TransportError::Encode)?;
+        self.send_payload(q, opts).await
+    }
+
+    /// Issues the HTTP request for an encoded `q` payload and decodes the JSON
+    /// response. Shared by [`Client::fetch_with`] and [`Client::fetch_raw`].
+    async fn send_payload(
+        &self,
+        q: String,
+        opts: CallOpts,
+    ) -> Result<serde_json::Value, TransportError> {
         let has_files = !opts.files.is_empty();
         let method: reqwest::Method = opts.method.map_or_else(
             || {
@@ -128,13 +163,7 @@ impl Client {
         }
 
         let response = request.send().await?;
-        let mut map: serde_json::Map<String, serde_json::Value> = response.json().await?;
-        let entry = map
-            .remove(E::ACTION)
-            .ok_or(TransportError::MissingAction(E::ACTION))?;
-        let envelope: Envelope<E::Output> =
-            serde_json::from_value(entry).map_err(TransportError::Decode)?;
-        Ok(envelope.into())
+        response.json().await.map_err(Into::into)
     }
 
     /// The shared HTTP pool backing this handle.

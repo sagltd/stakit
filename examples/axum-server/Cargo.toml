@@ -7,9 +7,18 @@ publish = false
 [dependencies]
 stakit-model = { path = "../../crates/model", features = ["camel"] }
 stakit-router = { path = "../../crates/router" }
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
 async-stream = "0.3"
+stakit-client = { path = "../../crates/client" }
+
+[[bin]]
+name = "axum-server-example"
+path = "src/main.rs"
+
+[[bin]]
+name = "example-client"
+path = "src/bin/example-client.rs"

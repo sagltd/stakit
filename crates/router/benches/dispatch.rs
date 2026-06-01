@@ -14,6 +14,7 @@ fn main() {
 }
 
 struct App;
+#[derive(Clone)]
 struct Req;
 
 #[derive(Model, Serialize, Deserialize)]
@@ -48,21 +49,40 @@ fn count(params: Count) -> impl futures::Stream<Item = Result<u64, Error>> {
     }
 }
 
+// Minimal action: `()` params + `()` output, so its benchmark isolates the
+// router's own overhead (payload parse + O(1) name lookup + envelope assembly)
+// from serde/validation cost.
+#[action]
+async fn noop() -> Result<(), Error> {
+    Ok(())
+}
+
 fn router() -> Router<App, Req> {
     Router::builder()
         .ctx(App)
         .register(greet)
+        .register(noop)
         .register_stream(count)
         .build()
 }
 
-/// Full unary dispatch on valid input.
+/// Full unary dispatch on valid input (single-call payload — the hot path).
 #[divan::bench]
 fn dispatch_valid(bencher: Bencher<'_, '_>) {
     let router = router();
     bencher
-        .with_inputs(|| json!({ "name": "bob" }))
-        .bench_values(|params: Value| black_box(block_on(router.on_request(Req, "greet", params))));
+        .with_inputs(|| json!({ "greet": { "name": "bob" } }))
+        .bench_values(|payload: Value| black_box(block_on(router.on_request(Req, payload))));
+}
+
+/// Router-only overhead: parse payload + O(1) name lookup + assemble the
+/// response envelope, with negligible serde/validation cost.
+#[divan::bench]
+fn route_only(bencher: Bencher<'_, '_>) {
+    let router = router();
+    bencher
+        .with_inputs(|| json!({ "noop": null }))
+        .bench_values(|payload: Value| black_box(block_on(router.on_request(Req, payload))));
 }
 
 /// Dispatch on invalid input (validation error path).
@@ -70,8 +90,8 @@ fn dispatch_valid(bencher: Bencher<'_, '_>) {
 fn dispatch_invalid(bencher: Bencher<'_, '_>) {
     let router = router();
     bencher
-        .with_inputs(|| json!({ "name": "" }))
-        .bench_values(|params: Value| black_box(block_on(router.on_request(Req, "greet", params))));
+        .with_inputs(|| json!({ "greet": { "name": "" } }))
+        .bench_values(|payload: Value| black_box(block_on(router.on_request(Req, payload))));
 }
 
 /// Full streaming dispatch: 10 items + End, collected.
@@ -79,9 +99,9 @@ fn dispatch_invalid(bencher: Bencher<'_, '_>) {
 fn dispatch_stream(bencher: Bencher<'_, '_>) {
     let router = router();
     bencher
-        .with_inputs(|| json!({ "n": 10 }))
-        .bench_values(|params: Value| {
-            let frames: Vec<Frame> = block_on(router.on_stream(Req, "count", params).collect());
+        .with_inputs(|| json!({ "count": { "n": 10 } }))
+        .bench_values(|payload: Value| {
+            let frames: Vec<Frame> = block_on(router.on_stream(Req, payload).collect());
             black_box(frames)
         });
 }

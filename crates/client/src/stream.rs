@@ -75,7 +75,9 @@ impl Client {
         let response = request.send().await?;
         let byte_stream = response.bytes_stream();
 
-        Ok(async_stream::stream! {
+        // Boxed so the returned stream is `Unpin` — callers can `.next()` it in a
+        // loop without pinning it first.
+        Ok(Box::pin(async_stream::stream! {
             futures::pin_mut!(byte_stream);
             let mut buf: Vec<u8> = Vec::new();
             while let Some(chunk) = byte_stream.next().await {
@@ -98,6 +100,6 @@ impl Client {
                     }
                 }
             }
-        })
+        }))
     }
 }
