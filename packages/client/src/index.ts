@@ -1,8 +1,21 @@
-// @stakit/client — TypeScript client for stakit routers.
+// @stakit/client — typed client for stakit routers (HTTP, stream, websocket).
 //
-// Placeholder entrypoint: the actual client (capable of calling any router over
-// any HTTP(S) URL with custom headers, inferring types from a generated
-// `Router` type) lands here next. Kept minimal so the build/test pipeline is
-// real and green.
+// Generic over the `Router` type emitted by stakit-router. Never throws on an
+// application error — those ride in `ActionResult` and are narrowed with
+// `isOk` / `isError`; only real network failures reject (or hit `onError`).
 
-export const STAKIT_CLIENT_VERSION = '0.1.0' as const
+export { createClient } from './client'
+export type { Client, Connection } from './client'
+export { isError, isOk } from './guards'
+export type {
+  ActionResult,
+  CallOpts,
+  ClientActionHandlers,
+  ClientOptions,
+  ErrorBody,
+  FileInput,
+  HeadersMap,
+  HttpMethod,
+  ParamsMap,
+  ResultMap,
+} from './types'

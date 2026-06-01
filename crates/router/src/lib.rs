@@ -9,6 +9,7 @@
 mod action;
 mod client;
 mod cx;
+mod endpoint;
 mod error;
 mod reply;
 mod router;
@@ -18,6 +19,7 @@ mod ts;
 pub use action::{Action, StreamAction};
 pub use client::ClientAction;
 pub use cx::Cx;
+pub use endpoint::{Endpoint, Kind};
 pub use error::Error;
 pub use reply::{ErrorBody, Frame, Reply};
 pub use router::{Builder, Router};

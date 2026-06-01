@@ -97,6 +97,13 @@ fn expand(func: &ItemFn, is_stream: bool) -> syn::Result<proc_macro2::TokenStrea
                     ::std::boxed::Box::pin(#block)
                 }
             }
+
+            impl ::stakit_router::Endpoint for #name {
+                type Params = #input_ty;
+                type Output = #item_ty;
+                const ACTION: &'static str = #name_str;
+                const KIND: ::stakit_router::Kind = ::stakit_router::Kind::Stream;
+            }
         })
     } else {
         let (output_ty, err_ty) =
@@ -126,6 +133,13 @@ fn expand(func: &ItemFn, is_stream: bool) -> syn::Result<proc_macro2::TokenStrea
                 {
                     ::std::boxed::Box::pin(async move #block)
                 }
+            }
+
+            impl ::stakit_router::Endpoint for #name {
+                type Params = #input_ty;
+                type Output = #output_ty;
+                const ACTION: &'static str = #name_str;
+                const KIND: ::stakit_router::Kind = ::stakit_router::Kind::Unary;
             }
         })
     }

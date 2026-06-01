@@ -1,10 +1,10 @@
 //! The [`Router`] and its builder.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt as _};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use stakit_model::TSType;
 
@@ -56,6 +56,27 @@ where
             Ok(data) => Reply::ok(data),
             Err(error) => Reply::error(error),
         }
+    }
+
+    /// Dispatches a batch of unary calls (`action -> params`) concurrently,
+    /// returning a `action -> Reply` map ready for the framework to serialize as
+    /// the HTTP-unary response (see `docs/transport.md`). Unknown actions yield
+    /// a per-entry error reply; the batch itself never fails.
+    pub async fn on_batch(&self, req: R, calls: Map<String, Value>) -> BTreeMap<String, Reply>
+    where
+        R: Clone,
+    {
+        let futures = calls.into_iter().map(|(action, params)| {
+            let req = req.clone();
+            async move {
+                let reply = self.on_request(req, &action, params).await;
+                (action, reply)
+            }
+        });
+        futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .collect()
     }
 
     /// Dispatches a streaming request, yielding [`Frame`]s (`Next*`, then `End`,

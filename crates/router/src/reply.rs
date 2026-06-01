@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::Error;
@@ -24,14 +24,14 @@ pub enum Reply {
 }
 
 /// Serializable error body.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorBody {
     /// Numeric status code.
     pub code: u16,
     /// Human-readable message.
     pub message: String,
     /// Per-field validation messages, when present.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<BTreeMap<String, Vec<String>>>,
 }
 

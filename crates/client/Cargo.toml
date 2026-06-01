@@ -1,0 +1,30 @@
+[package]
+name = "stakit-client"
+description = "Typed, transport-agnostic Rust client for stakit routers (HTTP, stream, websocket)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+stakit-router.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+bytes.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+tokio-tungstenite.workspace = true
+async-stream.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+stakit-model.workspace = true
+stakit-router-derive.workspace = true
+axum = { version = "0.8", features = ["ws", "multipart"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time"] }
+
+[lints]
+workspace = true
