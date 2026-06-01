@@ -87,6 +87,10 @@ fn named_field_line(field: &Field) -> TokenStream {
 }
 
 fn enum_ts(name: &str, variants: &[Variant]) -> TokenStream {
+    if variants.is_empty() {
+        let decl = format!("export type {name} = never;");
+        return quote! { String::from(#decl) };
+    }
     let parts = variants.iter().map(variant_part);
     let prefix = format!("export type {name} = ");
     quote! {

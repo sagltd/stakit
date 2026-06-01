@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -12,6 +13,10 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::Error;
+
+/// How long a `client_call` waits for the client's reply before giving up — so a
+/// disconnected client can't leak the awaiting task forever.
+const CLIENT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A client-side action the server may invoke over a duplex connection.
 pub trait ClientAction {
@@ -71,8 +76,19 @@ impl ClientHandle {
             .outgoing
             .send(frame)
             .map_err(|_| Error::new(500, "client connection closed"))?;
-        rx.await
-            .map_err(|_| Error::new(500, "client connection closed"))?
+        match tokio::time::timeout(CLIENT_CALL_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(Error::new(500, "client connection closed")),
+            Err(_) => {
+                // timed out — drop the pending entry so the task can't leak.
+                inner
+                    .pending
+                    .lock()
+                    .expect("pending lock poisoned")
+                    .remove(&id);
+                Err(Error::new(504, "client action timed out"))
+            }
+        }
     }
 
     /// Resolves a pending client-action call with the client's reply.
