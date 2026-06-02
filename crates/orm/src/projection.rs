@@ -7,12 +7,14 @@
 //! - [`All`] is a whole-row projection (`T` via positional decode);
 //!   `.nullable()` yields `Option<T>` for outer-join sides.
 
+use crate::driver::Row;
 use crate::error::Result;
 use crate::schema::{Col, Table};
 use crate::sql::SqlWriter;
+use crate::value::FromValue;
 use core::marker::PhantomData;
-use sqlx::postgres::PgRow;
-use sqlx::{Decode, Postgres, Row, Type, ValueRef};
+
+use crate::driver::decode_cell as decode_at;
 
 /// A select projection: its column list and how to decode one row.
 pub trait Projection {
@@ -29,12 +31,12 @@ pub trait Projection {
     ///
     /// # Errors
     /// Returns an error if a column fails to decode.
-    fn decode(&self, row: &PgRow, start: usize) -> Result<Self::Output>;
+    fn decode(&self, row: &dyn Row, start: usize) -> Result<Self::Output>;
 }
 
 impl<T, Ty> Projection for Col<T, Ty>
 where
-    Ty: for<'r> Decode<'r, Postgres> + Type<Postgres>,
+    Ty: FromValue,
 {
     type Output = Ty;
     fn arity(&self) -> usize {
@@ -44,8 +46,8 @@ where
         out.push_qualified(self.table, self.name)?;
         Ok(())
     }
-    fn decode(&self, row: &PgRow, start: usize) -> Result<Ty> {
-        Ok(row.try_get(start)?)
+    fn decode(&self, row: &dyn Row, start: usize) -> Result<Ty> {
+        decode_at(row, start)
     }
 }
 
@@ -67,8 +69,8 @@ impl Projection for Count {
         out.push("count(*)");
         Ok(())
     }
-    fn decode(&self, row: &PgRow, start: usize) -> Result<i64> {
-        Ok(row.try_get(start)?)
+    fn decode(&self, row: &dyn Row, start: usize) -> Result<i64> {
+        decode_at(row, start)
     }
 }
 
@@ -93,7 +95,7 @@ impl<Out> Agg<Out> {
 
 impl<Out> Projection for Agg<Out>
 where
-    Out: for<'r> Decode<'r, Postgres> + Type<Postgres>,
+    Out: FromValue,
 {
     type Output = Out;
     fn arity(&self) -> usize {
@@ -106,8 +108,8 @@ where
         out.push(")");
         Ok(())
     }
-    fn decode(&self, row: &PgRow, start: usize) -> Result<Out> {
-        Ok(row.try_get(start)?)
+    fn decode(&self, row: &dyn Row, start: usize) -> Result<Out> {
+        decode_at(row, start)
     }
 }
 
@@ -165,7 +167,7 @@ pub const fn sql_expr<Out>(fragment: &'static str) -> SqlExpr<Out> {
 
 impl<Out> Projection for SqlExpr<Out>
 where
-    Out: for<'r> Decode<'r, Postgres> + Type<Postgres>,
+    Out: FromValue,
 {
     type Output = Out;
     fn arity(&self) -> usize {
@@ -175,8 +177,8 @@ where
         out.push(self.fragment);
         Ok(())
     }
-    fn decode(&self, row: &PgRow, start: usize) -> Result<Out> {
-        Ok(row.try_get(start)?)
+    fn decode(&self, row: &dyn Row, start: usize) -> Result<Out> {
+        decode_at(row, start)
     }
 }
 
@@ -226,12 +228,12 @@ fn write_all_columns<T: Table>(out: &mut SqlWriter) -> Result<()> {
 
 /// Whether the outer-join side is "absent" (no matching row): the non-nullable PK
 /// column is NULL, or — for a PK-less table — every projected column is NULL.
-fn outer_join_absent<T: Table>(row: &PgRow, start: usize) -> Result<bool> {
+fn outer_join_absent<T: Table>(row: &dyn Row, start: usize) -> Result<bool> {
     if let Some(pk) = T::COLUMNS.iter().position(|column| column.is_pk) {
-        return Ok(row.try_get_raw(start + pk)?.is_null());
+        return row.is_null(start + pk);
     }
     for index in 0..T::COLUMNS.len() {
-        if !row.try_get_raw(start + index)?.is_null() {
+        if !row.is_null(start + index)? {
             return Ok(false);
         }
     }
@@ -246,9 +248,9 @@ impl<T: Table> Projection for All<T, NotNull> {
     fn write_columns(&self, out: &mut SqlWriter) -> Result<()> {
         write_all_columns::<T>(out)
     }
-    fn decode(&self, row: &PgRow, start: usize) -> Result<T> {
+    fn decode(&self, row: &dyn Row, start: usize) -> Result<T> {
         // Positional decode so this works at any offset inside a join tuple.
-        Ok(T::from_row_at(row, start)?)
+        T::from_row_at(row, start)
     }
 }
 
@@ -260,7 +262,7 @@ impl<T: Table> Projection for All<T, Nullable> {
     fn write_columns(&self, out: &mut SqlWriter) -> Result<()> {
         write_all_columns::<T>(out)
     }
-    fn decode(&self, row: &PgRow, start: usize) -> Result<Option<T>> {
+    fn decode(&self, row: &dyn Row, start: usize) -> Result<Option<T>> {
         if outer_join_absent::<T>(row, start)? {
             return Ok(None);
         }
@@ -293,7 +295,7 @@ macro_rules! tuple_projection {
                 Ok(())
             }
             #[allow(unused_assignments)]
-            fn decode(&self, row: &PgRow, start: usize) -> Result<Self::Output> {
+            fn decode(&self, row: &dyn Row, start: usize) -> Result<Self::Output> {
                 let mut offset = start;
                 Ok(($(
                     {

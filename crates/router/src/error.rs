@@ -108,8 +108,8 @@ where
     }
 }
 
-/// Builds an [`Error`](crate::Error): `err!(code, msg)` or `err!(msg)` (defaults
-/// to 500). The message is anything `Display`.
+/// Builds an [`Error`]: `err!(code, msg)` or `err!(msg)` (defaults to 500). The
+/// message is anything `Display`.
 #[macro_export]
 macro_rules! err {
     ($code:expr, $msg:expr $(,)?) => {

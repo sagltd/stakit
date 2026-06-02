@@ -35,7 +35,7 @@ where
 {
     pub(crate) fn new(router: Arc<Router<G, R>>, req: R) -> Self {
         let (out_tx, out_rx) = mpsc::channel(OUTGOING_BUFFER);
-        let client = ClientHandle::connected(out_tx.clone());
+        let client = ClientHandle::connected(out_tx.clone(), router.client_call_timeout);
         Self {
             router,
             req,

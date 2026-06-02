@@ -47,7 +47,8 @@ pub struct Column {
     pub name: &'static str,
     /// SQL type (e.g. `uuid`, `text`).
     pub sql_type: &'static str,
-    /// Whether this is (part of) the primary key.
+    /// Whether this column is the (single-column) primary key. Composite primary
+    /// keys are rejected by the derive.
     pub is_pk: bool,
     /// Whether a `UNIQUE` constraint applies.
     pub is_unique: bool,
@@ -60,7 +61,7 @@ pub struct Column {
 }
 
 /// A table mapped from a Rust struct. Implemented by `#[derive(Table)]`.
-pub trait Table: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin {
+pub trait Table: Send + Unpin {
     /// SQL table name.
     const TABLE: &'static str;
     /// Ordered column metadata.
@@ -69,12 +70,13 @@ pub trait Table: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin
     type Pk;
 
     /// Decode this row from columns at **positional** ordinals `start..start+N`
-    /// (in [`COLUMNS`](Self::COLUMNS) order). Unlike `FromRow` (by name), this
+    /// (in [`COLUMNS`](Self::COLUMNS) order), reading each cell through the
+    /// backend-neutral [`Row`](crate::driver::Row). Positional (not by-name) so it
     /// works inside a join tuple where two tables share column names.
     ///
     /// # Errors
-    /// Propagates any sqlx decode error.
-    fn from_row_at(row: &sqlx::postgres::PgRow, start: usize) -> sqlx::Result<Self>
+    /// Propagates any decode error.
+    fn from_row_at(row: &dyn crate::driver::Row, start: usize) -> crate::error::Result<Self>
     where
         Self: Sized;
 }

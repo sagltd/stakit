@@ -1,18 +1,11 @@
-//! Shared finalization: turn a [`SqlWriter`] into SQL text + bound arguments.
+//! Shared finalization: turn a [`SqlWriter`] into SQL text + backend-neutral
+//! bind values. Converting values to a driver's native parameter type happens in
+//! that driver (see [`crate::exec`]), keeping the builder backend-agnostic.
 
-use crate::error::{Error, Result};
-use crate::sql::SqlWriter;
-use sqlx::postgres::PgArguments;
+use crate::sql::{BindBuffer, SqlWriter};
 
-/// Consume a writer into `(sql, arguments)`, encoding all queued binds.
-///
-/// # Errors
-/// Returns [`Error::Encode`] if a bind value fails to encode.
-pub(crate) fn finish(writer: SqlWriter) -> Result<(String, PgArguments)> {
-    let (sql, binds) = writer.into_parts();
-    let mut arguments = PgArguments::default();
-    for bind in binds {
-        bind.add(&mut arguments).map_err(Error::Encode)?;
-    }
-    Ok((sql, arguments))
+/// Consume a writer into `(sql, values)`.
+#[must_use]
+pub(crate) fn finish(writer: SqlWriter) -> (String, BindBuffer) {
+    writer.into_parts()
 }

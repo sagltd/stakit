@@ -1,0 +1,231 @@
+//! The `SQLite` backend (sqlx): [`Row`] for `SqliteRow`, the [`SqliteDriver`], its
+//! transaction handle, and `Value` → `SqliteArguments` binding.
+//!
+//! `SQLite` stores a narrow set of native types, so a few [`Value`] kinds map onto
+//! wider storage: `f32` round-trips through `REAL` (`f64`), and arrays are
+//! unsupported (list membership is expanded to `IN (?, …)` by the dialect, so the
+//! array bind path is never hit for `SQLite`).
+
+use super::{BoxRow, Driver, Row, RowSink, TxConn};
+use crate::dialect::{Dialect, SqliteDialect};
+use crate::error::{Error, Result};
+use crate::sql::BindBuffer;
+use crate::value::{DateTime, NaiveDate, Utc, Uuid, Value, ValueKind};
+use futures::future::BoxFuture;
+use futures::stream::BoxStream;
+use sqlx::sqlite::{SqliteArguments, SqliteConnection};
+use sqlx::sqlite::{SqlitePool, SqliteRow};
+use sqlx::{Arguments, Row as _, Sqlite, Transaction, ValueRef};
+
+/// Read a nullable cell as `T`, mapping `Some`/`None` through `wrap`/the kind's
+/// null.
+macro_rules! read {
+    ($row:expr, $index:expr, $kind:expr, $ty:ty, $wrap:expr) => {{
+        let cell: Option<$ty> = $row.try_get($index).map_err(into_decode)?;
+        Ok(cell.map_or(Value::Null($kind), $wrap))
+    }};
+}
+
+impl Row for SqliteRow {
+    fn try_value(&self, index: usize, kind: ValueKind) -> Result<Value> {
+        match kind {
+            ValueKind::I16 => read!(self, index, kind, i16, Value::I16),
+            ValueKind::I32 => read!(self, index, kind, i32, Value::I32),
+            ValueKind::I64 => read!(self, index, kind, i64, Value::I64),
+            // SQLite has no 32-bit float; widen through REAL.
+            ValueKind::F32 => {
+                let cell: Option<f64> = self.try_get(index).map_err(into_decode)?;
+                #[allow(clippy::cast_possible_truncation)]
+                Ok(cell.map_or(Value::Null(kind), |value| Value::F32(value as f32)))
+            }
+            ValueKind::F64 => read!(self, index, kind, f64, Value::F64),
+            ValueKind::Bool => read!(self, index, kind, bool, Value::Bool),
+            ValueKind::Text => read!(self, index, kind, String, Value::Text),
+            ValueKind::Bytes => read!(self, index, kind, Vec<u8>, Value::Bytes),
+            ValueKind::Uuid => read!(self, index, kind, Uuid, Value::Uuid),
+            ValueKind::Timestamptz => {
+                read!(self, index, kind, DateTime<Utc>, Value::Timestamptz)
+            }
+            ValueKind::Date => read!(self, index, kind, NaiveDate, Value::Date),
+        }
+    }
+
+    fn is_null(&self, index: usize) -> Result<bool> {
+        Ok(self.try_get_raw(index).map_err(into_decode)?.is_null())
+    }
+}
+
+/// The `SQLite` [`Driver`], wrapping an sqlx pool.
+#[derive(Clone)]
+pub struct SqliteDriver {
+    pool: SqlitePool,
+}
+
+impl SqliteDriver {
+    /// Wrap an existing sqlx `SQLite` pool.
+    #[must_use]
+    pub const fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Borrow the underlying sqlx pool (the unaudited raw escape hatch).
+    #[must_use]
+    pub const fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+}
+
+impl Driver for SqliteDriver {
+    fn dialect(&self) -> &'static dyn Dialect {
+        &SqliteDialect
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        sql: String,
+        binds: BindBuffer,
+        sink: &'a mut dyn RowSink,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let args = sqlite_args(binds)?;
+            let mut rows = sqlx::query_with(sqlx::AssertSqlSafe(sql), args).fetch(&self.pool);
+            while let Some(row) = futures::TryStreamExt::try_next(&mut rows).await? {
+                sink.push(&row)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn execute(&self, sql: String, binds: BindBuffer) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async move {
+            let args = sqlite_args(binds)?;
+            let result = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .execute(&self.pool)
+                .await?;
+            Ok(result.rows_affected())
+        })
+    }
+
+    fn stream(&self, sql: String, binds: BindBuffer) -> BoxStream<'_, Result<BoxRow>> {
+        Box::pin(async_stream::try_stream! {
+            let args = sqlite_args(binds)?;
+            let mut rows = sqlx::query_with(sqlx::AssertSqlSafe(sql), args).fetch(&self.pool);
+            while let Some(row) = futures::TryStreamExt::try_next(&mut rows).await? {
+                yield Box::new(row) as BoxRow;
+            }
+        })
+    }
+
+    fn begin(&self) -> BoxFuture<'_, Result<Box<dyn TxConn>>> {
+        Box::pin(async move {
+            let transaction = self.pool.begin().await?;
+            Ok(Box::new(SqliteTxConn { transaction }) as Box<dyn TxConn>)
+        })
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+/// A `SQLite` transaction handle.
+struct SqliteTxConn {
+    transaction: Transaction<'static, Sqlite>,
+}
+
+impl TxConn for SqliteTxConn {
+    fn fetch<'a>(
+        &'a mut self,
+        sql: String,
+        binds: BindBuffer,
+        sink: &'a mut dyn RowSink,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let args = sqlite_args(binds)?;
+            let connection: &mut SqliteConnection = &mut self.transaction;
+            let mut rows = sqlx::query_with(sqlx::AssertSqlSafe(sql), args).fetch(connection);
+            while let Some(row) = futures::TryStreamExt::try_next(&mut rows).await? {
+                sink.push(&row)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn execute(&mut self, sql: String, binds: BindBuffer) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async move {
+            let args = sqlite_args(binds)?;
+            let result = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .execute(&mut *self.transaction)
+                .await?;
+            Ok(result.rows_affected())
+        })
+    }
+
+    fn commit(self: Box<Self>) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async move {
+            self.transaction.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn rollback(self: Box<Self>) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async move {
+            self.transaction.rollback().await?;
+            Ok(())
+        })
+    }
+}
+
+/// Wrap an sqlx decode error as [`Error::Decode`].
+fn into_decode(error: sqlx::Error) -> Error {
+    Error::Decode(Box::new(error))
+}
+
+/// Convert backend-neutral binds into `SQLite` arguments.
+fn sqlite_args(binds: BindBuffer) -> Result<SqliteArguments> {
+    let mut args = SqliteArguments::default();
+    for value in binds {
+        bind_scalar(&mut args, value)?;
+    }
+    Ok(args)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn bind_scalar(args: &mut SqliteArguments, value: Value) -> Result<()> {
+    let result = match value {
+        Value::Null(kind) => return bind_null(args, kind),
+        Value::I16(x) => args.add(x),
+        Value::I32(x) => args.add(x),
+        Value::I64(x) => args.add(x),
+        Value::F32(x) => args.add(f64::from(x)),
+        Value::F64(x) => args.add(x),
+        Value::Bool(x) => args.add(x),
+        Value::Text(x) => args.add(x),
+        Value::Bytes(x) => args.add(x),
+        Value::Uuid(x) => args.add(x),
+        Value::Timestamptz(x) => args.add(x),
+        Value::Date(x) => args.add(x),
+        // Arrays never reach SQLite: the dialect has `supports_any_array() == false`,
+        // so list membership is rendered as `IN (?, …)` with scalar binds.
+        Value::Array(..) => {
+            return Err(Error::Encode("SQLite does not support array binds".into()));
+        }
+    };
+    result.map_err(Error::Encode)
+}
+
+fn bind_null(args: &mut SqliteArguments, kind: ValueKind) -> Result<()> {
+    let result = match kind {
+        ValueKind::I16 => args.add(None::<i16>),
+        ValueKind::I32 => args.add(None::<i32>),
+        ValueKind::I64 => args.add(None::<i64>),
+        ValueKind::F32 | ValueKind::F64 => args.add(None::<f64>),
+        ValueKind::Bool => args.add(None::<bool>),
+        ValueKind::Text => args.add(None::<String>),
+        ValueKind::Bytes => args.add(None::<Vec<u8>>),
+        ValueKind::Uuid => args.add(None::<Uuid>),
+        ValueKind::Timestamptz => args.add(None::<DateTime<Utc>>),
+        ValueKind::Date => args.add(None::<NaiveDate>),
+    };
+    result.map_err(Error::Encode)
+}

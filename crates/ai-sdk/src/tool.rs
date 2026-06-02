@@ -107,6 +107,9 @@ impl<Ctx> ToolSet<Ctx> for Vec<Arc<dyn ToolDyn<Ctx>>> {
 
 struct Entry<Ctx> {
     tool: Arc<dyn ToolDyn<Ctx>>,
+    /// Definition computed once at registration (the JSON Schema is static per
+    /// type), so the loop never rebuilds it per step.
+    def: ToolDef,
     tags: Vec<String>,
     /// Deferred tools are withheld from the prompt until tool search surfaces
     /// them. Interior-mutable so `activate` works through a shared registry.
@@ -158,11 +161,13 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
 
     /// Registers an already-erased tool with explicit tags and deferral.
     pub fn insert(&self, tool: Arc<dyn ToolDyn<Ctx>>, tags: Vec<String>, defer: bool) -> &Self {
-        let name = tool.def().name;
+        let def = tool.def();
+        let name = def.name.clone();
         self.write_lock().insert(
             name,
             Entry {
                 tool,
+                def,
                 tags,
                 defer: AtomicBool::new(defer),
             },
@@ -213,7 +218,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         self.read_lock()
             .values()
             .filter(|e| !e.defer.load(Ordering::Relaxed))
-            .map(|e| e.tool.def())
+            .map(|e| e.def.clone())
             .collect()
     }
 
@@ -243,9 +248,10 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
             .iter()
             .filter(|(_, e)| e.defer.load(Ordering::Relaxed))
             .filter_map(|(name, e)| {
-                let def = e.tool.def();
-                let hay = format!("{name} {} {}", def.description, e.tags.join(" ")).to_lowercase();
-                hay.contains(&q).then_some((name.clone(), def.description))
+                let hay =
+                    format!("{name} {} {}", e.def.description, e.tags.join(" ")).to_lowercase();
+                hay.contains(&q)
+                    .then_some((name.clone(), e.def.description.clone()))
             })
             .collect()
     }

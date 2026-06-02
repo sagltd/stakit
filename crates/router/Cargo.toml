@@ -1,6 +1,7 @@
 [package]
 name = "stakit-router"
 description = "Framework-agnostic action router: validation, routing, action-to-action calls, and TypeScript generation."
+readme = "README.md"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

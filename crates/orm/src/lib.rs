@@ -1,5 +1,10 @@
-//! `stakit-orm` — a high-performance, type-safe Postgres ORM built on sqlx,
+//! `stakit-orm` — a high-performance, type-safe, **database-agnostic** ORM,
 //! inspired by Drizzle.
+//!
+//! One typed query builder runs on Postgres, `SQLite`, `MySQL` (all via sqlx), and
+//! Turso / `libSQL` (not sqlx) behind the [`Driver`] trait. Backends are opt-in
+//! cargo features — `postgres` (default), `sqlite`, `mysql`, `turso` — so you
+//! compile only the driver you use.
 //!
 //! Define a schema once with `#[derive(Table)]`, then build typed queries whose
 //! return type is inferred from the projection. See
@@ -23,6 +28,8 @@
 //! ```
 
 mod db;
+pub mod dialect;
+pub mod driver;
 pub mod error;
 mod exec;
 pub mod expr;
@@ -36,8 +43,21 @@ pub mod raw;
 mod render;
 pub mod schema;
 mod sql;
+pub mod value;
 
-pub use db::{Db, DbConfig, Tx};
+#[cfg(feature = "postgres")]
+pub use db::DbConfig;
+pub use db::{Db, Migration, Tx};
+pub use dialect::{Dialect, MySqlDialect, PostgresDialect, SqliteDialect, TursoDialect};
+#[cfg(feature = "mysql")]
+pub use driver::MySqlDriver;
+#[cfg(feature = "postgres")]
+pub use driver::PostgresDriver;
+#[cfg(feature = "sqlite")]
+pub use driver::SqliteDriver;
+#[cfg(feature = "turso")]
+pub use driver::TursoDriver;
+pub use driver::{Driver, Row, RowSink, TxConn};
 pub use error::{Error, Result};
 pub use ident::IdentError;
 pub use insert::{Insert, InsertReturning, Insertable, OptionalPresent};
@@ -50,7 +70,8 @@ pub use projection::{
 pub use query::Select;
 pub use raw::Raw;
 pub use schema::{Col, Column, Expr, ForeignKey, OnDelete, Rel, Table};
-pub use sql::{Bind, SqlWriter};
+pub use sql::SqlWriter;
+pub use value::{FromValue, ToValue, Value, ValueKind};
 
 /// The `#[derive(Table)]` macro (shares its name with the [`Table`] trait, like
 /// serde's `Serialize`).
@@ -63,11 +84,12 @@ pub use stakit_orm_derive::Row;
 /// traits/types.
 pub mod prelude {
     pub use crate::Db;
+    pub use crate::Migration;
     pub use crate::Table;
     pub use crate::error::{Error, Result};
     pub use crate::expr::{
         ColExpr, Direction, IntoExpr, Order, Predicate, and, any_of, asc, desc, eq, gt, gte,
-        is_null, like, lt, lte, ne, or, raw_pred,
+        is_null, like, lt, lte, ne, not, or, raw_pred,
     };
     pub use crate::projection::{
         All, Count, Projection, avg, count, count_col, max, min, sql_expr, sum,

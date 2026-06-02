@@ -100,7 +100,7 @@ fn expand_row(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             #[allow(unused_assignments)]
             fn decode(
                 &self,
-                row: &::sqlx::postgres::PgRow,
+                row: &dyn ::stakit_orm::driver::Row,
                 start: usize,
             ) -> ::stakit_orm::Result<#name> {
                 let mut __offset = start;
@@ -157,6 +157,17 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         columns.push(parse_column(&ident, field)?);
     }
 
+    // A single-column primary key is assumed by `type Pk`, `get()`/`pk_filter`, and
+    // the FK type-equality check. Reject composite PKs up front rather than silently
+    // filtering on only the first key column.
+    if columns.iter().filter(|column| column.is_pk).count() > 1 {
+        return Err(syn::Error::new_spanned(
+            name,
+            "composite primary keys are not supported: mark exactly one field \
+             #[column(pk)]",
+        ));
+    }
+
     let column_literals = columns.iter().map(column_literal);
     let col_consts = columns.iter().map(|column| {
         let field = &column.field;
@@ -168,17 +179,12 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 ::stakit_orm::Col::new(#table_name, #col_name);
         }
     });
-    let from_row_fields = columns.iter().map(|column| {
-        let field = &column.field;
-        let col_name = &column.col_name;
-        quote! { #field: row.try_get(#col_name)? }
-    });
     let from_row_at_fields = columns.iter().enumerate().map(|(index, column)| {
         let field = &column.field;
-        quote! { #field: row.try_get(start + #index)? }
-    });
-    let from_row_relations = relations.iter().map(|ident| {
-        quote! { #ident: ::core::default::Default::default() }
+        let field_ty = &column.field_ty;
+        quote! {
+            #field: ::stakit_orm::driver::decode_cell::<#field_ty>(row, start + #index)?
+        }
     });
     let from_row_at_relations = relations.iter().map(|ident| {
         quote! { #ident: ::core::default::Default::default() }
@@ -199,10 +205,9 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             type Pk = #pk_ty;
 
             fn from_row_at(
-                row: &::sqlx::postgres::PgRow,
+                row: &dyn ::stakit_orm::driver::Row,
                 start: usize,
-            ) -> ::sqlx::Result<Self> {
-                use ::sqlx::Row as _;
+            ) -> ::stakit_orm::Result<Self> {
                 Ok(Self {
                     #(#from_row_at_fields,)*
                     #(#from_row_at_relations,)*
@@ -216,16 +221,6 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             #[must_use]
             pub fn all() -> ::stakit_orm::All<Self> {
                 ::stakit_orm::All::new()
-            }
-        }
-
-        impl<'__r> ::sqlx::FromRow<'__r, ::sqlx::postgres::PgRow> for #name {
-            fn from_row(row: &'__r ::sqlx::postgres::PgRow) -> ::sqlx::Result<Self> {
-                use ::sqlx::Row as _;
-                Ok(Self {
-                    #(#from_row_fields,)*
-                    #(#from_row_relations,)*
-                })
             }
         }
 

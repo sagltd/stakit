@@ -191,6 +191,16 @@ pub enum StreamEvent {
 /// A boxed stream of streaming events.
 pub type EventStream = futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>;
 
+/// Builds an [`EventStream`] from a ready list of events.
+///
+/// Convenience for [`Provider`] implementors (e.g. non-streaming backends, or
+/// tests) so they can return a stream without depending on `futures` directly.
+#[must_use]
+pub fn event_stream(events: Vec<Result<StreamEvent, ProviderError>>) -> EventStream {
+    use futures::StreamExt as _;
+    futures::stream::iter(events).boxed()
+}
+
 /// A vendor-neutral LLM backend.
 ///
 /// Implementors map [`ChatRequest`] to their wire format and back, returning

@@ -1,6 +1,7 @@
 //! The [`Router`] and its builder.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::{Stream, StreamExt as _};
 use hashbrown::HashMap;
@@ -9,7 +10,7 @@ use serde_json::{Map, Value};
 use stakit_model::TSType;
 
 use crate::action::{ErasedAction, ErasedStreamAction};
-use crate::client::{ClientAction, ClientHandle, ClientMeta};
+use crate::client::{ClientAction, ClientHandle, ClientMeta, DEFAULT_CLIENT_CALL_TIMEOUT};
 use crate::session::Session;
 use crate::{Action, Cx, Error, Frame, Reply, StreamAction};
 
@@ -30,6 +31,7 @@ pub struct Router<G, R> {
     pub(crate) actions: HashMap<&'static str, Arc<dyn ErasedAction<G, R>>>,
     pub(crate) streams: HashMap<&'static str, Arc<dyn ErasedStreamAction<G, R>>>,
     pub(crate) client_actions: Vec<ClientMeta>,
+    pub(crate) client_call_timeout: Duration,
 }
 
 impl<G, R> Router<G, R>
@@ -45,6 +47,7 @@ where
             actions: HashMap::new(),
             streams: HashMap::new(),
             client_actions: Vec::new(),
+            client_call_timeout: DEFAULT_CLIENT_CALL_TIMEOUT,
         }
     }
 
@@ -249,6 +252,7 @@ pub struct Builder<G, R> {
     actions: HashMap<&'static str, Arc<dyn ErasedAction<G, R>>>,
     streams: HashMap<&'static str, Arc<dyn ErasedStreamAction<G, R>>>,
     client_actions: Vec<ClientMeta>,
+    client_call_timeout: Duration,
 }
 
 impl<G, R> Builder<G, R>
@@ -278,6 +282,15 @@ where
         self
     }
 
+    /// Sets how long a server→client `client_call` waits for the client's reply
+    /// before failing with `504` (default [`DEFAULT_CLIENT_CALL_TIMEOUT`]). Bounds
+    /// memory: a suspended action can't wait on a silent client forever.
+    #[must_use]
+    pub const fn client_call_timeout(mut self, timeout: Duration) -> Self {
+        self.client_call_timeout = timeout;
+        self
+    }
+
     /// Declares a client action (server→client). Used by `cx.client_call::<C>()`
     /// and included in the generated TypeScript.
     #[must_use]
@@ -303,6 +316,7 @@ where
             actions: self.actions,
             streams: self.streams,
             client_actions: self.client_actions,
+            client_call_timeout: self.client_call_timeout,
         }
     }
 }

@@ -1,11 +1,30 @@
-//! Execution source: a pool or an in-progress transaction. Query builders hold
-//! one of these so the same API runs on `Db` or inside `db.transaction(..)`.
+//! Execution source: a pool-backed [`Driver`] or an in-progress transaction.
+//! Query builders hold one of these so the same API runs on [`Db`](crate::Db) or
+//! inside `db.transaction(..)`.
+//!
+//! Builders produce backend-neutral [`Value`](crate::value::Value)s; the driver
+//! translates them to its native parameter type and yields rows as `dyn`
+//! [`Row`](crate::driver::Row).
 
+use crate::dialect::Dialect;
+use crate::driver::{Driver, Row, RowSink, TxConn};
 use crate::error::{Error, Result};
+use crate::sql::BindBuffer;
 use futures::lock::Mutex;
-use sqlx::postgres::{PgArguments, PgRow};
-use sqlx::{PgPool, Postgres, Transaction};
 use std::sync::Arc;
+
+/// Adapts a row-handling closure into a [`RowSink`], counting rows for logging.
+struct FnSink<'f> {
+    on_row: &'f mut (dyn FnMut(&dyn Row) -> Result<()> + Send),
+    count: usize,
+}
+
+impl RowSink for FnSink<'_> {
+    fn push(&mut self, row: &dyn Row) -> Result<()> {
+        self.count += 1;
+        (self.on_row)(row)
+    }
+}
 
 /// A shared, in-progress transaction held as `Option` so finalization can take
 /// it out regardless of how many query builders still reference the `Arc`.
@@ -13,7 +32,7 @@ use std::sync::Arc;
 /// Queries lock it sequentially (a transaction is inherently serial) — do not
 /// drive two queries from the same transaction concurrently; the lock would
 /// serialize them and a future awaiting the lock it already holds would hang.
-pub(crate) type SharedTx = Arc<Mutex<Option<Transaction<'static, Postgres>>>>;
+pub(crate) type SharedTx = Arc<Mutex<Option<Box<dyn TxConn>>>>;
 
 /// Error when a query runs after its transaction has been committed/rolled back.
 const fn finished() -> Error {
@@ -23,81 +42,62 @@ const fn finished() -> Error {
 /// Where a query runs.
 #[derive(Clone)]
 pub(crate) enum Exec {
-    /// Acquire a connection from the pool per query.
-    Pool(PgPool),
-    /// Run on the shared transaction's connection.
-    Tx(SharedTx),
+    /// Acquire a connection from the driver's pool per query.
+    Pool(Arc<dyn Driver>),
+    /// Run on the shared transaction's connection (dialect carried alongside,
+    /// since the transaction handle is type-erased).
+    Tx(&'static dyn Dialect, SharedTx),
 }
 
 // The transaction lock is intentionally held across the query's await: the query
 // must run on the locked connection. Dropping it earlier would be incorrect.
 #[allow(clippy::significant_drop_tightening)]
 impl Exec {
-    /// Fetch all rows.
-    pub(crate) async fn fetch_all(&self, sql: String, args: PgArguments) -> Result<Vec<PgRow>> {
-        let started = log_sql(&sql);
-        let query = sqlx::query_with(sqlx::AssertSqlSafe(sql), args);
-        let rows = match self {
-            Self::Pool(pool) => query.fetch_all(pool).await?,
-            Self::Tx(shared) => {
-                let mut guard = shared.lock().await;
-                let transaction = guard.as_mut().ok_or_else(finished)?;
-                query.fetch_all(&mut **transaction).await?
-            }
-        };
-        log_done(started, rows.len());
-        Ok(rows)
+    /// The SQL dialect of the underlying backend (for rendering placeholders,
+    /// list membership, etc.).
+    pub(crate) fn dialect(&self) -> &'static dyn Dialect {
+        match self {
+            Self::Pool(driver) => driver.dialect(),
+            Self::Tx(dialect, _) => *dialect,
+        }
     }
-
-    /// Fetch at most one row.
-    pub(crate) async fn fetch_optional(
+    /// Run a query, invoking `on_row` for each row as it arrives. Rows are decoded
+    /// inline (the `&dyn Row` is borrowed, never boxed), so the collect path makes
+    /// no per-row allocation.
+    pub(crate) async fn for_each_row(
         &self,
         sql: String,
-        args: PgArguments,
-    ) -> Result<Option<PgRow>> {
+        binds: BindBuffer,
+        mut on_row: impl FnMut(&dyn Row) -> Result<()> + Send,
+    ) -> Result<()> {
         let started = log_sql(&sql);
-        let query = sqlx::query_with(sqlx::AssertSqlSafe(sql), args);
-        let row = match self {
-            Self::Pool(pool) => query.fetch_optional(pool).await?,
-            Self::Tx(shared) => {
+        let mut sink = FnSink {
+            on_row: &mut on_row,
+            count: 0,
+        };
+        match self {
+            Self::Pool(driver) => driver.fetch(sql, binds, &mut sink).await?,
+            Self::Tx(_, shared) => {
                 let mut guard = shared.lock().await;
                 let transaction = guard.as_mut().ok_or_else(finished)?;
-                query.fetch_optional(&mut **transaction).await?
+                transaction.fetch(sql, binds, &mut sink).await?;
             }
-        };
-        log_done(started, usize::from(row.is_some()));
-        Ok(row)
-    }
-
-    /// Fetch exactly one row.
-    pub(crate) async fn fetch_one(&self, sql: String, args: PgArguments) -> Result<PgRow> {
-        let started = log_sql(&sql);
-        let query = sqlx::query_with(sqlx::AssertSqlSafe(sql), args);
-        let row = match self {
-            Self::Pool(pool) => query.fetch_one(pool).await?,
-            Self::Tx(shared) => {
-                let mut guard = shared.lock().await;
-                let transaction = guard.as_mut().ok_or_else(finished)?;
-                query.fetch_one(&mut **transaction).await?
-            }
-        };
-        log_done(started, 1);
-        Ok(row)
+        }
+        log_done(started, sink.count);
+        Ok(())
     }
 
     /// Execute a statement, returning rows affected.
-    pub(crate) async fn execute(&self, sql: String, args: PgArguments) -> Result<u64> {
+    pub(crate) async fn execute(&self, sql: String, binds: BindBuffer) -> Result<u64> {
         let started = log_sql(&sql);
-        let query = sqlx::query_with(sqlx::AssertSqlSafe(sql), args);
-        let result = match self {
-            Self::Pool(pool) => query.execute(pool).await?,
-            Self::Tx(shared) => {
+        let affected = match self {
+            Self::Pool(driver) => driver.execute(sql, binds).await?,
+            Self::Tx(_, shared) => {
                 let mut guard = shared.lock().await;
                 let transaction = guard.as_mut().ok_or_else(finished)?;
-                query.execute(&mut **transaction).await?
+                transaction.execute(sql, binds).await?
             }
         };
-        let affected = result.rows_affected();
         log_done(started, usize::try_from(affected).unwrap_or(usize::MAX));
         Ok(affected)
     }

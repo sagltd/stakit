@@ -7,7 +7,8 @@
 
 use crate::ident::IdentError;
 use crate::schema::Col;
-use crate::sql::{Bind, SqlWriter};
+use crate::sql::SqlWriter;
+use crate::value::{ToValue, Value};
 
 /// A column usable on the left of a comparison.
 pub trait ColExpr {
@@ -38,16 +39,16 @@ pub enum Operand {
         /// Column name.
         name: &'static str,
     },
-    /// A value bound as `$N`.
-    Value(Box<dyn Bind>),
+    /// A backend-neutral value bound as a placeholder.
+    Value(Value),
 }
 
 impl Operand {
     pub(crate) fn write_into(self, writer: &mut SqlWriter) -> Result<(), IdentError> {
         match self {
             Self::Column { table, name } => writer.push_qualified(table, name),
-            Self::Value(bind) => {
-                writer.push_bind(bind);
+            Self::Value(value) => {
+                writer.push_bind(value);
                 Ok(())
             }
         }
@@ -78,12 +79,12 @@ macro_rules! value_into_expr {
     ($($ty:ty),* $(,)?) => {$(
         impl IntoExpr<$ty> for $ty {
             fn into_operand(self) -> Operand {
-                Operand::Value(Box::new(self) as Box<dyn Bind>)
+                Operand::Value(self.to_value())
             }
         }
         impl IntoExpr<Option<$ty>> for $ty {
             fn into_operand(self) -> Operand {
-                Operand::Value(Box::new(self) as Box<dyn Bind>)
+                Operand::Value(self.to_value())
             }
         }
     )*};
@@ -106,13 +107,13 @@ value_into_expr!(
 /// Ergonomic string literals against `text` columns.
 impl IntoExpr<String> for &str {
     fn into_operand(self) -> Operand {
-        Operand::Value(Box::new(self.to_owned()) as Box<dyn Bind>)
+        Operand::Value(self.to_value())
     }
 }
 
 impl IntoExpr<Option<String>> for &str {
     fn into_operand(self) -> Operand {
-        Operand::Value(Box::new(self.to_owned()) as Box<dyn Bind>)
+        Operand::Value(self.to_value())
     }
 }
 
@@ -143,12 +144,14 @@ pub enum Predicate {
         /// Column name.
         name: &'static str,
         /// The bound array value.
-        values: Box<dyn Bind>,
+        values: Value,
     },
     /// `(left AND right)`.
     And(Box<Self>, Box<Self>),
     /// `(left OR right)`.
     Or(Box<Self>, Box<Self>),
+    /// `NOT (inner)`.
+    Not(Box<Self>),
     /// A raw SQL fragment (developer-trusted `&'static str`) — e.g. an aggregate
     /// `HAVING` like `count(*) > 5` that the typed builder can't model.
     Raw(&'static str),
@@ -161,6 +164,18 @@ pub const fn raw_pred(fragment: &'static str) -> Predicate {
 }
 
 impl Predicate {
+    /// `"table"."name" = <value>` from an already-converted [`Value`] (used by
+    /// `Db::get` to filter on a table's primary-key column).
+    #[must_use]
+    pub const fn eq_value(table: &'static str, name: &'static str, value: Value) -> Self {
+        Self::Binary {
+            table,
+            name,
+            op: " = ",
+            rhs: Operand::Value(value),
+        }
+    }
+
     /// Render this predicate into the writer.
     ///
     /// # Errors
@@ -186,21 +201,61 @@ impl Predicate {
                 table,
                 name,
                 values,
-            } => {
-                writer.push_qualified(table, name)?;
-                writer.push(" = any(");
-                writer.push_bind(values);
+            } => write_any_of(writer, table, name, values),
+            Self::And(left, right) => combine(*left, " and ", *right, writer),
+            Self::Or(left, right) => combine(*left, " or ", *right, writer),
+            Self::Not(inner) => {
+                writer.push("not (");
+                inner.write(writer)?;
                 writer.push(")");
                 Ok(())
             }
-            Self::And(left, right) => combine(*left, " and ", *right, writer),
-            Self::Or(left, right) => combine(*left, " or ", *right, writer),
             Self::Raw(fragment) => {
                 writer.push(fragment);
                 Ok(())
             }
         }
     }
+}
+
+/// Render list membership. On backends with array binds (Postgres) this is one
+/// `= ANY($1)` array parameter; otherwise it expands to `IN (?, ?, …)` with one
+/// bind per element. An empty list renders as the always-false `1 = 0`.
+fn write_any_of(
+    writer: &mut SqlWriter,
+    table: &'static str,
+    name: &'static str,
+    values: crate::value::Value,
+) -> Result<(), IdentError> {
+    if writer.supports_any_array() {
+        writer.push_qualified(table, name)?;
+        writer.push(" = any(");
+        writer.push_bind(values);
+        writer.push(")");
+        return Ok(());
+    }
+    let crate::value::Value::Array(_, items) = values else {
+        // `any_of` always builds an Array; treat anything else as a single value.
+        writer.push_qualified(table, name)?;
+        writer.push(" in (");
+        writer.push_bind(values);
+        writer.push(")");
+        return Ok(());
+    };
+    if items.is_empty() {
+        writer.push("1 = 0");
+        return Ok(());
+    }
+    writer.push_qualified(table, name)?;
+    writer.push(" in (");
+    for (index, item) in items.into_iter().enumerate() {
+        if index > 0 {
+            writer.push(", ");
+        }
+        writer.push_bind(item);
+    }
+    writer.push(")");
+    Ok(())
 }
 
 fn combine(
@@ -297,13 +352,12 @@ where
 /// statement, no per-element params; see the spec's statement-cache rules).
 pub fn any_of<T, Ty>(column: Col<T, Ty>, values: &[Ty]) -> Predicate
 where
-    Ty: Clone + Send + 'static,
-    Vec<Ty>: for<'q> sqlx::Encode<'q, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+    Ty: ToValue + crate::value::FromValue + Clone,
 {
     Predicate::AnyOf {
         table: column.table,
         name: column.name,
-        values: Box::new(values.to_vec()) as Box<dyn Bind>,
+        values: values.to_vec().to_value(),
     }
 }
 
@@ -326,6 +380,12 @@ pub fn and(left: Predicate, right: Predicate) -> Predicate {
 #[must_use]
 pub fn or(left: Predicate, right: Predicate) -> Predicate {
     Predicate::Or(Box::new(left), Box::new(right))
+}
+
+/// `NOT (inner)` — negate any predicate (including compound `and`/`or` trees).
+#[must_use]
+pub fn not(inner: Predicate) -> Predicate {
+    Predicate::Not(Box::new(inner))
 }
 
 /// Sort direction.
@@ -377,5 +437,114 @@ pub const fn desc<T, Ty>(column: Col<T, Ty>) -> Order {
         table: column.table,
         column: column.name,
         direction: Direction::Desc,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Predicate, and, any_of, asc, desc, eq, gt, gte, is_null, like, lt, lte, ne, or, raw_pred,
+    };
+    use crate::schema::Col;
+    use crate::sql::SqlWriter;
+
+    /// Render a predicate to its SQL string (binds discarded).
+    fn render(predicate: Predicate) -> String {
+        let mut writer = SqlWriter::new();
+        predicate.write(&mut writer).unwrap();
+        writer.sql().to_owned()
+    }
+
+    const ID: Col<(), i32> = Col::new("t", "id");
+    const NAME: Col<(), String> = Col::new("t", "name");
+    const BIO: Col<(), Option<String>> = Col::new("t", "bio");
+
+    #[test]
+    fn comparison_operators_render_correct_symbols() {
+        assert_eq!(render(eq(ID, 1_i32)), r#""t"."id" = $1"#);
+        assert_eq!(render(ne(ID, 1_i32)), r#""t"."id" <> $1"#);
+        assert_eq!(render(gt(ID, 1_i32)), r#""t"."id" > $1"#);
+        assert_eq!(render(lt(ID, 1_i32)), r#""t"."id" < $1"#);
+        assert_eq!(render(gte(ID, 1_i32)), r#""t"."id" >= $1"#);
+        assert_eq!(render(lte(ID, 1_i32)), r#""t"."id" <= $1"#);
+    }
+
+    #[test]
+    fn eq_column_to_column_emits_no_bind() {
+        let mut writer = SqlWriter::new();
+        let other: Col<(), i32> = Col::new("u", "id");
+        eq(ID, other).write(&mut writer).unwrap();
+        assert_eq!(writer.sql(), r#""t"."id" = "u"."id""#);
+        assert_eq!(writer.bind_count(), 0);
+    }
+
+    #[test]
+    fn like_on_nullable_renders_like() {
+        assert_eq!(render(like(BIO, "%x%")), r#""t"."bio" like $1"#);
+    }
+
+    #[test]
+    fn like_on_non_nullable_renders_like() {
+        assert_eq!(render(like(NAME, "%x%")), r#""t"."name" like $1"#);
+    }
+
+    #[test]
+    fn is_null_renders_is_null() {
+        assert_eq!(render(is_null(BIO)), r#""t"."bio" is null"#);
+    }
+
+    #[test]
+    fn any_of_multi_is_single_array_bind() {
+        let mut writer = SqlWriter::new();
+        any_of(ID, &[1_i32, 2, 3]).write(&mut writer).unwrap();
+        assert_eq!(writer.sql(), r#""t"."id" = any($1)"#);
+        assert_eq!(writer.bind_count(), 1);
+    }
+
+    #[test]
+    fn any_of_empty_is_single_array_bind() {
+        let mut writer = SqlWriter::new();
+        let none: [i32; 0] = [];
+        any_of(ID, &none).write(&mut writer).unwrap();
+        assert_eq!(writer.sql(), r#""t"."id" = any($1)"#);
+        assert_eq!(writer.bind_count(), 1);
+    }
+
+    #[test]
+    fn and_or_nesting_parenthesizes() {
+        let predicate = and(
+            or(eq(ID, 1_i32), eq(ID, 2_i32)),
+            and(eq(ID, 3_i32), eq(ID, 4_i32)),
+        );
+        assert_eq!(
+            render(predicate),
+            r#"(("t"."id" = $1 or "t"."id" = $2) and ("t"."id" = $3 and "t"."id" = $4))"#
+        );
+    }
+
+    #[test]
+    fn bind_numbering_follows_predicate_order() {
+        let mut writer = SqlWriter::new();
+        and(eq(ID, 10_i32), eq(NAME, "x"))
+            .write(&mut writer)
+            .unwrap();
+        assert_eq!(writer.sql(), r#"("t"."id" = $1 and "t"."name" = $2)"#);
+        assert_eq!(writer.bind_count(), 2);
+    }
+
+    #[test]
+    fn raw_pred_renders_verbatim() {
+        assert_eq!(render(raw_pred("count(*) > 5")), "count(*) > 5");
+    }
+
+    #[test]
+    fn order_terms_render_direction() {
+        let mut writer = SqlWriter::new();
+        asc(ID).write(&mut writer).unwrap();
+        assert_eq!(writer.sql(), r#""t"."id" asc"#);
+
+        let mut writer = SqlWriter::new();
+        desc(NAME).write(&mut writer).unwrap();
+        assert_eq!(writer.sql(), r#""t"."name" desc"#);
     }
 }

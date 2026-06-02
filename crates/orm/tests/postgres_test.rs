@@ -1,3 +1,5 @@
+#![allow(missing_docs)] // gated-out builds compile to an empty crate
+#![cfg(feature = "postgres")]
 //! Integration test against a **real, embedded** Postgres (`postgresql_embedded`)
 //! — no Docker. Boots a server in a temp dir, applies migrations via sqlx, then
 //! exercises the typed query builder (select / update / delete) end to end.
@@ -47,7 +49,10 @@ async fn setup() -> (postgresql_embedded::PostgreSQL, Db) {
         .expect("create database");
     let url = postgres.settings().url("stakit_test");
     let db = Db::connect(&url).await.expect("connect");
-    MIGRATOR.run(db.pool()).await.expect("run migrations");
+    MIGRATOR
+        .run(db.pool().expect("postgres pool"))
+        .await
+        .expect("run migrations");
     (postgres, db)
 }
 

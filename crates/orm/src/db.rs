@@ -1,6 +1,15 @@
 //! The [`Db`] handle and [`Tx`] transaction handle: thin wrappers that hand out
 //! query builders bound to a pool or an in-progress transaction.
 
+use crate::driver::Driver;
+#[cfg(feature = "mysql")]
+use crate::driver::MySqlDriver;
+#[cfg(feature = "postgres")]
+use crate::driver::PostgresDriver;
+#[cfg(feature = "sqlite")]
+use crate::driver::SqliteDriver;
+#[cfg(feature = "turso")]
+use crate::driver::TursoDriver;
 use crate::error::{Error, Result};
 use crate::exec::{Exec, SharedTx};
 use crate::insert::{Insert, Insertable};
@@ -10,14 +19,18 @@ use crate::query::Select;
 use crate::raw::Raw;
 use crate::schema::Table;
 use futures::lock::Mutex;
+#[cfg(feature = "postgres")]
 use sqlx::PgPool;
+#[cfg(feature = "postgres")]
 use sqlx::postgres::PgPoolOptions;
 use std::future::Future;
 use std::sync::Arc;
+#[cfg(feature = "postgres")]
 use std::time::Duration;
 
-/// Production connection-pool configuration. `Debug` redacts the URL (it carries
-/// credentials).
+/// Production connection-pool configuration (Postgres). `Debug` redacts the URL
+/// (it carries credentials).
+#[cfg(feature = "postgres")]
 #[derive(Clone)]
 pub struct DbConfig {
     url: String,
@@ -33,6 +46,7 @@ pub struct DbConfig {
     pub max_lifetime: Option<Duration>,
 }
 
+#[cfg(feature = "postgres")]
 impl DbConfig {
     /// Config with production-sane defaults for `url`.
     #[must_use]
@@ -48,6 +62,7 @@ impl DbConfig {
     }
 }
 
+#[cfg(feature = "postgres")]
 impl core::fmt::Debug for DbConfig {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DbConfig")
@@ -61,34 +76,120 @@ impl core::fmt::Debug for DbConfig {
     }
 }
 
-/// A database handle. Cheap to clone (the pool is reference-counted) and `Send`
+/// One ordered, versioned migration: a unique `version` and the SQL `statements`
+/// to apply (each statement runs individually, so it works on every backend). Use
+/// with [`Db::migrate`].
+#[derive(Debug, Clone, Copy)]
+pub struct Migration<'a> {
+    /// Unique, ordered identifier (e.g. `"0001_init"`); recorded once applied.
+    pub version: &'a str,
+    /// SQL statements to run, in order.
+    pub statements: &'a [&'a str],
+}
+
+/// A database handle. Cheap to clone (the driver is reference-counted) and `Send`
 /// + `Sync`; share it across tasks.
 #[derive(Clone)]
 pub struct Db {
-    pool: PgPool,
+    driver: Arc<dyn Driver>,
 }
 
 impl Db {
-    /// Wrap an existing sqlx pool.
+    /// Wrap an existing sqlx Postgres pool.
+    #[cfg(feature = "postgres")]
     #[must_use]
-    pub const fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool) -> Self {
+        Self::from_driver(Arc::new(PostgresDriver::new(pool)))
     }
 
-    /// Connect to `url` with sqlx defaults.
+    /// Build a handle over any [`Driver`] (the backend-agnostic constructor).
+    #[must_use]
+    pub fn from_driver(driver: Arc<dyn Driver>) -> Self {
+        Self { driver }
+    }
+
+    /// Connect to a Postgres `url` with sqlx defaults.
     ///
     /// # Errors
     /// Returns an error if the connection cannot be established.
+    #[cfg(feature = "postgres")]
     pub async fn connect(url: &str) -> Result<Self> {
-        Ok(Self {
-            pool: PgPool::connect(url).await?,
-        })
+        Ok(Self::new(PgPool::connect(url).await?))
+    }
+
+    /// Wrap an existing sqlx `SQLite` pool.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn sqlite(pool: sqlx::SqlitePool) -> Self {
+        Self::from_driver(Arc::new(SqliteDriver::new(pool)))
+    }
+
+    /// Connect to a `SQLite` `url` (e.g. `sqlite::memory:` or `sqlite://file.db`).
+    ///
+    /// # Errors
+    /// Returns an error if the connection cannot be established.
+    #[cfg(feature = "sqlite")]
+    pub async fn connect_sqlite(url: &str) -> Result<Self> {
+        Ok(Self::sqlite(sqlx::SqlitePool::connect(url).await?))
+    }
+
+    /// Wrap an existing sqlx `MySQL` pool.
+    #[cfg(feature = "mysql")]
+    #[must_use]
+    pub fn mysql(pool: sqlx::MySqlPool) -> Self {
+        Self::from_driver(Arc::new(MySqlDriver::new(pool)))
+    }
+
+    /// Connect to a `MySQL` `url`.
+    ///
+    /// # Errors
+    /// Returns an error if the connection cannot be established.
+    #[cfg(feature = "mysql")]
+    pub async fn connect_mysql(url: &str) -> Result<Self> {
+        Ok(Self::mysql(sqlx::MySqlPool::connect(url).await?))
+    }
+
+    /// Wrap an existing Turso / `libSQL` [`Connection`](libsql::Connection).
+    #[cfg(feature = "turso")]
+    #[must_use]
+    pub fn turso(connection: libsql::Connection) -> Self {
+        Self::from_driver(Arc::new(TursoDriver::new(connection)))
+    }
+
+    /// Open a local Turso / `libSQL` database at `path` (use `:memory:` for an
+    /// in-memory database).
+    ///
+    /// # Errors
+    /// Returns an error if the database cannot be opened or connected.
+    #[cfg(feature = "turso")]
+    pub async fn connect_turso_local(path: &str) -> Result<Self> {
+        let database = libsql::Builder::new_local(path)
+            .build()
+            .await
+            .map_err(Error::Turso)?;
+        let connection = database.connect().map_err(Error::Turso)?;
+        Ok(Self::turso(connection))
+    }
+
+    /// Connect to a remote Turso / `libSQL` database (`url` + auth `token`).
+    ///
+    /// # Errors
+    /// Returns an error if the database cannot be opened or connected.
+    #[cfg(feature = "turso")]
+    pub async fn connect_turso_remote(url: &str, token: &str) -> Result<Self> {
+        let database = libsql::Builder::new_remote(url.to_owned(), token.to_owned())
+            .build()
+            .await
+            .map_err(Error::Turso)?;
+        let connection = database.connect().map_err(Error::Turso)?;
+        Ok(Self::turso(connection))
     }
 
     /// Connect using an explicit [`DbConfig`] (pool sizing, timeouts).
     ///
     /// # Errors
     /// Returns an error if the connection cannot be established.
+    #[cfg(feature = "postgres")]
     pub async fn connect_with(config: &DbConfig) -> Result<Self> {
         let options = PgPoolOptions::new()
             .max_connections(config.max_connections)
@@ -96,24 +197,110 @@ impl Db {
             .acquire_timeout(config.acquire_timeout)
             .idle_timeout(config.idle_timeout)
             .max_lifetime(config.max_lifetime);
-        Ok(Self {
-            pool: options.connect(&config.url).await?,
-        })
+        Ok(Self::new(options.connect(&config.url).await?))
     }
 
-    /// Borrow the underlying sqlx pool (the unaudited raw escape hatch).
+    /// Borrow the underlying sqlx Postgres pool, if this handle is Postgres-backed
+    /// (the unaudited raw escape hatch, e.g. for the migrator). Returns `None` for
+    /// other backends.
+    #[cfg(feature = "postgres")]
     #[must_use]
-    pub const fn pool(&self) -> &PgPool {
-        &self.pool
+    pub fn pool(&self) -> Option<&PgPool> {
+        self.driver
+            .as_any()
+            .downcast_ref::<PostgresDriver>()
+            .map(PostgresDriver::pool)
     }
 
     fn exec(&self) -> Exec {
-        Exec::Pool(self.pool.clone())
+        Exec::Pool(Arc::clone(&self.driver))
+    }
+
+    /// Apply pending [`Migration`]s in order, on **any** backend (Postgres, `SQLite`,
+    /// `MySQL`, Turso) — migrations work out-of-box because they run through the
+    /// [`Driver`], not a backend-specific migrator.
+    ///
+    /// Applied versions are tracked in a `_stakit_migrations` table; each pending
+    /// migration runs in a transaction (its statements then the version record) so a
+    /// failure rolls back and is safely retried. (On `MySQL`, DDL implicitly commits,
+    /// so a multi-statement migration that fails mid-way is not atomic — the standard
+    /// `MySQL` caveat.) Returns the number of migrations applied.
+    ///
+    /// # Errors
+    /// Returns an error if a migration statement fails or tracking can't be read.
+    pub async fn migrate(&self, migrations: &[Migration<'_>]) -> Result<u64> {
+        let exec = self.exec();
+        exec.execute(
+            "create table if not exists _stakit_migrations (version varchar(255) primary key)"
+                .to_owned(),
+            crate::sql::BindBuffer::new(),
+        )
+        .await?;
+
+        let mut applied = std::collections::HashSet::new();
+        exec.for_each_row(
+            "select version from _stakit_migrations".to_owned(),
+            crate::sql::BindBuffer::new(),
+            |row| {
+                applied.insert(crate::driver::decode_cell::<String>(row, 0)?);
+                Ok(())
+            },
+        )
+        .await?;
+
+        let dialect = self.driver.dialect();
+        let placeholder = if dialect.numbered_placeholders() {
+            format!("{}1", dialect.placeholder_prefix())
+        } else {
+            dialect.placeholder_prefix().to_string()
+        };
+        let insert_sql = format!("insert into _stakit_migrations (version) values ({placeholder})");
+
+        let mut count = 0;
+        for migration in migrations {
+            if applied.contains(migration.version) {
+                continue;
+            }
+            let insert_sql = insert_sql.clone();
+            self.transaction(|tx| async move {
+                for statement in migration.statements {
+                    tx.raw(*statement).exec().await?;
+                }
+                tx.raw(insert_sql)
+                    .bind(migration.version.to_owned())
+                    .exec()
+                    .await?;
+                Ok(())
+            })
+            .await?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Start a `SELECT` for `projection`, bound to this pool.
     pub fn select<P: Projection>(&self, projection: P) -> Select<P> {
         Select::with_exec(projection, self.exec())
+    }
+
+    /// Start a whole-row `SELECT * FROM T` (Drizzle-style `find`): the output type
+    /// is inferred as `T`, so no `T::all()` / `.from::<T>()` boilerplate and no
+    /// `let rows: Vec<T>` annotation. Chain `.filter()`/`.order_by()`/`.limit()`
+    /// then a terminal (`.all()` → `Vec<T>`, `.one()` → `Option<T>`).
+    #[must_use]
+    pub fn find<T: Table>(&self) -> Select<crate::projection::All<T>> {
+        self.select(crate::projection::All::<T>::new()).from::<T>()
+    }
+
+    /// Fetch by primary key: `SELECT * FROM T WHERE <pk> = $1`, output inferred as
+    /// `T`. Finish with `.one()` → `Option<T>`. Tables without a primary key match
+    /// nothing (the filter renders as always-false).
+    #[must_use]
+    pub fn get<T: Table>(&self, pk: T::Pk) -> Select<crate::projection::All<T>>
+    where
+        T::Pk: crate::value::ToValue,
+    {
+        self.find::<T>().filter(pk_filter::<T>(pk))
     }
 
     /// Insert a single row.
@@ -159,10 +346,10 @@ impl Db {
         F: FnOnce(Tx) -> Fut,
         Fut: Future<Output = Result<R>>,
     {
-        let transaction = self.pool.begin().await?;
+        let transaction = self.driver.begin().await?;
         let shared: SharedTx = Arc::new(Mutex::new(Some(transaction)));
         let handle = Tx {
-            exec: Exec::Tx(Arc::clone(&shared)),
+            exec: Exec::Tx(self.driver.dialect(), Arc::clone(&shared)),
         };
         let outcome = work(handle).await;
 
@@ -199,6 +386,21 @@ impl Tx {
         Select::with_exec(projection, self.exec.clone())
     }
 
+    /// Start a whole-row `SELECT * FROM T` on this transaction (see [`Db::find`]).
+    #[must_use]
+    pub fn find<T: Table>(&self) -> Select<crate::projection::All<T>> {
+        self.select(crate::projection::All::<T>::new()).from::<T>()
+    }
+
+    /// Fetch by primary key on this transaction (see [`Db::get`]).
+    #[must_use]
+    pub fn get<T: Table>(&self, pk: T::Pk) -> Select<crate::projection::All<T>>
+    where
+        T::Pk: crate::value::ToValue,
+    {
+        self.find::<T>().filter(pk_filter::<T>(pk))
+    }
+
     /// Insert a single row on this transaction.
     pub fn insert<N: Insertable>(&self, row: N) -> Insert<N> {
         Insert::with_exec(self.exec.clone(), vec![row])
@@ -226,4 +428,18 @@ impl Tx {
     pub fn raw(&self, sql: impl Into<String>) -> Raw {
         Raw::new(self.exec.clone(), sql)
     }
+}
+
+/// Build the `WHERE <pk> = $1` predicate for `T::get`. Falls back to the
+/// always-false `1 = 0` for a primary-key-less table (so `get` matches nothing
+/// rather than every row).
+fn pk_filter<T: Table>(pk: T::Pk) -> crate::expr::Predicate
+where
+    T::Pk: crate::value::ToValue,
+{
+    use crate::value::ToValue;
+    T::COLUMNS.iter().find(|column| column.is_pk).map_or_else(
+        || crate::expr::raw_pred("1 = 0"),
+        |column| crate::expr::Predicate::eq_value(T::TABLE, column.name, pk.to_value()),
+    )
 }

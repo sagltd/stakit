@@ -8,10 +8,9 @@ use crate::exec::Exec;
 use crate::expr::{Order, Predicate};
 use crate::projection::Projection;
 use crate::schema::Table;
-use crate::sql::{Bind, SqlWriter};
+use crate::sql::{BindBuffer, SqlWriter};
+use crate::value::Value;
 use smallvec::SmallVec;
-use sqlx::Row;
-use sqlx::postgres::PgArguments;
 
 struct Join {
     keyword: &'static str,
@@ -145,7 +144,11 @@ impl<P: Projection> Select<P> {
     /// Consume the builder into `(projection, sql, arguments)`. Predicates are
     /// `FnOnce`, so building is consuming; the projection is handed back for
     /// row decoding.
-    fn into_sql(self) -> Result<(P, String, PgArguments)> {
+    fn into_sql(self) -> Result<(P, String, BindBuffer)> {
+        let dialect = self
+            .exec
+            .as_ref()
+            .map_or_else(crate::dialect::default_dialect, Exec::dialect);
         let Self {
             projection,
             from_table,
@@ -158,7 +161,7 @@ impl<P: Projection> Select<P> {
             offset,
             exec: _,
         } = self;
-        let mut writer = SqlWriter::new();
+        let mut writer = SqlWriter::with_dialect(dialect);
         writer.push("select ");
         projection.write_columns(&mut writer)?;
         writer.push(" from ");
@@ -189,13 +192,13 @@ impl<P: Projection> Select<P> {
         }
         if let Some(limit) = limit {
             writer.push(" limit ");
-            writer.push_bind(Box::new(limit) as Box<dyn Bind>);
+            writer.push_bind(Value::I64(limit));
         }
         if let Some(offset) = offset {
             writer.push(" offset ");
-            writer.push_bind(Box::new(offset) as Box<dyn Bind>);
+            writer.push_bind(Value::I64(offset));
         }
-        let (sql, arguments) = crate::render::finish(writer)?;
+        let (sql, arguments) = crate::render::finish(writer);
         Ok((projection, sql, arguments))
     }
 
@@ -216,30 +219,54 @@ impl<P: Projection> Select<P> {
     ///
     /// # Errors
     /// Returns an error if the query fails or a row fails to decode.
-    pub async fn all(self) -> Result<Vec<P::Output>> {
+    pub async fn all(self) -> Result<Vec<P::Output>>
+    where
+        P: Sync,
+        P::Output: Send,
+    {
         let exec = self.take_exec()?;
         let (projection, sql, arguments) = self.into_sql()?;
-        let rows = exec.fetch_all(sql, arguments).await?;
-        rows.iter().map(|row| projection.decode(row, 0)).collect()
+        let mut out = Vec::new();
+        exec.for_each_row(sql, arguments, |row| {
+            out.push(projection.decode(row, 0)?);
+            Ok(())
+        })
+        .await?;
+        Ok(out)
     }
 
     /// Run and return the first row, if any (adds `LIMIT 1`).
     ///
     /// # Errors
     /// Returns an error if the query fails or the row fails to decode.
-    pub async fn one(mut self) -> Result<Option<P::Output>> {
+    pub async fn one(mut self) -> Result<Option<P::Output>>
+    where
+        P: Sync,
+        P::Output: Send,
+    {
         self.limit = Some(1);
         let exec = self.take_exec()?;
         let (projection, sql, arguments) = self.into_sql()?;
-        let row = exec.fetch_optional(sql, arguments).await?;
-        row.map(|row| projection.decode(&row, 0)).transpose()
+        let mut out = None;
+        exec.for_each_row(sql, arguments, |row| {
+            if out.is_none() {
+                out = Some(projection.decode(row, 0)?);
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(out)
     }
 
     /// Run and return the first row, erroring if absent.
     ///
     /// # Errors
     /// [`Error::NotFound`] if no row; query/decode errors otherwise.
-    pub async fn one_or_err(self) -> Result<P::Output> {
+    pub async fn one_or_err(self) -> Result<P::Output>
+    where
+        P: Sync,
+        P::Output: Send,
+    {
         self.one().await?.ok_or(Error::NotFound)
     }
 
@@ -256,8 +283,13 @@ impl<P: Projection> Select<P> {
         let exec = self.take_exec()?;
         let (_projection, inner, arguments) = self.into_sql()?;
         let sql = format!("select count(*) from ({inner}) as __count");
-        let row = exec.fetch_one(sql, arguments).await?;
-        Ok(row.try_get(0)?)
+        let mut value = 0_i64;
+        exec.for_each_row(sql, arguments, |row| {
+            value = crate::driver::decode_cell(row, 0)?;
+            Ok(())
+        })
+        .await?;
+        Ok(value)
     }
 
     /// Whether any row matches (`select exists(<this query>)`). `LIMIT`/`OFFSET`/
@@ -272,8 +304,13 @@ impl<P: Projection> Select<P> {
         let exec = self.take_exec()?;
         let (_projection, inner, arguments) = self.into_sql()?;
         let sql = format!("select exists({inner})");
-        let row = exec.fetch_one(sql, arguments).await?;
-        Ok(row.try_get(0)?)
+        let mut value = false;
+        exec.for_each_row(sql, arguments, |row| {
+            value = crate::driver::decode_cell(row, 0)?;
+            Ok(())
+        })
+        .await?;
+        Ok(value)
     }
 
     /// Stream rows lazily (bounded client memory). Pool-only: streaming inside a
@@ -283,15 +320,15 @@ impl<P: Projection> Select<P> {
         async_stream::try_stream! {
             let exec = self.exec.clone().ok_or(Error::NotFound)?;
             let (projection, sql, arguments) = self.into_sql()?;
-            let pool = match exec {
-                Exec::Pool(pool) => pool,
-                Exec::Tx(_) => {
+            let driver = match exec {
+                Exec::Pool(driver) => driver,
+                Exec::Tx(..) => {
                     Err(Error::Transaction("stream is not supported inside a transaction"))?
                 }
             };
-            let mut rows = sqlx::query_with(sqlx::AssertSqlSafe(sql), arguments).fetch(&pool);
+            let mut rows = driver.stream(sql, arguments);
             while let Some(row) = futures::TryStreamExt::try_next(&mut rows).await? {
-                yield projection.decode(&row, 0)?;
+                yield projection.decode(row.as_ref(), 0)?;
             }
         }
     }
@@ -300,15 +337,23 @@ impl<P: Projection> Select<P> {
     ///
     /// # Errors
     /// [`Error::NotFound`] if no row, [`Error::TooManyRows`] if more than one.
-    pub async fn exact_one(mut self) -> Result<P::Output> {
+    pub async fn exact_one(mut self) -> Result<P::Output>
+    where
+        P: Sync,
+        P::Output: Send,
+    {
         self.limit = Some(2);
         let exec = self.take_exec()?;
         let (projection, sql, arguments) = self.into_sql()?;
-        let rows = exec.fetch_all(sql, arguments).await?;
-        match rows.split_first() {
-            None => Err(Error::NotFound),
-            Some((row, [])) => projection.decode(row, 0),
-            Some(_) => Err(Error::TooManyRows),
+        let mut rows: SmallVec<[P::Output; 2]> = SmallVec::new();
+        exec.for_each_row(sql, arguments, |row| {
+            rows.push(projection.decode(row, 0)?);
+            Ok(())
+        })
+        .await?;
+        if rows.len() > 1 {
+            return Err(Error::TooManyRows);
         }
+        rows.into_iter().next().ok_or(Error::NotFound)
     }
 }

@@ -1,0 +1,151 @@
+#![allow(missing_docs)] // gated-out builds compile to an empty crate
+#![cfg(feature = "mysql")]
+//! Integration test against a real **`MySQL`** server. Unlike Postgres (embedded)
+//! and `SQLite`/Turso (in-process), `MySQL` has no in-process mode, so this test
+//! is **gated on the `MYSQL_URL` env var** and skips when it is absent — set it to
+//! a throwaway database (e.g. in CI with a `MySQL` service) to run it.
+//!
+//! Proves the agnostic core runs on `MySQL`: schema DDL, `insert` / `insert_many`,
+//! typed select / partial projection / `IN` membership, aggregates, update,
+//! delete, and transactions. (`MySQL` has no `RETURNING`, so that is exercised by
+//! the Postgres and `SQLite` suites instead.)
+
+use stakit_orm::prelude::*;
+
+#[derive(Table, Debug, PartialEq, Eq)]
+#[table(name = "users")]
+struct User {
+    #[column(pk)]
+    id: i64,
+    #[column(unique)]
+    email: String,
+    name: String,
+    age: i32,
+}
+
+#[tokio::test]
+async fn end_to_end_against_mysql() {
+    let Ok(url) = std::env::var("MYSQL_URL") else {
+        eprintln!("MYSQL_URL not set; skipping MySQL e2e");
+        return;
+    };
+
+    let db = Db::connect_mysql(&url).await.expect("connect mysql");
+
+    // Fresh schema.
+    db.raw("drop table if exists users")
+        .exec()
+        .await
+        .expect("drop");
+    db.raw(
+        "create table users (\
+            id bigint primary key, \
+            email varchar(255) not null unique, \
+            name varchar(255) not null, \
+            age int not null)",
+    )
+    .exec()
+    .await
+    .expect("create table");
+
+    db.insert_many(vec![
+        UserNew {
+            id: 1,
+            email: "alice@x.com".to_owned(),
+            name: "Alice".to_owned(),
+            age: 30,
+        },
+        UserNew {
+            id: 2,
+            email: "bob@x.com".to_owned(),
+            name: "Bob".to_owned(),
+            age: 25,
+        },
+    ])
+    .exec()
+    .await
+    .expect("seed");
+
+    let fetched = db
+        .select(User::all())
+        .from::<User>()
+        .filter(eq(User::id, 1_i64))
+        .one()
+        .await
+        .expect("select one")
+        .expect("row present");
+    assert_eq!(fetched.email, "alice@x.com");
+
+    // any_of -> IN (?, ?) and ordering.
+    let some = db
+        .select(User::all())
+        .from::<User>()
+        .filter(any_of(User::id, &[1_i64, 2]))
+        .order_by(asc(User::age))
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(some.len(), 2);
+    assert_eq!(some[0].name, "Bob");
+
+    // aggregate.
+    let count = db.select(User::all()).from::<User>().count().await.unwrap();
+    assert_eq!(count, 2);
+
+    // update + transaction rollback.
+    db.update::<User>()
+        .set(User::age, 31)
+        .filter(eq(User::id, 1_i64))
+        .exec()
+        .await
+        .unwrap();
+
+    let result: Result<()> = db
+        .transaction(|tx| async move {
+            tx.insert(UserNew {
+                id: 3,
+                email: "carol@x.com".to_owned(),
+                name: "Carol".to_owned(),
+                age: 40,
+            })
+            .exec()
+            .await?;
+            Err(Error::Transaction("rollback"))
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        db.select(User::all()).from::<User>().count().await.unwrap(),
+        2,
+        "rolled-back insert must not persist"
+    );
+
+    // delete.
+    let deleted = db
+        .delete::<User>()
+        .filter(eq(User::id, 2_i64))
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+}
+
+#[tokio::test]
+async fn mysql_migrations_run_out_of_box() {
+    let Ok(url) = std::env::var("MYSQL_URL") else {
+        eprintln!("MYSQL_URL not set; skipping MySQL migration e2e");
+        return;
+    };
+    let db = Db::connect_mysql(&url).await.expect("connect");
+    db.raw("drop table if exists gadgets").exec().await.ok();
+    db.raw("drop table if exists _stakit_migrations")
+        .exec()
+        .await
+        .ok();
+    let migrations = [Migration {
+        version: "0001",
+        statements: &["create table gadgets (id bigint primary key, name varchar(64) not null)"],
+    }];
+    assert_eq!(db.migrate(&migrations).await.expect("migrate"), 1);
+    assert_eq!(db.migrate(&migrations).await.expect("again"), 0);
+}

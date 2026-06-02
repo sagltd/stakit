@@ -37,7 +37,7 @@ pub use message::{
 };
 pub use provider::{
     ChatRequest, ChatResponse, EventStream, Provider, StopReason, StreamEvent, ThinkingConfig,
-    ToolChoice, ToolDef,
+    ToolChoice, ToolDef, event_stream,
 };
 pub use skill::{FsSkillLoader, SkillContent, SkillLoader, SkillManifest};
 pub use tool::{Tool, ToolDyn, ToolRegistry, ToolSet, TypedTool};

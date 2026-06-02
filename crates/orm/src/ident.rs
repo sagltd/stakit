@@ -49,26 +49,40 @@ pub(crate) fn validate(name: &str) -> Result<(), IdentError> {
     Ok(())
 }
 
-/// Append a quoted identifier to `out`.
+/// Append an identifier to `out`, quoted with `quote` (`"` for the SQL standard,
+/// `` ` `` for `MySQL`); embedded `quote` characters are doubled.
 ///
 /// # Errors
 /// Returns [`IdentError`] if [`validate`] rejects `name`.
-pub(crate) fn write_quoted(out: &mut String, name: &str) -> Result<(), IdentError> {
+pub(crate) fn write_quoted_with(
+    out: &mut String,
+    name: &str,
+    quote: char,
+) -> Result<(), IdentError> {
     validate(name)?;
-    out.push('"');
+    out.push(quote);
     for ch in name.chars() {
-        if ch == '"' {
-            out.push('"');
+        if ch == quote {
+            out.push(quote);
         }
         out.push(ch);
     }
-    out.push('"');
+    out.push(quote);
     Ok(())
+}
+
+/// Append a standard double-quoted identifier (Postgres / `SQLite` / Turso).
+///
+/// # Errors
+/// Returns [`IdentError`] if [`validate`] rejects `name`.
+#[cfg(test)]
+pub(crate) fn write_quoted(out: &mut String, name: &str) -> Result<(), IdentError> {
+    write_quoted_with(out, name, '"')
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{IdentError, MAX_IDENT_LEN, validate, write_quoted};
+    use super::{IdentError, MAX_IDENT_LEN, validate, write_quoted, write_quoted_with};
 
     fn quote(name: &str) -> Result<String, IdentError> {
         let mut out = String::new();
@@ -79,6 +93,13 @@ mod tests {
     #[test]
     fn plain_name_is_wrapped() {
         assert_eq!(quote("users").unwrap(), r#""users""#);
+    }
+
+    #[test]
+    fn mysql_backtick_quoting_doubles_embedded_backticks() {
+        let mut out = String::new();
+        write_quoted_with(&mut out, "ta`b", '`').unwrap();
+        assert_eq!(out, "`ta``b`");
     }
 
     #[test]
@@ -106,5 +127,45 @@ mod tests {
     fn at_namedatalen_is_allowed() {
         let ok = "x".repeat(MAX_IDENT_LEN);
         assert!(validate(&ok).is_ok());
+    }
+
+    #[test]
+    fn write_quoted_rejects_empty_and_leaves_output_clean() {
+        let mut out = String::new();
+        assert_eq!(write_quoted(&mut out, ""), Err(IdentError::Empty));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn write_quoted_rejects_nul() {
+        let mut out = String::new();
+        assert_eq!(write_quoted(&mut out, "a\0b"), Err(IdentError::ContainsNul));
+    }
+
+    #[test]
+    fn multiple_embedded_quotes_are_all_doubled() {
+        assert_eq!(quote(r#"a"b"c"#).unwrap(), r#""a""b""c""#);
+    }
+
+    #[test]
+    fn over_length_reports_actual_length() {
+        let long = "x".repeat(MAX_IDENT_LEN + 5);
+        assert_eq!(
+            write_quoted(&mut String::new(), &long),
+            Err(IdentError::TooLong(MAX_IDENT_LEN + 5))
+        );
+    }
+
+    #[test]
+    fn error_display_messages() {
+        assert_eq!(IdentError::Empty.to_string(), "identifier is empty");
+        assert_eq!(
+            IdentError::ContainsNul.to_string(),
+            "identifier contains a NUL byte"
+        );
+        assert_eq!(
+            IdentError::TooLong(99).to_string(),
+            format!("identifier is 99 bytes, exceeds {MAX_IDENT_LEN}")
+        );
     }
 }

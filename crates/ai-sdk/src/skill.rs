@@ -81,7 +81,7 @@ impl<Ctx: Send + Sync + 'static> SkillLoader<Ctx> for FsSkillLoader {
             {
                 let skill_md = entry.path().join("SKILL.md");
                 if let Ok(text) = tokio::fs::read_to_string(&skill_md).await {
-                    if let Some(front) = parse_frontmatter(&text) {
+                    if let Some(front) = parse_frontmatter(&text.replace('\r', "")) {
                         manifests.push(front.into_manifest());
                     }
                 }
@@ -100,7 +100,8 @@ impl<Ctx: Send + Sync + 'static> SkillLoader<Ctx> for FsSkillLoader {
             let dir = self.root.join(name);
             let text = tokio::fs::read_to_string(dir.join("SKILL.md"))
                 .await
-                .map_err(|e| AiError::Skill(format!("skill {name}: {e}")))?;
+                .map_err(|e| AiError::Skill(format!("skill {name}: {e}")))?
+                .replace('\r', "");
             let body = strip_frontmatter(&text).trim().to_owned();
             let references = list_references(&dir).await;
             Ok(SkillContent { body, references })

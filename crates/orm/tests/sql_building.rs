@@ -325,6 +325,310 @@ fn empty_insert_renders_no_sql() {
     assert_eq!(sql, "");
 }
 
+#[derive(Table)]
+#[table(name = "profiles")]
+#[allow(dead_code)]
+struct Profile {
+    #[column(pk)]
+    id: Uuid,
+    bio: Option<String>,
+    age: i32,
+}
+
+#[test]
+fn ne_renders_not_equal() {
+    let sql = Select::new(User::all())
+        .from::<User>()
+        .filter(ne(User::name, "Dan"))
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"select "users"."id", "users"."email", "users"."name" from "users" where "users"."name" <> $1"#
+    );
+}
+
+#[test]
+fn comparison_operators_render() {
+    let sql = Select::new(Post::all())
+        .from::<Post>()
+        .filter(and(
+            and(gt(Post::views, 1), lt(Post::views, 100)),
+            and(gte(Post::views, 2), lte(Post::views, 99)),
+        ))
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"select "posts"."id", "posts"."author_id", "posts"."title", "posts"."views" from "posts" where (("posts"."views" > $1 and "posts"."views" < $2) and ("posts"."views" >= $3 and "posts"."views" <= $4))"#
+    );
+}
+
+#[test]
+fn like_on_nullable_column() {
+    let sql = Select::new(Profile::all())
+        .from::<Profile>()
+        .filter(like(Profile::bio, "%rust%"))
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"select "profiles"."id", "profiles"."bio", "profiles"."age" from "profiles" where "profiles"."bio" like $1"#
+    );
+}
+
+#[test]
+fn is_null_renders() {
+    let sql = Select::new(Profile::all())
+        .from::<Profile>()
+        .filter(is_null(Profile::bio))
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"select "profiles"."id", "profiles"."bio", "profiles"."age" from "profiles" where "profiles"."bio" is null"#
+    );
+}
+
+#[test]
+fn not_via_nested_or_and_combination() {
+    // Exercise deep and/or nesting and parenthesization.
+    let sql = Select::new(User::all())
+        .from::<User>()
+        .filter(or(
+            and(eq(User::name, "a"), eq(User::email, "b")),
+            or(eq(User::name, "c"), eq(User::name, "d")),
+        ))
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"select "users"."id", "users"."email", "users"."name" from "users" where (("users"."name" = $1 and "users"."email" = $2) or ("users"."name" = $3 or "users"."name" = $4))"#
+    );
+}
+
+#[test]
+fn multiple_order_by_terms() {
+    let sql = Select::new(User::all())
+        .from::<User>()
+        .order_by(asc(User::name))
+        .order_by(desc(User::email))
+        .order_by(asc(User::id))
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"select "users"."id", "users"."email", "users"."name" from "users" order by "users"."name" asc, "users"."email" desc, "users"."id" asc"#
+    );
+}
+
+#[test]
+fn any_of_multi_and_empty_bind_one_param_each() {
+    // multi
+    let ids = [uid(), uid(), uid()];
+    let sql = Select::new(User::all())
+        .from::<User>()
+        .filter(any_of(User::id, &ids))
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"select "users"."id", "users"."email", "users"."name" from "users" where "users"."id" = any($1)"#
+    );
+
+    // empty (still a single array bind)
+    let none: [Uuid; 0] = [];
+    let sql = Select::new(User::all())
+        .from::<User>()
+        .filter(any_of(User::id, &none))
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"select "users"."id", "users"."email", "users"."name" from "users" where "users"."id" = any($1)"#
+    );
+}
+
+#[test]
+fn group_by_multiple_columns() {
+    use stakit_orm::count_col;
+    let sql = Select::new((User::name, User::email, count_col(User::id)))
+        .from::<User>()
+        .group_by(User::name)
+        .group_by(User::email)
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"select "users"."name", "users"."email", count("users"."id") from "users" group by "users"."name", "users"."email""#
+    );
+}
+
+#[test]
+fn having_with_raw_pred_after_group_by() {
+    use stakit_orm::count_col;
+    use stakit_orm::expr::raw_pred;
+    let sql = Select::new((User::name, count_col(User::id)))
+        .from::<User>()
+        .group_by(User::name)
+        .having(raw_pred("count(*) >= 3"))
+        .order_by(desc(User::name))
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"select "users"."name", count("users"."id") from "users" group by "users"."name" having count(*) >= 3 order by "users"."name" desc"#
+    );
+}
+
+#[test]
+fn sql_expr_standalone_projection() {
+    use stakit_orm::sql_expr;
+    let sql = Select::new(sql_expr::<i64>("count(*) filter (where true)"))
+        .from::<User>()
+        .to_sql()
+        .unwrap();
+    assert_eq!(sql, r#"select count(*) filter (where true) from "users""#);
+}
+
+#[test]
+fn update_multiple_sets_no_filter() {
+    use stakit_orm::Update;
+    let sql = Update::<User>::new()
+        .set(User::name, "Sam")
+        .set(User::email, "s@b.com")
+        .to_sql()
+        .unwrap();
+    assert_eq!(sql, r#"update "users" set "name" = $1, "email" = $2"#);
+}
+
+#[test]
+fn update_set_to_column_value() {
+    // RHS is another column rather than a bound value.
+    use stakit_orm::Update;
+    let sql = Update::<User>::new()
+        .set(User::name, User::email)
+        .to_sql()
+        .unwrap();
+    assert_eq!(sql, r#"update "users" set "name" = "users"."email""#);
+}
+
+#[test]
+fn delete_without_filter() {
+    use stakit_orm::Delete;
+    let sql = Delete::<User>::new().to_sql().unwrap();
+    assert_eq!(sql, r#"delete from "users""#);
+}
+
+#[test]
+fn insert_mixed_optional_presence_across_rows() {
+    use stakit_orm::Insert;
+    // Row 1 omits id, row 2 supplies it. The union means the "id" column is
+    // included, and row 1 binds NULL for it.
+    let sql = Insert::new(vec![
+        AccountNew {
+            id: None,
+            email: "a@b.com".to_owned(),
+        },
+        AccountNew {
+            id: Some(uid()),
+            email: "c@d.com".to_owned(),
+        },
+    ])
+    .to_sql()
+    .unwrap();
+    assert_eq!(
+        sql,
+        r#"insert into "accounts" ("email", "id") values ($1, $2), ($3, $4)"#
+    );
+}
+
+#[derive(Table)]
+#[table(name = "widgets")]
+#[allow(dead_code)]
+struct Widget {
+    #[column(pk, default = "gen_random_uuid()")]
+    id: Uuid,
+    #[column(unique)]
+    sku: String,
+    name: String,
+    price: i32,
+}
+
+#[test]
+fn on_conflict_do_update_multiple_non_target_columns() {
+    use stakit_orm::Insert;
+    let sql = Insert::new(vec![WidgetNew {
+        id: Some(uid()),
+        sku: "abc".to_owned(),
+        name: "Gadget".to_owned(),
+        price: 10,
+    }])
+    .on_conflict_do_update(Widget::sku)
+    .to_sql()
+    .unwrap();
+    // Every inserted column except the conflict target is set to excluded.<col>.
+    assert_eq!(
+        sql,
+        r#"insert into "widgets" ("sku", "name", "price", "id") values ($1, $2, $3, $4) on conflict ("sku") do update set "name" = excluded."name", "price" = excluded."price", "id" = excluded."id""#
+    );
+}
+
+#[test]
+fn on_conflict_do_update_with_only_target_falls_back_to_do_nothing() {
+    use stakit_orm::Insert;
+    // Only the target column is present -> no non-target columns -> DO NOTHING.
+    let sql = Insert::new(vec![AccountNew {
+        id: None,
+        email: "a@b.com".to_owned(),
+    }])
+    .on_conflict_do_update(Account::email)
+    .to_sql()
+    .unwrap();
+    assert_eq!(
+        sql,
+        r#"insert into "accounts" ("email") values ($1) on conflict ("email") do nothing"#
+    );
+}
+
+#[test]
+fn count_terminal_wraps_subquery() {
+    // Count drops paging/order but keeps the filter; verify the inner SQL the
+    // wrapper is built from renders the filter correctly.
+    let sql = Select::new(User::all())
+        .from::<User>()
+        .filter(eq(User::name, "x"))
+        .order_by(asc(User::name))
+        .limit(10)
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"select "users"."id", "users"."email", "users"."name" from "users" where "users"."name" = $1 order by "users"."name" asc limit $2"#
+    );
+}
+
+#[test]
+fn full_clause_ordering() {
+    // where -> group by -> having -> order by -> limit -> offset, in order.
+    use stakit_orm::count_col;
+    use stakit_orm::expr::raw_pred;
+    let sql = Select::new((User::name, count_col(User::id)))
+        .from::<User>()
+        .filter(eq(User::email, "a@b.com"))
+        .group_by(User::name)
+        .having(raw_pred("count(*) > 0"))
+        .order_by(desc(User::name))
+        .limit(5)
+        .offset(10)
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"select "users"."name", count("users"."id") from "users" where "users"."email" = $1 group by "users"."name" having count(*) > 0 order by "users"."name" desc limit $2 offset $3"#
+    );
+}
+
 #[test]
 fn table_metadata_is_emitted() {
     assert_eq!(<User as stakit_orm::Table>::TABLE, "users");

@@ -17,7 +17,7 @@ mod session;
 mod ts;
 
 pub use action::{Action, StreamAction};
-pub use client::ClientAction;
+pub use client::{ClientAction, DEFAULT_CLIENT_CALL_TIMEOUT};
 pub use cx::Cx;
 pub use endpoint::{Endpoint, Kind};
 pub use error::Error;

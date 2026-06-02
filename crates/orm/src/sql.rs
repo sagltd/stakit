@@ -4,44 +4,29 @@
 //! step, and `$N` placeholders are numbered globally in clause order.
 
 use crate::ident::{self, IdentError};
-use sqlx::error::BoxDynError;
-use sqlx::postgres::PgArguments;
-use sqlx::{Arguments, Encode, Postgres, Type};
-
-/// A value queued to bind into a Postgres statement.
-///
-/// Boxed so heterogeneous value types share one ordered buffer; the concrete
-/// type is preserved until it is handed to sqlx, so binding stays type-safe (no
-/// string interpolation).
-pub trait Bind: Send {
-    /// Consume the boxed value and append it to sqlx arguments.
-    ///
-    /// # Errors
-    /// Propagates any sqlx encode error.
-    fn add(self: Box<Self>, args: &mut PgArguments) -> Result<(), BoxDynError>;
-}
-
-impl<T> Bind for T
-where
-    T: for<'q> Encode<'q, Postgres> + Type<Postgres> + Send + 'static,
-{
-    fn add(self: Box<Self>, args: &mut PgArguments) -> Result<(), BoxDynError> {
-        args.add(*self)
-    }
-}
+use crate::value::Value;
 
 /// Inline-capacity bind buffer: most statements bind few values, so the common
-/// case stays on the stack (no heap allocation for the buffer itself).
-pub(crate) type BindBuffer = smallvec::SmallVec<[Box<dyn Bind>; 4]>;
+/// case stays on the stack (no heap allocation for the buffer itself). Values are
+/// backend-neutral [`Value`]s; each driver converts them to native parameters.
+pub(crate) type BindBuffer = smallvec::SmallVec<[Value; 4]>;
 
 /// Typical assembled statement length; pre-sizing avoids `String` reallocs in
 /// the build hot path.
 const DEFAULT_SQL_CAPACITY: usize = 96;
 
 /// Accumulates SQL text and its ordered bind values.
+///
+/// The dialect's per-statement flags are read **once** at construction and cached
+/// as plain fields, so the hot assembly path (`push_bind`, `push_ident`) does no
+/// vtable dispatch per bind/identifier.
 pub struct SqlWriter {
     sql: String,
     binds: BindBuffer,
+    placeholder_prefix: char,
+    numbered_placeholders: bool,
+    quote_char: char,
+    supports_any_array: bool,
 }
 
 impl Default for SqlWriter {
@@ -51,12 +36,23 @@ impl Default for SqlWriter {
 }
 
 impl SqlWriter {
-    /// Create a writer with a pre-sized SQL buffer.
+    /// Create a writer with a pre-sized SQL buffer (Postgres dialect).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_dialect(crate::dialect::default_dialect())
+    }
+
+    /// Create a writer rendering placeholders for `dialect`. The dialect's flags
+    /// are snapshotted here; later calls never re-dispatch through the trait object.
+    #[must_use]
+    pub fn with_dialect(dialect: &'static dyn crate::dialect::Dialect) -> Self {
         Self {
             sql: String::with_capacity(DEFAULT_SQL_CAPACITY),
             binds: BindBuffer::new(),
+            placeholder_prefix: dialect.placeholder_prefix(),
+            numbered_placeholders: dialect.numbered_placeholders(),
+            quote_char: dialect.quote_char(),
+            supports_any_array: dialect.supports_any_array(),
         }
     }
 
@@ -70,7 +66,7 @@ impl SqlWriter {
     /// # Errors
     /// Returns [`IdentError`] if the identifier is invalid.
     pub fn push_ident(&mut self, name: &str) -> Result<(), IdentError> {
-        ident::write_quoted(&mut self.sql, name)
+        ident::write_quoted_with(&mut self.sql, name, self.quote_char)
     }
 
     /// Append a table-qualified column: `"table"."column"`.
@@ -78,25 +74,36 @@ impl SqlWriter {
     /// # Errors
     /// Returns [`IdentError`] if either identifier is invalid.
     pub fn push_qualified(&mut self, table: &str, column: &str) -> Result<(), IdentError> {
-        ident::write_quoted(&mut self.sql, table)?;
+        let quote = self.quote_char;
+        ident::write_quoted_with(&mut self.sql, table, quote)?;
         self.sql.push('.');
-        ident::write_quoted(&mut self.sql, column)
+        ident::write_quoted_with(&mut self.sql, column, quote)
     }
 
-    /// Queue a bind value and write its positional `$N` placeholder.
-    pub fn push_bind(&mut self, value: Box<dyn Bind>) {
+    /// Queue a bind value and write its positional placeholder (`$N` for
+    /// Postgres, `?N` for SQLite/libSQL).
+    pub fn push_bind(&mut self, value: Value) {
         self.binds.push(value);
         let position = self.binds.len();
-        self.sql.push('$');
-        // Avoid `format!` allocation in the hot path.
-        let mut buffer = itoa_buffer();
-        self.sql.push_str(itoa(position, &mut buffer));
+        self.sql.push(self.placeholder_prefix);
+        if self.numbered_placeholders {
+            // Avoid `format!` allocation in the hot path.
+            let mut buffer = itoa_buffer();
+            self.sql.push_str(itoa(position, &mut buffer));
+        }
     }
 
     /// Number of queued binds (also the next `$N`).
     #[must_use]
     pub fn bind_count(&self) -> usize {
         self.binds.len()
+    }
+
+    /// Whether this backend supports `= ANY(<array>)` with one array bind. When
+    /// false, list membership must expand to `IN (?, ?, …)`.
+    #[must_use]
+    pub const fn supports_any_array(&self) -> bool {
+        self.supports_any_array
     }
 
     /// Borrow the assembled SQL text.
@@ -136,34 +143,5 @@ fn itoa(value: usize, buffer: &mut ItoaBuffer) -> &str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::SqlWriter;
-
-    #[test]
-    fn qualified_column_is_quoted() {
-        let mut writer = SqlWriter::new();
-        writer.push_qualified("users", "id").unwrap();
-        assert_eq!(writer.sql(), r#""users"."id""#);
-    }
-
-    #[test]
-    fn binds_are_numbered_in_order() {
-        let mut writer = SqlWriter::new();
-        writer.push("a = ");
-        writer.push_bind(Box::new(10_i32));
-        writer.push(" and b = ");
-        writer.push_bind(Box::new(20_i32));
-        assert_eq!(writer.sql(), "a = $1 and b = $2");
-        assert_eq!(writer.bind_count(), 2);
-    }
-
-    #[test]
-    fn itoa_renders_multi_digit() {
-        let mut writer = SqlWriter::new();
-        for _ in 0..12 {
-            writer.push_bind(Box::new(1_i32));
-            writer.push(" ");
-        }
-        assert!(writer.sql().contains("$12"));
-    }
-}
+#[path = "sql/sql_test.rs"]
+mod sql_test;

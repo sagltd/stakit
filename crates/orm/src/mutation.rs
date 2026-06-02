@@ -4,8 +4,8 @@ use crate::error::{Error, Result};
 use crate::exec::Exec;
 use crate::expr::{IntoExpr, Operand, Predicate};
 use crate::schema::{Col, Table};
+use crate::sql::BindBuffer;
 use crate::sql::SqlWriter;
-use sqlx::postgres::PgArguments;
 
 /// An `UPDATE` statement under construction.
 pub struct Update<T> {
@@ -53,11 +53,15 @@ impl<T: Table> Update<T> {
         self
     }
 
-    fn into_sql(self) -> Result<(String, PgArguments)> {
+    fn into_sql(self) -> Result<(String, BindBuffer)> {
         if self.sets.is_empty() {
             return Err(Error::NotFound);
         }
-        let mut writer = SqlWriter::new();
+        let dialect = self
+            .exec
+            .as_ref()
+            .map_or_else(crate::dialect::default_dialect, Exec::dialect);
+        let mut writer = SqlWriter::with_dialect(dialect);
         writer.push("update ");
         writer.push_ident(T::TABLE)?;
         writer.push(" set ");
@@ -73,7 +77,7 @@ impl<T: Table> Update<T> {
             writer.push(" where ");
             filter.write(&mut writer)?;
         }
-        crate::render::finish(writer)
+        Ok(crate::render::finish(writer))
     }
 
     /// Render the SQL (for inspection / unit tests).
@@ -134,15 +138,19 @@ impl<T: Table> Delete<T> {
         self
     }
 
-    fn into_sql(self) -> Result<(String, PgArguments)> {
-        let mut writer = SqlWriter::new();
+    fn into_sql(self) -> Result<(String, BindBuffer)> {
+        let dialect = self
+            .exec
+            .as_ref()
+            .map_or_else(crate::dialect::default_dialect, Exec::dialect);
+        let mut writer = SqlWriter::with_dialect(dialect);
         writer.push("delete from ");
         writer.push_ident(T::TABLE)?;
         if let Some(filter) = self.filter {
             writer.push(" where ");
             filter.write(&mut writer)?;
         }
-        crate::render::finish(writer)
+        Ok(crate::render::finish(writer))
     }
 
     /// Render the SQL (for inspection / unit tests).

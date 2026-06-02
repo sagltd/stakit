@@ -1,6 +1,6 @@
 [package]
 name = "stakit-orm"
-description = "High-performance, type-safe Postgres ORM on sqlx. Drizzle-inspired."
+description = "High-performance, type-safe, database-agnostic ORM (Postgres, SQLite, MySQL, Turso/libSQL). Drizzle-inspired."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -8,9 +8,19 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+# Default to Postgres (the crate's original backend). Other backends are opt-in
+# so consumers don't compile sqlx-mysql / sqlx-sqlite / libsql unless requested.
+default = ["postgres"]
+postgres = ["sqlx/postgres"]
+sqlite = ["sqlx/sqlite"]
+mysql = ["sqlx/mysql"]
+turso = ["dep:libsql"]
+
 [dependencies]
 stakit-orm-derive.workspace = true
 sqlx.workspace = true
+libsql = { workspace = true, optional = true }
 smallvec.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true

@@ -16,7 +16,8 @@ path = "src/main.rs"
 syn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx.workspace = true
+# The migration CLI is Postgres-targeted: it needs the sqlx Postgres backend.
+sqlx = { workspace = true, features = ["postgres"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]

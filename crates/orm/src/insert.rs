@@ -13,7 +13,7 @@
 use crate::error::{Error, Result};
 use crate::exec::Exec;
 use crate::projection::Projection;
-use crate::sql::{Bind, SqlWriter};
+use crate::sql::SqlWriter;
 use smallvec::SmallVec;
 
 /// A callback that writes the `RETURNING` projection columns.
@@ -91,9 +91,9 @@ impl<N: Insertable> Insert<N> {
     }
 
     /// Which optional columns appear in any row (union); all-`None` optionals are
-    /// omitted so the DB default applies.
-    fn optional_included(rows: &[N]) -> Vec<bool> {
-        let mut included = vec![false; N::OPTIONAL.len()];
+    /// omitted so the DB default applies. Inline up to 16 optional columns.
+    fn optional_included(rows: &[N]) -> OptionalPresent {
+        let mut included: OptionalPresent = smallvec::smallvec![false; N::OPTIONAL.len()];
         for row in rows {
             for (slot, present) in included.iter_mut().zip(row.optional_present()) {
                 *slot = *slot || present;
@@ -102,8 +102,8 @@ impl<N: Insertable> Insert<N> {
         included
     }
 
-    fn column_names(included: &[bool]) -> Vec<&'static str> {
-        let mut names: Vec<&'static str> = N::REQUIRED.to_vec();
+    fn column_names(included: &[bool]) -> SmallVec<[&'static str; 16]> {
+        let mut names: SmallVec<[&'static str; 16]> = SmallVec::from_slice(N::REQUIRED);
         for (name, present) in N::OPTIONAL.iter().zip(included) {
             if *present {
                 names.push(name);
@@ -134,7 +134,10 @@ impl<N: Insertable> Insert<N> {
         } = self;
         let included = Self::optional_included(&rows);
         let columns = Self::column_names(&included);
-        let mut writer = SqlWriter::new();
+        let dialect = exec
+            .as_ref()
+            .map_or_else(crate::dialect::default_dialect, crate::exec::Exec::dialect);
+        let mut writer = SqlWriter::with_dialect(dialect);
         Self::write_head(&mut writer, &columns)?;
         for (index, row) in rows.into_iter().enumerate() {
             if index > 0 {
@@ -159,6 +162,17 @@ impl<N: Insertable> Insert<N> {
         Ok((exec.ok_or(Error::NotFound)?, writer))
     }
 
+    /// Error early if this builder's backend does not support `RETURNING` (`MySQL`),
+    /// rather than emitting invalid SQL that only fails at the database.
+    fn ensure_returning_supported(&self) -> Result<()> {
+        if let Some(exec) = &self.exec {
+            if !exec.dialect().supports_returning() {
+                return Err(Error::Unsupported("RETURNING"));
+            }
+        }
+        Ok(())
+    }
+
     /// Render the SQL (for inspection / unit tests).
     ///
     /// # Errors
@@ -180,7 +194,7 @@ impl<N: Insertable> Insert<N> {
             return Ok(0);
         }
         let (exec, writer) = self.build(None)?;
-        let (sql, arguments) = crate::render::finish(writer)?;
+        let (sql, arguments) = crate::render::finish(writer);
         exec.execute(sql, arguments).await
     }
 
@@ -205,17 +219,25 @@ impl<N: Insertable, P: Projection> InsertReturning<N, P> {
     ///
     /// # Errors
     /// Returns an error if the statement fails or a row fails to decode.
-    pub async fn all(self) -> Result<Vec<P::Output>> {
+    pub async fn all(self) -> Result<Vec<P::Output>>
+    where
+        P: Sync,
+        P::Output: Send,
+    {
         if self.insert.rows.is_empty() {
             return Ok(Vec::new());
         }
+        self.insert.ensure_returning_supported()?;
         let projection_columns = projection_writer(&self.projection);
         let (exec, writer) = self.insert.build(Some(&projection_columns))?;
-        let (sql, arguments) = crate::render::finish(writer)?;
-        let rows = exec.fetch_all(sql, arguments).await?;
-        rows.iter()
-            .map(|row| self.projection.decode(row, 0))
-            .collect()
+        let (sql, arguments) = crate::render::finish(writer);
+        let mut out = Vec::new();
+        exec.for_each_row(sql, arguments, |row| {
+            out.push(self.projection.decode(row, 0)?);
+            Ok(())
+        })
+        .await?;
+        Ok(out)
     }
 
     /// Execute and decode a single returned row (a plain single-row insert always
@@ -223,18 +245,27 @@ impl<N: Insertable, P: Projection> InsertReturning<N, P> {
     ///
     /// # Errors
     /// [`Error::NotFound`] if no row was returned; decode/statement errors otherwise.
-    pub async fn one(self) -> Result<P::Output> {
+    pub async fn one(self) -> Result<P::Output>
+    where
+        P: Sync,
+        P::Output: Send,
+    {
         if self.insert.rows.is_empty() {
             return Err(Error::NotFound);
         }
+        self.insert.ensure_returning_supported()?;
         let projection_columns = projection_writer(&self.projection);
         let (exec, writer) = self.insert.build(Some(&projection_columns))?;
-        let (sql, arguments) = crate::render::finish(writer)?;
-        let row = exec
-            .fetch_optional(sql, arguments)
-            .await?
-            .ok_or(Error::NotFound)?;
-        self.projection.decode(&row, 0)
+        let (sql, arguments) = crate::render::finish(writer);
+        let mut out = None;
+        exec.for_each_row(sql, arguments, |row| {
+            if out.is_none() {
+                out = Some(self.projection.decode(row, 0)?);
+            }
+            Ok(())
+        })
+        .await?;
+        out.ok_or(Error::NotFound)
     }
 }
 
@@ -274,12 +305,9 @@ fn write_conflict(writer: &mut SqlWriter, conflict: Conflict, columns: &[&str]) 
     Ok(())
 }
 
-/// Helper for generated code: box a value as a [`Bind`].
+/// Helper for generated code: convert a field into a backend-neutral [`Value`].
 #[doc(hidden)]
 #[must_use]
-pub fn boxed_bind<T>(value: T) -> Box<dyn Bind>
-where
-    T: for<'q> sqlx::Encode<'q, sqlx::Postgres> + sqlx::Type<sqlx::Postgres> + Send + 'static,
-{
-    Box::new(value)
+pub fn boxed_bind<T: crate::value::ToValue>(value: T) -> crate::value::Value {
+    value.to_value()
 }

@@ -102,7 +102,10 @@ impl<P: Provider, Ctx: Send + Sync + 'static> Agent<P, Ctx> {
     /// Runs the loop, yielding a stream of [`LoopEvent`]s.
     ///
     /// `history` is the initial conversation, `ctx` the tool context, and
-    /// `cancel` aborts the run mid-stream.
+    /// `cancel` aborts the run mid-stream. Cancellation interrupts the provider
+    /// stream immediately; a tool already executing runs to completion unless it
+    /// observes [`ToolCx::cancel_token`](crate::ToolCx::cancel_token) itself, so
+    /// long-running tools should poll it.
     pub fn run(
         &self,
         history: Vec<Message>,
@@ -233,7 +236,8 @@ impl<P: Provider, Ctx: Send + Sync + 'static> Agent<P, Ctx> {
 
                 yield LoopEvent::StepStart { step };
 
-                let request = build_request(&inner, &model_id, system.as_ref(), &history);
+                let request =
+                    build_request(&inner, &model_id, !skill_manifests.is_empty(), system.as_ref(), &history);
                 let mut stream = match inner.provider.stream(request).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -405,6 +409,7 @@ impl<P: Provider, Ctx: Send + Sync + 'static> Agent<P, Ctx> {
 fn build_request<P, Ctx: Send + Sync + 'static>(
     inner: &Inner<P, Ctx>,
     model: &str,
+    skills_active: bool,
     system: Option<&SystemPrompt>,
     history: &[Message],
 ) -> ChatRequest {
@@ -412,7 +417,7 @@ fn build_request<P, Ctx: Send + Sync + 'static>(
     if inner.tools.has_deferred() {
         tools.push(tool_search_def());
     }
-    if inner.skills.is_some() {
+    if skills_active {
         tools.extend(skill_tool_defs());
     }
     ChatRequest {
