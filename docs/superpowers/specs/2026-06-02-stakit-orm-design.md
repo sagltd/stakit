@@ -598,7 +598,155 @@ Default to per-test database for clarity; revisit if boot/create cost hurts.
 First run downloads the pg binary (cached after). Pin newest versions at
 implementation time (workspace rule: check crates.io).
 
-## 15. Phasing summary
+## 15. Performance — measured with divan
+
+Performance is a first-class requirement and **must be measured, not asserted**.
+The workspace already uses [`divan`](https://crates.io/crates/divan) (in
+`[workspace.dependencies]`); each crate gets a `benches/` dir. Benchmarks are part
+of the deliverable, not an afterthought — a change that regresses a tracked metric
+is a bug.
+
+### What is benchmarked (and why each matters)
+
+The ORM's overhead is **everything between the user's call and sqlx's
+`fetch`/`execute`**. That overhead must be near-zero versus hand-written sqlx.
+
+| Bench | Measures | Target (relative to raw sqlx) |
+|---|---|---|
+| `bench_select_build` | build SQL string + binds for a typical select (3 cols, 2 predicates, 1 order) | < 200 ns; **0 heap allocations** (smallvec stays on stack) |
+| `bench_select_build_join` | same with a 2-table join | < 400 ns; ≤ 1 alloc |
+| `bench_projection_tuple` | `Projection` → column list for a 3-tuple | 0 alloc |
+| `bench_row_macro` | `row!{}` expansion cost (compile-time; measured via generated-code path at runtime) | within 5% of `#[derive(Row)]` |
+| `bench_insert_chunk_calc` | `insert_many` chunk planning for 10k rows | < 1 µs; 0 alloc beyond the chunk vec |
+| `bench_predicate_compose` | `and(eq, or(gt, lt))` tree build | 0 alloc (smallvec) |
+| `bench_error_map` | `sqlx::Error` → `Error` SQLSTATE mapping | < 100 ns |
+| `bench_decode_row` (integration) | decode N rows into `User` vs sqlx `query_as` | within 3% of raw sqlx |
+| `bench_insert_throughput` (integration) | rows/sec: `insert` vs `insert_many` vs `copy_into` at 1/1k/100k | `copy_into` ≥ 5× `insert_many` at 100k |
+
+Pure-build benches (no DB) run in the default loop. Integration throughput benches
+use the embedded pg from §14 and run in CI.
+
+### Methodology
+
+- Measure **allocations**, not just time — the zero-copy/zero-alloc claims in §2
+  and §7 are verified with an allocation-counting global allocator in the bench
+  harness (or `divan`'s alloc profiling). A claim of "0 heap allocations" that
+  isn't asserted is treated as false.
+- `std::hint::black_box` all inputs/outputs to defeat const-folding.
+- Track regressions: bench results recorded; a tracked metric regressing > 10% is
+  a release blocker.
+- Compare against a **raw-sqlx baseline** in the same bench file so overhead is
+  always expressed as a delta, not an absolute that drifts with hardware.
+
+### Performance design invariants (what the benches protect)
+
+1. SQL string built **once** at the terminal, never per builder step.
+2. Column/predicate buffers are `smallvec` sized so the common case (≤ 8) never
+   heap-allocates.
+3. Column/relation tokens are zero-sized; no per-query allocation for schema info.
+4. `insert_many` issues one multi-row statement per chunk (one round-trip), not N.
+5. Prepared-statement reuse is on (see §16) so repeated queries skip re-parse.
+6. No `format!`-per-row in any hot path; SQL assembled into a single reused
+   `String` with computed capacity.
+
+## 16. Production readiness
+
+### Connection pool
+
+`Db::new(pool)` wraps `sqlx::PgPool`. Expose a `DbConfig` builder for production
+knobs (all map to sqlx `PoolOptions`):
+
+```rust
+let db = Db::connect(DbConfig {
+    url,
+    max_connections: 20,
+    min_connections: 2,
+    acquire_timeout: Duration::from_secs(5),
+    idle_timeout: Some(Duration::from_secs(600)),
+    max_lifetime: Some(Duration::from_secs(1800)),
+    statement_cache_capacity: 256,
+}).await?;
+```
+
+- **Acquire timeout** is mandatory (no unbounded waits → no hung requests).
+- Pool is `Clone` + `Send` + `Sync` (sqlx `PgPool` is `Arc` inside); share across
+  tasks freely.
+
+### Prepared-statement cache
+
+sqlx caches prepared statements per connection by default. The builder produces a
+**stable SQL string for a given query shape** (same shape → same string → cache
+hit), so repeated queries skip parse/plan. The `row!`/builder must NOT embed
+values into the SQL text (they go to binds) — otherwise cache thrashes. This is
+both a perf and a security invariant (§17).
+
+### Timeouts & cancellation
+
+- Every terminal accepts an optional per-query timeout; on elapse the future is
+  dropped → sqlx cancels. Default inherits `DbConfig`.
+- All futures are cancellation-safe (drop = rollback for an open tx, §11).
+
+### Observability
+
+- `tracing` spans around each query: span fields = operation, table, elapsed,
+  rows. SQL text only at `DEBUG`; **bind values never logged** (PII/secrets).
+- Optional slow-query log threshold in `DbConfig`.
+- Errors carry enough context (table, constraint) without leaking values.
+
+### Type mapping (Rust ↔ Postgres)
+
+Delegated to sqlx's `Type`/`Encode`/`Decode`, fixed at v1:
+
+| Rust | Postgres |
+|---|---|
+| `i16/i32/i64` | `smallint/int/bigint` |
+| `f32/f64` | `real/double precision` |
+| `bool` | `boolean` |
+| `String`/`&str` | `text` |
+| `Vec<u8>` | `bytea` |
+| `Uuid` (`uuid` feature) | `uuid` |
+| `DateTime<Utc>`/`NaiveDate` (`chrono`) | `timestamptz`/`date` |
+| `serde_json::Value` (`json` feature) | `jsonb` |
+| `Option<T>` | nullable column |
+| `Vec<T>` | `T[]` array |
+| `#[column(enum)]` Rust enum | pg enum / text |
+
+Optional types gated behind cargo features (`uuid`, `chrono`, `json`, `decimal`)
+so a minimal build stays lean. Newest crate versions pinned at impl (workspace
+rule).
+
+### Concurrency & safety
+
+- All public futures `Send` where the executor is `Send` (matches workspace
+  `future_not_send` relaxation but the executor path stays `Send`).
+- `unsafe` forbidden workspace-wide — no exceptions; zero-copy is via lifetimes /
+  smallvec, never raw pointers.
+- Derives generate only safe code; no `unsafe` in expansions.
+
+### Graceful failure
+
+- Pool exhaustion → `Error::Database` with acquire-timeout context, not a hang.
+- Migration checksum drift (edited applied migration) → hard error at startup via
+  sqlx, surfaced clearly.
+- Partial `insert_many`/`copy_into` failure → whole operation in one transaction,
+  rolls back (no partial writes).
+
+## 17. Security
+
+- **SQL injection:** all user values are bound parameters (`$N`), never
+  string-interpolated. Identifiers (table/column names) come only from
+  compile-time schema tokens and are quoted (`"users"."id"`) — never from runtime
+  strings. `sql!` `{}` accepts only `Col` tokens (compile-checked), `?` only
+  binds. The raw escape hatch (`db.raw`) takes a `&'static str` SQL with `.bind()`
+  params — no interpolation API is exposed.
+- **No value logging:** bind values excluded from spans/logs by default (§16).
+- **`unsafe` forbidden** (workspace lint); memory-safety by construction.
+- **Least surprise:** no implicit `*` that leaks new columns into typed results —
+  projections are explicit; `T::all()` is generated from the known schema.
+- **Migration safety:** generated SQL is reviewed before apply; destructive diffs
+  (drop column/table) are surfaced, never auto-applied silently (§5, v2).
+
+## 18. Phasing summary
 
 | Version | Scope |
 |---|---|
@@ -606,7 +754,7 @@ implementation time (workspace rule: check crates.io).
 | **v2** | relational API 2 (one-level `.with()`); migration diff alter/drop |
 | **v3** | nested `.with()`; CTEs; subqueries; broader aggregates; possible second backend behind the executor trait |
 
-## 16. Open questions / risks
+## 19. Open questions / risks
 
 - **`row!` field-type checking** happens at decode, not select, for non-`sql!`
   fields (the proc-macro pre-typecheck limitation). Acceptable; derive Row (B)
