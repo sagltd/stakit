@@ -302,8 +302,8 @@ detection in a later pass (flagged to user, hand-edit allowed meanwhile).
 ## 6. Query API 1 — SQL builder (Drizzle `db.select()`)
 
 Free-function operators (exactly Drizzle): `eq`, `and`, `or`, `gt`, `lt`, `gte`,
-`lte`, `ne`, `like`, `in_`, `is_null`, `asc`, `desc`. `where` is a Rust reserved
-keyword → the method is **`.filter()`**.
+`lte`, `ne`, `like`, `any_of` (renders `= ANY($1)`, see below), `is_null`, `asc`,
+`desc`. `where` is a Rust reserved keyword → the method is **`.filter()`**.
 
 ```rust
 use stakit_orm::prelude::*;
@@ -1221,7 +1221,7 @@ pagination. `bench_stream_memory` (§15) asserts bounded client memory.
 Highest-risk items to prototype first (de-risk before committing the full v1):
 
 - **`Projection` + `row!` type machinery (§7)** is the core typing bet — the
-  `field(expr, extractor)` type-resolution trick and the tuple/`All`/`Col`/`Count`
+  `field<X: Expr>(e: X)` type-resolution trick (`X::Out: Decode`) and the tuple/`All`/`Col`/`Count`
   wrapper coherence must be proven with a compiling spike before the rest of the
   builder is built on it. Fallback if the inline-`row!` inference proves too
   brittle: ship tuple (A) + `#[derive(Row)]` (B) in v1, move `row!` (C) to v1.1.
