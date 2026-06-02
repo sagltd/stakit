@@ -139,10 +139,14 @@ pub struct Comment {
 - sqlx `FromRow` (delegated).
 - **Insert companion type** `UserNew` (Drizzle-style): same columns, but any
   column with a `#[column(default = …)]` (or `pk` with a default) is `Option<T>`
-  — `None` omits it from the INSERT list so the **DB default fires**; relation
-  (`Rel<_>`) fields are absent. `db.insert`/`insert_many` take `UserNew`, so DB
-  defaults are reachable (the full `User` struct, with required `id`/`created_at`,
-  is the *read* shape). `UserNew::from(User)` exists for convenience.
+  — `None` omits it from the INSERT list so the **DB default fires**; required
+  (non-defaulted) columns stay **plain, non-`Option`** fields; relation (`Rel<_>`)
+  fields are absent. `UserNew` deliberately does **NOT** derive `Default` (that
+  would let a required FK like `author_id: Uuid` silently become the nil UUID —
+  defeating the required-field guarantee). `db.insert`/`insert_many` accept `impl
+  Into<UserNew>`, with a generated `From<User> for UserNew` — so passing a full
+  `User` (the read shape) works and copies real values, while constructing
+  `UserNew` directly (with `None` for defaulted columns) reaches DB defaults.
 
 ### Compile-time checks (what rustc verifies)
 
@@ -238,12 +242,21 @@ create table posts (
     id uuid primary key default gen_random_uuid(),
     author_id uuid not null references users(id) on delete cascade,
     title text not null,
+    views int not null,
+    created_at timestamptz not null default now(),
     body text
+);
+create table comments (
+    id uuid primary key default gen_random_uuid(),
+    post_id uuid not null references posts(id) on delete cascade,
+    author_id uuid not null references users(id) on delete cascade,
+    body text not null
 );
 ```
 
 `...init.down.sql`:
 ```sql
+drop table comments;
 drop table posts;
 drop table users;
 ```
@@ -420,7 +433,7 @@ static wrappers simply ignore `&self`. Decode strategies are provided by
 | `count()` / `count(Post::id)` | `Count` | `i64` | `try_get(0)` |
 | `sum(Col<_,T>)` / `avg(_)` | `Sum<T>` / `Avg` | `T` / `f64` | `try_get(0)` |
 | `User::all()` | `All<User>` | `User` | `User::from_row` (sqlx `FromRow`) |
-| `User::all().nullable()` | `All<User, Nullable>` | `Option<User>` | `None` when the row's columns are all NULL (outer-join side), else `User::from_row` |
+| `User::all().nullable()` | `All<User, Nullable>` | `Option<User>` | `None` when the **PK column is NULL** (the unambiguous outer-join "no match" signal — `All<T>` always selects the non-nullable PK), else `User::from_row` |
 | `UserStat::project()` (derive Row) | `RowProj<UserStat>` | `UserStat` | derived |
 | `row! { .. }` | macro-generated local | anonymous named struct | per-field, see below |
 
@@ -627,11 +640,12 @@ SQL text is the caller's responsibility; values must still go through `.bind()`/
 ## 10. Inserts + batching
 
 ```rust
-// single — UserNew lets defaulted columns (id, created_at) be omitted (None) so
-// the DB default fires; required columns are plain fields.
-let id: Uuid = db.insert(UserNew { email, name, ..Default::default() })
+// single — UserNew: defaulted columns (id, created_at) set to None so the DB
+// default fires; required columns (email, name) are plain, must be supplied.
+// No Default derive (a required FK must not silently become a nil UUID).
+let id: Uuid = db.insert(UserNew { email, name, id: None, created_at: None })
     .returning(User::id).one().await?;
-db.insert(new_user).exec().await?;                   // -> rows affected
+db.insert(user).exec().await?;        // full User accepted via From<User> for UserNew
 
 // many -> INSERT … SELECT * FROM UNNEST($1::T[], …), one array per column, one statement
 let n = db.insert_many(new_users).exec().await?;
