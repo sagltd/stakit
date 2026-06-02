@@ -1,7 +1,8 @@
 //! Per-action middleware (guards): run a check before an action — and optionally
 //! a hook after — without reaching the action body if the guard fails.
 //!
-//! Trait-based, plain `async fn`, no boxing:
+//! Trait-based, plain `async fn`, no boxing in your code (the trait methods are
+//! return-position `impl Future + Send`, which you satisfy with `async fn`):
 //!
 //! ```ignore
 //! struct RequireAdmin;
@@ -28,8 +29,9 @@ use crate::{Action, Cx, Error, StreamAction};
 /// A pre/post-action guard. Implement `before` (default: pass) to gate the
 /// action; `after` (default: no-op) runs once the action completes.
 ///
-/// Both are plain `async fn`. Returning `Err` from `before` short-circuits — the
-/// action body never runs and the error becomes the reply.
+/// Both are plain `async fn` (no boxing). Returning `Err` from `before`
+/// short-circuits — the action body never runs and the error becomes the reply;
+/// `after` is then skipped too.
 pub trait Middleware<G, R>: Send + Sync + 'static {
     /// Runs before the action. `Err` skips the action and is returned instead.
     fn before(&self, _cx: &Cx<G, R>) -> impl Future<Output = Result<(), Error>> + Send {
@@ -83,6 +85,9 @@ where
         self.action.name()
     }
 
+    // Boxed because `Action::run` returns `BoxFuture` (the router's erasure layer)
+    // — the same single `Box::pin` every action already does; the `Middleware`
+    // trait itself is box-free.
     fn run<'a>(
         &'a self,
         cx: &'a Cx<G, R>,
@@ -125,6 +130,7 @@ where
         input: Self::Input,
     ) -> BoxStream<'a, Result<Self::Item, Self::Error>> {
         Box::pin(async_stream::stream! {
+            // guard runs once before the stream starts
             if let Err(error) = self.mw.before(cx).await {
                 yield Err(error);
                 return;
@@ -133,6 +139,7 @@ where
             while let Some(item) = items.next().await {
                 yield item.map_err(Into::into);
             }
+            // runs once after the whole stream finishes (not per item)
             self.mw.after(cx).await;
         })
     }

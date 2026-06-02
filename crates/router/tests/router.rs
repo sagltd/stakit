@@ -4,14 +4,19 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::OnceLock;
+
 use stakit_model::Model;
-use stakit_router::{Action, ClientAction, Cx, Error, Frame, Router, action, err};
+use stakit_router::{
+    Action, ActionExt as _, ClientAction, Cx, Error, Frame, Middleware, Router, action, err,
+};
 
 // --- contexts ---
 struct App {
@@ -565,6 +570,103 @@ async fn unit_test_action_with_mocked_client_call() {
         .await
         .unwrap();
     assert_eq!(out.message, "delivered");
+}
+
+// ── middleware: JWT-style auth guard (validate token → inject user → gate) ───
+
+#[derive(Clone, Default)]
+struct AuthReq {
+    bearer: Option<String>,
+    user: OnceLock<String>, // filled by the guard, read by the action
+}
+
+struct JwtAuth;
+impl Middleware<App, AuthReq> for JwtAuth {
+    // plain `async fn`, no Box. Validates the token and injects the user; the
+    // action body is never reached if this returns `Err`.
+    async fn before(&self, cx: &Cx<App, AuthReq>) -> Result<(), Error> {
+        let token = cx
+            .req
+            .bearer
+            .as_deref()
+            .ok_or_else(|| err!(401, "missing bearer token"))?;
+        // (a real impl verifies a JWT signature/claims here)
+        let user = token
+            .strip_prefix("valid:")
+            .ok_or_else(|| err!(401, "invalid token"))?;
+        let _ = cx.req.user.set(user.to_owned()); // OnceLock = interior mutability
+        Ok(())
+    }
+}
+
+#[action]
+async fn whoami_authed(cx: &Cx<App, AuthReq>) -> Result<String, Error> {
+    // reads the user the guard injected
+    cx.req
+        .user
+        .get()
+        .cloned()
+        .ok_or_else(|| err!(401, "unauthenticated"))
+}
+
+fn auth_router() -> Router<App, AuthReq> {
+    Router::builder()
+        .ctx(App {
+            greeting: "Hi".to_owned(),
+        })
+        .register(whoami_authed.middleware(JwtAuth))
+        .build()
+}
+
+#[test]
+fn middleware_rejects_before_reaching_action() {
+    // no token → 401, action body never runs
+    let denied = block_on(
+        auth_router().on_request(AuthReq::default(), payload("whoami_authed", json!(null))),
+    );
+    assert_eq!(denied["whoami_authed"]["error"]["code"], 401);
+}
+
+static ACTION_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[action]
+async fn counted(_cx: &Cx<App, AuthReq>) -> Result<(), Error> {
+    ACTION_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+struct Deny;
+impl Middleware<App, AuthReq> for Deny {
+    async fn before(&self, _cx: &Cx<App, AuthReq>) -> Result<(), Error> {
+        Err(err!(403, "denied"))
+    }
+}
+
+#[test]
+fn before_error_never_calls_the_action() {
+    ACTION_CALLS.store(0, Ordering::SeqCst);
+    let router = Router::builder()
+        .ctx(App {
+            greeting: "Hi".to_owned(),
+        })
+        .register(counted.middleware(Deny))
+        .build();
+
+    let out = block_on(router.on_request(AuthReq::default(), payload("counted", json!(null))));
+    assert_eq!(out["counted"]["error"]["code"], 403);
+    // the action body never ran
+    assert_eq!(ACTION_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn middleware_passes_and_injects_user() {
+    let req = AuthReq {
+        bearer: Some("valid:alice".to_owned()),
+        user: OnceLock::new(),
+    };
+    let ok = block_on(auth_router().on_request(req, payload("whoami_authed", json!(null))));
+    assert_eq!(ok["whoami_authed"]["status"], "ok");
+    assert_eq!(ok["whoami_authed"]["data"], json!("alice")); // injected by the guard
 }
 
 #[test]

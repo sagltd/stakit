@@ -151,10 +151,37 @@ Findings fixed:
   composite primary keys** (compile error), matching the single-column `type Pk`.
 - Gate: 115 tests green (all-features), 0 clippy issues, doctest green.
 
-Still open (next rounds): relational `with`/`#[has_many]`; universal migration DDL
-generation (CLI `gen` is Postgres-only; a Driver-based runtime apply would work on any
-backend); a typed-decode fast-path to skip per-cell `Value` materialization; live
-`MySQL` e2e (needs `MYSQL_URL`).
+## Review loop — round 3 (universal migrations)
+
+- **Migrations now run out-of-box on any backend.** `Db::migrate(&[Migration])` applies
+  pending, versioned migrations through the [`Driver`] (not a backend-specific
+  migrator): it creates a `_stakit_migrations` tracking table (portable
+  `varchar(255)` PK DDL), runs each pending migration's statements + version record in
+  a transaction, and is idempotent. Works on Postgres / `SQLite` / `MySQL` / Turso.
+  `Migration { version, statements }` is a plain value (no SQL-file parsing), exported
+  in the prelude. E2e verified on `SQLite` and the non-sqlx Turso backend; gated e2e on
+  `MySQL`. (Caveat: `MySQL` implicitly commits DDL, so a multi-statement migration that
+  fails mid-way is not atomic there — the standard `MySQL` limitation.)
+- Gate: 118 tests green (all-features), 0 clippy issues, doctest green.
+
+## Review loop — round 4 (relations)
+
+- **Typed, batched relations (no N+1), backend-agnostic.** `Db::load_has_many(parents,
+  child_fk, parent_key, child_key) -> Vec<(P, Vec<C>)>` and
+  `Db::load_belongs_to(children, child_key, parent_pk, parent_key) -> Vec<(C, Option<P>)>`
+  each issue **one** batched `... WHERE fk IN (keys)` query (via `any_of`, which works on
+  every driver) then group in memory. Fully typed — `Col<C, K>` forces the FK type to
+  match the parent key. This is Drizzle's relational-load pattern (the efficient
+  two-query form, not N+1). E2e verified on `SQLite` and the non-sqlx Turso backend.
+- Gate: 120 tests green (all-features), 0 clippy issues, doctest green.
+
+Genuinely remaining (not quick fixes): the CLI `gen` schema-diff DDL generator is still
+Postgres-specific (the *runtime* migration apply is universal); a typed-decode fast-path
+to skip per-cell `Value` materialization (perf); declarative `#[has_many]`/`#[belongs_to]`
+codegen on top of the working `load_*` primitives; and **live `MySQL` e2e**, which is
+environment/infra-blocked — there is no in-process MySQL in Rust, and this machine has no
+`mysqld`/Docker, so the `MySQL` driver is verified by shared-code-path + offline SQL
+rendering + `MYSQL_URL`-gated e2e (runnable in CI with a MySQL service).
 
 ## Not yet implemented (tracked, with rationale)
 

@@ -170,7 +170,7 @@ async fn end_to_end_against_turso() {
     );
 }
 
-#[derive(Table, Debug, PartialEq, Eq)]
+#[derive(Table, Debug, Clone, PartialEq, Eq)]
 #[table(name = "authors")]
 struct Author {
     #[column(pk)]
@@ -279,13 +279,91 @@ async fn turso_migrations_run_out_of_box() {
     assert_eq!(db.migrate(&migrations).await.expect("migrate"), 2);
     assert_eq!(db.migrate(&migrations).await.expect("again"), 0);
 
-    #[derive(Table, Debug)]
-    #[table(name = "items")]
-    struct Item {
-        #[column(pk)]
-        id: i64,
-        label: String,
-    }
     let n = db.select(Item::all()).from::<Item>().count().await.unwrap();
     assert_eq!(n, 1);
+}
+
+#[derive(Table, Debug)]
+#[table(name = "items")]
+#[allow(dead_code)]
+struct Item {
+    #[column(pk)]
+    id: i64,
+    label: String,
+}
+
+/// `has_many` / `belongs_to` batched relations on the non-sqlx `libSQL` backend.
+#[tokio::test]
+async fn turso_relations() {
+    let db = Db::connect_turso_local(":memory:").await.expect("open");
+    db.raw("create table authors (id integer primary key, name text not null)")
+        .exec()
+        .await
+        .unwrap();
+    db.raw(
+        "create table posts (id integer primary key, author_id integer not null \
+         references authors(id), views integer not null)",
+    )
+    .exec()
+    .await
+    .unwrap();
+    db.insert_many(vec![
+        AuthorNew {
+            id: 1,
+            name: "Ann".to_owned(),
+        },
+        AuthorNew {
+            id: 2,
+            name: "Bo".to_owned(),
+        },
+    ])
+    .exec()
+    .await
+    .unwrap();
+    db.insert_many(vec![
+        PostNew {
+            id: 1,
+            author_id: 1,
+            views: 4,
+        },
+        PostNew {
+            id: 2,
+            author_id: 1,
+            views: 6,
+        },
+        PostNew {
+            id: 3,
+            author_id: 2,
+            views: 1,
+        },
+    ])
+    .exec()
+    .await
+    .unwrap();
+
+    let authors = db
+        .find::<Author>()
+        .order_by(asc(Author::id))
+        .all()
+        .await
+        .unwrap();
+    let with_posts = db
+        .load_has_many::<Author, Post, i64>(authors, Post::author_id, |a| a.id, |p| p.author_id)
+        .await
+        .expect("has_many");
+    assert_eq!(with_posts[0].1.len(), 2);
+    assert_eq!(with_posts[1].1.len(), 1);
+
+    let posts = db
+        .find::<Post>()
+        .order_by(asc(Post::id))
+        .all()
+        .await
+        .unwrap();
+    let with_author = db
+        .load_belongs_to::<Post, Author, i64>(posts, |p| p.author_id, Author::id, |a| a.id)
+        .await
+        .expect("belongs_to");
+    assert_eq!(with_author[0].1.as_ref().unwrap().name, "Ann");
+    assert_eq!(with_author[2].1.as_ref().unwrap().name, "Bo");
 }

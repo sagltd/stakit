@@ -303,6 +303,93 @@ impl Db {
         self.find::<T>().filter(pk_filter::<T>(pk))
     }
 
+    /// Load a **has-many** relation for a set of parents in **one** batched query
+    /// (no N+1): fetches all children whose `child_fk` is in the parents' keys, then
+    /// groups them, returning each parent paired with its children. Typed end to end
+    /// — `child_fk: Col<C, K>` forces the foreign-key type to match the parent key —
+    /// and backend-agnostic (the `IN` membership works on every driver).
+    ///
+    /// `parent_key` reads the key from a parent (usually its PK); `child_key` reads
+    /// the same key from a loaded child (its FK), used to group.
+    ///
+    /// # Errors
+    /// Returns an error if the child query fails.
+    pub async fn load_has_many<P, C, K>(
+        &self,
+        parents: Vec<P>,
+        child_fk: crate::schema::Col<C, K>,
+        parent_key: impl Fn(&P) -> K,
+        child_key: impl Fn(&C) -> K,
+    ) -> Result<Vec<(P, Vec<C>)>>
+    where
+        C: Table + Send,
+        K: crate::value::ToValue + crate::value::FromValue + Clone + Eq + core::hash::Hash,
+    {
+        if parents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<K> = parents.iter().map(&parent_key).collect();
+        let children: Vec<C> = self
+            .find::<C>()
+            .filter(crate::expr::any_of(child_fk, &keys))
+            .all()
+            .await?;
+        let mut grouped: std::collections::HashMap<K, Vec<C>> = std::collections::HashMap::new();
+        for child in children {
+            grouped.entry(child_key(&child)).or_default().push(child);
+        }
+        Ok(parents
+            .into_iter()
+            .map(|parent| {
+                let children = grouped.remove(&parent_key(&parent)).unwrap_or_default();
+                (parent, children)
+            })
+            .collect())
+    }
+
+    /// Load a **belongs-to** relation for a set of children in one batched query:
+    /// fetches the referenced parents by primary key, then pairs each child with its
+    /// parent (`None` if the FK doesn't resolve). Typed and backend-agnostic.
+    ///
+    /// `child_key` reads the FK from a child; `parent_pk`/`parent_key` are the parent
+    /// PK column and its accessor.
+    ///
+    /// # Errors
+    /// Returns an error if the parent query fails.
+    pub async fn load_belongs_to<C, P, K>(
+        &self,
+        children: Vec<C>,
+        child_key: impl Fn(&C) -> K,
+        parent_pk: crate::schema::Col<P, K>,
+        parent_key: impl Fn(&P) -> K,
+    ) -> Result<Vec<(C, Option<P>)>>
+    where
+        P: Table + Clone + Send,
+        K: crate::value::ToValue + crate::value::FromValue + Clone + Eq + core::hash::Hash,
+    {
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<K> = children.iter().map(&child_key).collect();
+        let parents: Vec<P> = self
+            .find::<P>()
+            .filter(crate::expr::any_of(parent_pk, &keys))
+            .all()
+            .await?;
+        let by_key: std::collections::HashMap<K, P> = parents
+            .into_iter()
+            .map(|parent| (parent_key(&parent), parent))
+            .collect();
+        // A parent may be shared by several children, so clone on attach.
+        Ok(children
+            .into_iter()
+            .map(|child| {
+                let parent = by_key.get(&child_key(&child)).cloned();
+                (child, parent)
+            })
+            .collect())
+    }
+
     /// Insert a single row.
     pub fn insert<N: Insertable>(&self, row: N) -> Insert<N> {
         Insert::with_exec(self.exec(), vec![row])

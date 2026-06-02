@@ -242,7 +242,7 @@ async fn end_to_end_against_sqlite() {
 // ----- Comprehensive cross-feature coverage (joins, grouping, aggregates,
 // derive(Row), streaming, predicates, on_conflict, typed errors) -----
 
-#[derive(Table, Debug, PartialEq, Eq)]
+#[derive(Table, Debug, Clone, PartialEq, Eq)]
 #[table(name = "authors")]
 struct Author {
     #[column(pk)]
@@ -544,6 +544,15 @@ async fn streaming_and_on_conflict_and_unique_error() {
     assert!(err.is_unique(), "expected unique violation, got {err:?}");
 }
 
+#[derive(Table, Debug)]
+#[table(name = "widgets")]
+#[allow(dead_code)]
+struct Widget {
+    #[column(pk)]
+    id: i64,
+    name: String,
+}
+
 #[tokio::test]
 async fn migrations_run_out_of_box() {
     let pool = SqlitePoolOptions::new()
@@ -571,13 +580,6 @@ async fn migrations_run_out_of_box() {
     let applied = db.migrate(&migrations).await.expect("migrate");
     assert_eq!(applied, 2);
 
-    #[derive(Table, Debug)]
-    #[table(name = "widgets")]
-    struct Widget {
-        #[column(pk)]
-        id: i64,
-        name: String,
-    }
     let count = db
         .select(Widget::all())
         .from::<Widget>()
@@ -589,4 +591,40 @@ async fn migrations_run_out_of_box() {
     // second run is idempotent: nothing pending.
     let applied_again = db.migrate(&migrations).await.expect("migrate again");
     assert_eq!(applied_again, 0);
+}
+
+#[tokio::test]
+async fn relations_has_many_and_belongs_to() {
+    let db = setup_blog().await;
+
+    // has_many: each author with their posts, one batched IN query (no N+1).
+    let authors = db
+        .find::<Author>()
+        .order_by(asc(Author::id))
+        .all()
+        .await
+        .unwrap();
+    let with_posts = db
+        .load_has_many::<Author, Post, i64>(authors, Post::author_id, |a| a.id, |p| p.author_id)
+        .await
+        .expect("has_many");
+    assert_eq!(with_posts.len(), 2);
+    assert_eq!(with_posts[0].0.name, "Ann");
+    assert_eq!(with_posts[0].1.len(), 2); // Ann has 2 posts
+    assert_eq!(with_posts[1].1.len(), 1); // Bo has 1 post
+
+    // belongs_to: each post with its author.
+    let posts = db
+        .find::<Post>()
+        .order_by(asc(Post::id))
+        .all()
+        .await
+        .unwrap();
+    let with_author = db
+        .load_belongs_to::<Post, Author, i64>(posts, |p| p.author_id, Author::id, |a| a.id)
+        .await
+        .expect("belongs_to");
+    assert_eq!(with_author.len(), 3);
+    assert_eq!(with_author[0].1.as_ref().unwrap().name, "Ann");
+    assert_eq!(with_author[2].1.as_ref().unwrap().name, "Bo");
 }
