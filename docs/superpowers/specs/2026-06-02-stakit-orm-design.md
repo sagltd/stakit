@@ -894,40 +894,68 @@ knobs (all map to sqlx `PoolOptions`):
 
 ```rust
 let db = Db::connect(DbConfig {
-    url,
+    // accepts a URL or sqlx PgConnectOptions so the password can be supplied
+    // out-of-band; the URL field is a redacting wrapper (Debug never prints it).
+    conn: ConnSpec::Options(opts),   // or ConnSpec::Url(Secret<String>)
     max_connections: 20,
     min_connections: 2,
     acquire_timeout: Duration::from_secs(5),
     idle_timeout: Some(Duration::from_secs(600)),
     max_lifetime: Some(Duration::from_secs(1800)),
     statement_cache_capacity: 256,
+    slow_query_threshold: Some(Duration::from_millis(200)),
 }).await?;
 ```
 
 - **Acquire timeout** is mandatory (no unbounded waits → no hung requests).
 - Pool is `Clone` + `Send` + `Sync` (sqlx `PgPool` is `Arc` inside); share across
   tasks freely.
+- **Credential hygiene:** the connection string holds the password. `DbConfig`'s
+  `Debug` **redacts** it (wrapped in a `Secret`/custom `Debug`), and the URL is
+  never placed in spans or error context. Prefer supplying `PgConnectOptions`.
+
+### Protocol
+
+All generated queries use sqlx's **extended query protocol with binary result
+format** (sqlx default) — no string parsing of ints/uuids/timestamps on decode,
+and prepared statements are reusable. **No code path falls back to the simple
+protocol** (which would lose both binary decode and statement reuse); the
+`= ANY($1)` rule (§6) is what lets dynamic-length IN lists stay on the prepared
+path.
 
 ### Prepared-statement cache
 
-sqlx caches prepared statements per connection by default. The builder produces a
-**stable SQL string for a given query shape** (same shape → same string → cache
-hit), so repeated queries skip parse/plan. The `row!`/builder must NOT embed
-values into the SQL text (they go to binds) — otherwise cache thrashes. This is
-both a perf and a security invariant (§17).
+sqlx caches prepared statements per connection. A cache hit needs a **stable SQL
+string for a query shape**. Two well-known traps are designed out:
+
+- **IN lists:** `in ($1,$2,…)` varies its text with element count → a new
+  statement per length → thrash. We render `= ANY($1)` instead (§6) — one stable
+  statement for any length.
+- **`insert_many`:** a varying row count per call/last-chunk varies the `VALUES`
+  text. We **bucket** chunk sizes to powers of two (§10) so distinct statement
+  shapes stay bounded.
+
+Values are never embedded in SQL text (they are binds) — a perf invariant and a
+security invariant (§17). `bench_statement_cache_hitrate` (§15) guards this.
 
 ### Timeouts & cancellation
 
 - Every terminal accepts an optional per-query timeout; on elapse the future is
   dropped → sqlx cancels. Default inherits `DbConfig`.
-- All futures are cancellation-safe (drop = rollback for an open tx, §11).
+- Cancellation is safe, but cancelling an in-flight query **on a transaction's
+  connection** may force that connection closed rather than rolled back (§11
+  caveat) — correctness over reuse.
 
 ### Observability
 
-- `tracing` spans around each query: span fields = operation, table, elapsed,
-  rows. SQL text only at `DEBUG`; **bind values never logged** (PII/secrets).
-- Optional slow-query log threshold in `DbConfig`.
-- Errors carry enough context (table, constraint) without leaking values.
+- `tracing` spans around each query: fields = operation, table, elapsed, rows.
+- **Value-leak boundary (honest):** stakit never interpolates values into SQL, so
+  values are not in the SQL text to begin with — that is the real protection.
+  stakit additionally configures sqlx's own statement logging **off by default**
+  (`.log_statements(Off)`, slow-query logging gated by `slow_query_threshold`), so
+  sqlx does not log SQL/values. What stakit **cannot** control: Postgres
+  server-side logging (`log_statement`/`log_min_duration_statement`) — operators
+  own that. Error `Display` can carry pg messages (§12) — log server-side only.
 
 ### Type mapping (Rust ↔ Postgres)
 
@@ -944,19 +972,31 @@ Delegated to sqlx's `Type`/`Encode`/`Decode`, fixed at v1:
 | `DateTime<Utc>`/`NaiveDate` (`chrono`) | `timestamptz`/`date` |
 | `serde_json::Value` (`json` feature) | `jsonb` |
 | `Option<T>` | nullable column |
-| `Vec<T>` | `T[]` array |
+| `Vec<T>` (T ≠ u8) | `T[]` array |
 | `#[column(enum)]` Rust enum | pg enum / text |
 
-Optional types gated behind cargo features (`uuid`, `chrono`, `json`, `decimal`)
-so a minimal build stays lean. Newest crate versions pinned at impl (workspace
-rule).
+`Vec<u8>` maps to `bytea` and is **special-cased before** the generic `Vec<T>`
+rule (they overlap). The migration generator (§5) recognizes only the canonical
+spelling `Vec<u8>`; `&[u8]`/`Bytes` need `#[column(sql_type = "bytea")]`. Optional
+types gated behind cargo features (`uuid`, `chrono`, `json`, `decimal`) so a
+minimal build stays lean. Newest crate versions pinned at impl (workspace rule).
+
+### `.stream()` semantics
+
+`.stream()` reads rows incrementally from the socket (bounded client memory — it
+does not buffer the full result), but it **holds its pooled connection for the
+stream's whole lifetime** (pool-pressure cost) and Postgres still computes the
+full result server-side unless a cursor is used. Use it for large reads where you
+consume-and-drop; for very large server-side result sets, prefer keyset
+pagination. `bench_stream_memory` (§15) asserts bounded client memory.
 
 ### Concurrency & safety
 
 - All public futures `Send` where the executor is `Send` (matches workspace
   `future_not_send` relaxation but the executor path stays `Send`).
-- `unsafe` forbidden workspace-wide — no exceptions; zero-copy is via lifetimes /
-  smallvec, never raw pointers.
+- `unsafe` forbidden workspace-wide; all `unsafe`-free by construction (no
+  `GlobalAlloc` for benches — divan's alloc profiling is used instead, §15).
+  Allocation-light design is via lifetimes / smallvec, never raw pointers.
 - Derives generate only safe code; no `unsafe` in expansions.
 
 ### Graceful failure
@@ -964,23 +1004,47 @@ rule).
 - Pool exhaustion → `Error::Database` with acquire-timeout context, not a hang.
 - Migration checksum drift (edited applied migration) → hard error at startup via
   sqlx, surfaced clearly.
-- Partial `insert_many`/`copy_into` failure → whole operation in one transaction,
-  rolls back (no partial writes).
+- `insert_many` is one transaction by default (all-or-nothing); `.commit_per_chunk()`
+  trades atomicity for shorter locks/WAL on bulk loads (§10).
+- `copy_into` is a single atomic COPY (the command is all-or-nothing); on error it
+  `abort()`s the COPY stream so no connection is returned mid-protocol (§10).
 
 ## 17. Security
 
-- **SQL injection:** all user values are bound parameters (`$N`), never
-  string-interpolated. Identifiers (table/column names) come only from
-  compile-time schema tokens and are quoted (`"users"."id"`) — never from runtime
-  strings. `sql!` `{}` accepts only `Col` tokens (compile-checked), `?` only
-  binds. The raw escape hatch (`db.raw`) takes a `&'static str` SQL with `.bind()`
-  params — no interpolation API is exposed.
-- **No value logging:** bind values excluded from spans/logs by default (§16).
-- **`unsafe` forbidden** (workspace lint); memory-safety by construction.
+- **SQL injection (values):** all user values are bound parameters (`$N`), never
+  string-interpolated, on every builder path. `sql!` `{}` accepts only `Col`
+  tokens (compile-checked); `?` is a bind only; clause inputs (`order_by`
+  direction, nulls placement, `on_conflict` target) are typed tokens/enums, never
+  strings. **No `order_by_raw(&str)`-style API exists** — dynamic SQL only via the
+  explicit `db.raw` opt-out.
+- **SQL injection (identifiers):** table/column names come only from compile-time
+  schema tokens, rendered with **correct identifier quoting** — wrap in `"`,
+  **double every embedded `"`** (`x"y` → `"x""y"`), reject NUL bytes. (Quoting
+  alone is not a sanitizer; embedded-quote doubling is the actual defense and is a
+  tested invariant.) Note attribute strings (`#[column(name=…)]`,
+  `#[table(name=…)]`) are trusted developer input, but are still quoted correctly.
+- **DDL strings:** `#[column(default = "…")]` is emitted **verbatim** into
+  `create table` DDL — trusted developer literals only, never templated from
+  runtime/env. The column API accepts no runtime `String` for `default`/`name`.
+- **Raw escape hatch is unaudited by design:** `db.raw(&str)` and the exposed
+  `db.pool()` put SQL-text responsibility on the caller (values still via
+  `.bind()`). `&'static str` was rejected as security theater (`Box::leak`
+  defeats it; it only blocks legitimate dynamic SQL). The builder APIs are the
+  safe default.
+- **Value logging:** the real protection is that stakit never interpolates values
+  into SQL; additionally sqlx statement logging is configured off by default
+  (§16). stakit cannot stop Postgres server-side logging or a caller echoing
+  `Error::Display` (which can carry pg messages with values, §12) — both are
+  documented operator/caller responsibilities.
+- **`unsafe` forbidden** (workspace lint), no exceptions — including benches
+  (divan alloc profiling, not a custom `GlobalAlloc`, §15/§16).
+- **Transactions:** drop-rollback is best-effort (§11); the closure form does an
+  explicit awaited rollback. Savepoint names are internal counters, never input.
+- **Migrations:** advisory-locked against concurrent boot; `.snapshot.json`
+  divergence from applied state is a hard error; destructive `gen` diffs are
+  reviewed before apply and destructive `down` requires `--force` (§5).
 - **Least surprise:** no implicit `*` that leaks new columns into typed results —
   projections are explicit; `T::all()` is generated from the known schema.
-- **Migration safety:** generated SQL is reviewed before apply; destructive diffs
-  (drop column/table) are surfaced, never auto-applied silently (§5, v2).
 
 ## 18. Phasing summary
 
@@ -992,14 +1056,35 @@ rule).
 
 ## 19. Open questions / risks
 
-- **`row!` field-type checking** happens at decode, not select, for non-`sql!`
-  fields (the proc-macro pre-typecheck limitation). Acceptable; derive Row (B)
-  gives select-time checking when stronger guarantees are wanted.
-- **Relational nested types (v2/v3)** are the highest-risk codegen; one level
-  first to de-risk.
-- **Migration diff** for type changes / renames is ambiguous (rename vs
-  drop+add); v1 covers additive changes, surfaces the rest for hand-editing
-  rather than guessing.
+Highest-risk items to prototype first (de-risk before committing the full v1):
+
+- **`Projection` + `row!` type machinery (§7)** is the core typing bet — the
+  `field(expr, extractor)` type-resolution trick and the tuple/`All`/`Col`/`Count`
+  wrapper coherence must be proven with a compiling spike before the rest of the
+  builder is built on it. Fallback if the inline-`row!` inference proves too
+  brittle: ship tuple (A) + `#[derive(Row)]` (B) in v1, move `row!` (C) to v1.1.
+- **Unified `Executor` over pool + `&mut Tx` (§11)** — the reborrow + HRTB closure
+  signature is fiddly sqlx territory; spike it early.
+- **syn migration resolver + type-spelling map (§5)** is inherently fragile
+  (no type info); the canonical-spelling allowlist + `#[column(sql_type)]` escape +
+  hard-error-on-unknown is the mitigation. Risk: developer friction on
+  aliases/re-exports — accepted and documented.
+- **Relational result type (§8)** — one fixed `UserWith` per table for v2 to avoid
+  combinatorial codegen; nested `.with()` and `columns`+`with` deferred to v3.
+- **Statement-cache discipline (§6/§10/§16)** — `= ANY($1)` everywhere + chunk
+  bucketing; `bench_statement_cache_hitrate` is the guard. A regression here is a
+  silent perf cliff.
+- **Migration diff** for type changes / renames is ambiguous (rename vs drop+add);
+  v1 covers additive changes, surfaces the rest for hand-editing.
+
+Resolved during review (now specified, not open): `Projection::decode` method;
+lowercase column-const `#[allow(non_upper_case_globals)]`; FK type-equality via
+`PhantomData` witness (not `const assert!`); `IntoExpr<Ty>` for `eq`; terminal
+split (Select vs mutation); honest allocation budget (1 String + 1 args, not "0
+allocs"); divan alloc profiling (no `unsafe` allocator); drop-rollback as
+best-effort with explicit closure rollback; identifier-quote doubling; error
+value-leak boundary; credential redaction.
+
 - **Quality gate:** all crates must pass `./code-check.sh` (fmt, clippy
   pedantic+nursery `-D warnings`, build, nextest, doctests); `unsafe` forbidden;
   public items documented.
