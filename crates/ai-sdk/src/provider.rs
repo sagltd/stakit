@@ -200,6 +200,10 @@ pub trait Provider: Clone + Send + Sync + 'static {
     /// Provider-native response body, preserved on [`ChatResponse::raw`].
     type Raw: Send + Sync;
 
+    /// The model id this handle targets (used by the agent for the request and
+    /// for cost lookup, so callers don't repeat the model).
+    fn model_id(&self) -> &str;
+
     /// Performs a non-streamed completion.
     fn complete(
         &self,
@@ -244,6 +248,14 @@ mod tests {
 
     impl Provider for MockProvider {
         type Raw = ();
+
+        #[expect(
+            clippy::unnecessary_literal_bound,
+            reason = "trait ties the lifetime to &self"
+        )]
+        fn model_id(&self) -> &str {
+            "mock"
+        }
 
         async fn complete(
             &self,

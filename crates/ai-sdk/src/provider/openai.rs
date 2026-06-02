@@ -75,6 +75,10 @@ pub struct OpenAiModel {
 impl Provider for OpenAiModel {
     type Raw = Value;
 
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
     async fn complete(
         &self,
         request: ChatRequest,

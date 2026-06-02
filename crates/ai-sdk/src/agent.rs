@@ -47,7 +47,8 @@ type PrepareStep = Arc<dyn Fn(u32, &mut Vec<Message>) + Send + Sync>;
 
 struct Inner<P, Ctx> {
     provider: P,
-    model: String,
+    /// Optional model override; defaults to the provider's `model_id()`.
+    model: Option<String>,
     system: Option<crate::message::SystemPrompt>,
     tools: ToolRegistry<Ctx>,
     pricing: Pricing,
@@ -74,6 +75,28 @@ impl<P: Provider, Ctx: Send + Sync + 'static> Agent<P, Ctx> {
     /// Starts building an agent over `provider`.
     pub fn builder(provider: P) -> AgentBuilder<P, Ctx> {
         AgentBuilder::new(provider)
+    }
+
+    /// Registers a tool on a live agent (the registry is shared across clones).
+    /// Takes effect on the next step — call before/between runs.
+    pub fn register_tool<T: Tool<Ctx>>(&self, tool: T) {
+        self.inner.tools.register(tool);
+    }
+
+    /// Registers a bundle of tools on a live agent.
+    pub fn register_tool_set<S: ToolSet<Ctx>>(&self, set: S) {
+        self.inner.tools.register_set(set);
+    }
+
+    /// Removes a tool by name; returns whether it was present.
+    pub fn remove_tool(&self, name: &str) -> bool {
+        self.inner.tools.remove(name)
+    }
+
+    /// Names of the currently registered tools.
+    #[must_use]
+    pub fn tool_names(&self) -> Vec<String> {
+        self.inner.tools.names()
     }
 
     /// Runs the loop, yielding a stream of [`LoopEvent`]s.
@@ -113,6 +136,12 @@ impl<P: Provider, Ctx: Send + Sync + 'static> Agent<P, Ctx> {
             let mut final_text = String::new();
             let mut step: u32 = 0;
             let finish;
+
+            // Model id: explicit override, else the provider's bound model.
+            let model_id = inner
+                .model
+                .clone()
+                .unwrap_or_else(|| inner.provider.model_id().to_owned());
 
             // Run context loaders once, merging their output into the system
             // prompt and seeding the history.
@@ -204,7 +233,7 @@ impl<P: Provider, Ctx: Send + Sync + 'static> Agent<P, Ctx> {
 
                 yield LoopEvent::StepStart { step };
 
-                let request = build_request(&inner, system.as_ref(), &history);
+                let request = build_request(&inner, &model_id, system.as_ref(), &history);
                 let mut stream = match inner.provider.stream(request).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -293,7 +322,7 @@ impl<P: Provider, Ctx: Send + Sync + 'static> Agent<P, Ctx> {
                 history.push(Message::Assistant(blocks));
 
                 total.merge(&step_usage);
-                let step_cost = inner.pricing.cost(&inner.model, &step_usage);
+                let step_cost = inner.pricing.cost(&model_id, &step_usage);
                 if let Some(c) = step_cost {
                     total_cost = Some(total_cost.unwrap_or(0.0) + c);
                 }
@@ -375,6 +404,7 @@ impl<P: Provider, Ctx: Send + Sync + 'static> Agent<P, Ctx> {
 
 fn build_request<P, Ctx: Send + Sync + 'static>(
     inner: &Inner<P, Ctx>,
+    model: &str,
     system: Option<&SystemPrompt>,
     history: &[Message],
 ) -> ChatRequest {
@@ -386,7 +416,7 @@ fn build_request<P, Ctx: Send + Sync + 'static>(
         tools.extend(skill_tool_defs());
     }
     ChatRequest {
-        model: inner.model.clone(),
+        model: model.to_owned(),
         system: system.cloned(),
         messages: history.to_vec(),
         tools,
@@ -550,7 +580,7 @@ impl<P: Provider, Ctx: Send + Sync + 'static> AgentBuilder<P, Ctx> {
         Self {
             inner: Inner {
                 provider,
-                model: String::new(),
+                model: None,
                 system: None,
                 tools: ToolRegistry::new(),
                 pricing: Pricing::new(),
@@ -587,10 +617,11 @@ impl<P: Provider, Ctx: Send + Sync + 'static> AgentBuilder<P, Ctx> {
         self
     }
 
-    /// Sets the model id.
+    /// Overrides the model id (defaults to the provider's `model_id()` — you
+    /// usually don't need this, since the provider handle already names a model).
     #[must_use]
     pub fn model(mut self, model: impl Into<String>) -> Self {
-        self.inner.model = model.into();
+        self.inner.model = Some(model.into());
         self
     }
 
@@ -603,14 +634,14 @@ impl<P: Provider, Ctx: Send + Sync + 'static> AgentBuilder<P, Ctx> {
 
     /// Registers a typed tool.
     #[must_use]
-    pub fn register<T: Tool<Ctx>>(mut self, tool: T) -> Self {
+    pub fn register<T: Tool<Ctx>>(self, tool: T) -> Self {
         self.inner.tools.register(tool);
         self
     }
 
     /// Registers a bundle of tools.
     #[must_use]
-    pub fn register_set<S: ToolSet<Ctx>>(mut self, set: S) -> Self {
+    pub fn register_set<S: ToolSet<Ctx>>(self, set: S) -> Self {
         self.inner.tools.register_set(set);
         self
     }
@@ -618,7 +649,7 @@ impl<P: Provider, Ctx: Send + Sync + 'static> AgentBuilder<P, Ctx> {
     /// Registers a deferred tool: withheld from the prompt until the built-in
     /// `tool_search` surfaces it (keeps large tool sets out of the context).
     #[must_use]
-    pub fn register_deferred<T: Tool<Ctx>>(mut self, tool: T) -> Self {
+    pub fn register_deferred<T: Tool<Ctx>>(self, tool: T) -> Self {
         self.inner
             .tools
             .insert(Arc::new(TypedTool(tool)), Vec::new(), true);

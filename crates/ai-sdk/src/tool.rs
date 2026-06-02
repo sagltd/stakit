@@ -114,14 +114,18 @@ struct Entry<Ctx> {
 }
 
 /// A flat, name-keyed registry of tools with optional tags and deferral.
+///
+/// Internally synchronized (a `RwLock`), so tools can be added or removed
+/// through a shared `&self` — including on a live, cloned [`Agent`] between (or
+/// before) runs. Each `run()` reads the current active set at step start.
 pub struct ToolRegistry<Ctx> {
-    entries: IndexMap<String, Entry<Ctx>>,
+    entries: std::sync::RwLock<IndexMap<String, Entry<Ctx>>>,
 }
 
 impl<Ctx> Default for ToolRegistry<Ctx> {
     fn default() -> Self {
         Self {
-            entries: IndexMap::new(),
+            entries: std::sync::RwLock::new(IndexMap::new()),
         }
     }
 }
@@ -133,20 +137,29 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
         Self::default()
     }
 
-    /// Registers a typed tool (active, untagged).
-    pub fn register<T: Tool<Ctx>>(&mut self, tool: T) -> &mut Self {
+    // Lock accessors that recover from poisoning (a panicking holder never
+    // corrupts the map), so no public method can panic on the lock.
+    fn read_lock(&self) -> std::sync::RwLockReadGuard<'_, IndexMap<String, Entry<Ctx>>> {
+        self.entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_lock(&self) -> std::sync::RwLockWriteGuard<'_, IndexMap<String, Entry<Ctx>>> {
+        self.entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Registers a typed tool (active, untagged). Overwrites a same-named tool.
+    pub fn register<T: Tool<Ctx>>(&self, tool: T) -> &Self {
         self.insert(Arc::new(TypedTool(tool)), Vec::new(), false)
     }
 
     /// Registers an already-erased tool with explicit tags and deferral.
-    pub fn insert(
-        &mut self,
-        tool: Arc<dyn ToolDyn<Ctx>>,
-        tags: Vec<String>,
-        defer: bool,
-    ) -> &mut Self {
+    pub fn insert(&self, tool: Arc<dyn ToolDyn<Ctx>>, tags: Vec<String>, defer: bool) -> &Self {
         let name = tool.def().name;
-        self.entries.insert(
+        self.write_lock().insert(
             name,
             Entry {
                 tool,
@@ -158,35 +171,46 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
     }
 
     /// Registers a bundle of tools.
-    pub fn register_set<S: ToolSet<Ctx>>(&mut self, set: S) -> &mut Self {
+    pub fn register_set<S: ToolSet<Ctx>>(&self, set: S) -> &Self {
         for tool in set.into_tools() {
             self.insert(tool, Vec::new(), false);
         }
         self
     }
 
-    /// Looks up a tool by name.
+    /// Removes a tool by name; returns whether it was present.
+    pub fn remove(&self, name: &str) -> bool {
+        self.write_lock().shift_remove(name).is_some()
+    }
+
+    /// Looks up a tool by name, cloning its handle.
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&Arc<dyn ToolDyn<Ctx>>> {
-        self.entries.get(name).map(|e| &e.tool)
+    pub fn get(&self, name: &str) -> Option<Arc<dyn ToolDyn<Ctx>>> {
+        self.read_lock().get(name).map(|e| Arc::clone(&e.tool))
+    }
+
+    /// Names of all registered tools, in registration order.
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        self.read_lock().keys().cloned().collect()
     }
 
     /// Number of registered tools.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.read_lock().len()
     }
 
     /// Whether the registry is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.read_lock().is_empty()
     }
 
     /// Definitions of the active (non-deferred) tools, in registration order.
     #[must_use]
     pub fn active_defs(&self) -> Vec<ToolDef> {
-        self.entries
+        self.read_lock()
             .values()
             .filter(|e| !e.defer.load(Ordering::Relaxed))
             .map(|e| e.tool.def())
@@ -196,21 +220,14 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
     /// Whether any tool is currently deferred (so the loop offers tool search).
     #[must_use]
     pub fn has_deferred(&self) -> bool {
-        self.entries
+        self.read_lock()
             .values()
             .any(|e| e.defer.load(Ordering::Relaxed))
     }
 
-    /// Tags attached to a tool, if any.
-    #[must_use]
-    pub fn tags(&self, name: &str) -> Option<&[String]> {
-        self.entries.get(name).map(|e| e.tags.as_slice())
-    }
-
     /// Marks a deferred tool active (called when tool search surfaces it).
-    /// Works through a shared `&self` (deferral is interior-mutable).
     pub fn activate(&self, name: &str) -> bool {
-        self.entries.get(name).is_some_and(|e| {
+        self.read_lock().get(name).is_some_and(|e| {
             e.defer.store(false, Ordering::Relaxed);
             true
         })
@@ -222,7 +239,7 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
     #[must_use]
     pub fn search(&self, query: &str) -> Vec<(String, String)> {
         let q = query.to_lowercase();
-        self.entries
+        self.read_lock()
             .iter()
             .filter(|(_, e)| e.defer.load(Ordering::Relaxed))
             .filter_map(|(name, e)| {
@@ -234,7 +251,8 @@ impl<Ctx: Send + Sync + 'static> ToolRegistry<Ctx> {
     }
 
     /// Runs a tool by name. Returns `Err` (an `is_error` result) for an unknown
-    /// tool so the model can recover.
+    /// tool so the model can recover. The registry lock is released before the
+    /// tool body runs (never held across `.await`).
     ///
     /// # Errors
     /// Propagates argument-decode, validation, and tool-body errors.
@@ -298,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_calls_tool_by_name() {
-        let mut reg = ToolRegistry::<()>::new();
+        let reg = ToolRegistry::<()>::new();
         reg.register(Echo);
         let cx = ToolCx::new(());
         let out = reg
@@ -320,7 +338,7 @@ mod tests {
 
     #[test]
     fn deferred_tool_is_hidden_until_search_activates_it() {
-        let mut reg = ToolRegistry::<()>::new();
+        let reg = ToolRegistry::<()>::new();
         reg.insert(Arc::new(TypedTool(Echo)), vec!["text".into()], true);
         assert!(reg.active_defs().is_empty(), "deferred tool must be hidden");
         assert!(reg.has_deferred());

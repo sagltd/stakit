@@ -45,6 +45,14 @@ impl Mock {
 impl Provider for Mock {
     type Raw = ();
 
+    #[expect(
+        clippy::unnecessary_literal_bound,
+        reason = "trait ties the lifetime to &self"
+    )]
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
     async fn complete(&self, _r: ChatRequest) -> Result<ChatResponse<()>, ProviderError> {
         Err(ProviderError::InvalidArgument("unused".into()))
     }
@@ -204,6 +212,13 @@ struct ParallelMock {
 
 impl stakit_ai_sdk::Provider for ParallelMock {
     type Raw = ();
+    #[expect(
+        clippy::unnecessary_literal_bound,
+        reason = "trait ties the lifetime to &self"
+    )]
+    fn model_id(&self) -> &str {
+        "mock"
+    }
     async fn complete(&self, _r: ChatRequest) -> Result<ChatResponse<()>, ProviderError> {
         Err(ProviderError::Cancelled)
     }
@@ -294,6 +309,19 @@ async fn tool_calls_in_a_turn_run_concurrently() {
         results, 2,
         "both tool calls should produce results: {events:?}"
     );
+}
+
+#[test]
+fn tools_can_be_added_and_removed_at_runtime() {
+    let agent = Agent::<Mock, ()>::builder(Mock::new()).build();
+    assert!(agent.tool_names().is_empty());
+
+    agent.register_tool(echo); // add to a live, already-built agent
+    assert_eq!(agent.tool_names(), vec!["echo".to_string()]);
+
+    assert!(agent.remove_tool("echo"));
+    assert!(agent.tool_names().is_empty());
+    assert!(!agent.remove_tool("echo"), "removing twice is false");
 }
 
 #[tokio::test]

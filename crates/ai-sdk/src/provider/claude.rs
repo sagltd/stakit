@@ -77,11 +77,16 @@ pub struct ClaudeModel {
 impl Provider for ClaudeModel {
     type Raw = Value;
 
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
     async fn complete(
         &self,
         request: ChatRequest,
     ) -> Result<ChatResponse<Self::Raw>, ProviderError> {
-        let body = build_body(&self.model, &request, false);
+        let model = self.pick_model(&request);
+        let body = build_body(&model, &request, false);
         let resp = self.send(body).await?;
         let status = resp.status();
         let text = resp
@@ -99,7 +104,8 @@ impl Provider for ClaudeModel {
     }
 
     async fn stream(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
-        let body = build_body(&self.model, &request, true);
+        let model = self.pick_model(&request);
+        let body = build_body(&model, &request, true);
         let resp = self.send(body).await?;
         let status = resp.status();
         if !status.is_success() {
@@ -140,6 +146,15 @@ impl Provider for ClaudeModel {
 }
 
 impl ClaudeModel {
+    /// The request's model id when set, else this handle's bound model.
+    fn pick_model(&self, request: &ChatRequest) -> String {
+        if request.model.is_empty() {
+            self.model.clone()
+        } else {
+            request.model.clone()
+        }
+    }
+
     async fn send(&self, body: Value) -> Result<reqwest::Response, ProviderError> {
         self.client
             .http

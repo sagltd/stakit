@@ -22,7 +22,6 @@ async fn main() {
     };
 
     let agent = Agent::<_, ()>::builder(client.model(MODEL))
-        .model(MODEL)
         .max_tokens(256)
         .build();
 

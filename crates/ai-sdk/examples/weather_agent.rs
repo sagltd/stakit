@@ -37,7 +37,6 @@ async fn main() {
     };
 
     let agent = Agent::<_, ()>::builder(client.model(MODEL))
-        .model(MODEL)
         .max_tokens(512)
         .register(get_weather)
         .skills(FsSkillLoader::new(".agents/skills"))
