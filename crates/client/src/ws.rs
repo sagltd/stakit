@@ -231,6 +231,7 @@ fn parse_frame(bytes: &[u8]) -> Result<ServerFrame, TransportError> {
                     .map_err(TransportError::Decode)?
                     .unwrap_or_else(|| ErrorBody {
                         code: 500,
+                        kind: std::borrow::Cow::Borrowed("internal"),
                         message: "missing error body".to_owned(),
                         fields: None,
                     });

@@ -1,10 +1,22 @@
 //! The neutral reply envelope returned by [`Router::on_request`](crate::Router::on_request).
 
+use std::borrow::Cow;
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::Error;
+
+/// Default machine-readable error code; omitted from the wire when unset.
+const fn default_kind() -> Cow<'static, str> {
+    Cow::Borrowed("error")
+}
+
+/// Whether the machine code is the default (so it can be skipped on the wire).
+fn is_default_kind(kind: &str) -> bool {
+    kind == "error"
+}
 
 /// Outcome of a unary action call, ready for the framework to serialize.
 #[derive(Debug, Serialize)]
@@ -27,19 +39,29 @@ pub enum Reply {
 pub struct ErrorBody {
     /// Numeric status code.
     pub code: u16,
+    /// Stable, machine-readable error code (wire key `type`); defaults to
+    /// `"ERROR"` and is omitted from the wire when unset.
+    #[serde(
+        rename = "type",
+        default = "default_kind",
+        skip_serializing_if = "is_default_kind"
+    )]
+    pub kind: Cow<'static, str>,
     /// Human-readable message.
     pub message: String,
-    /// Per-field validation messages, when present.
+    /// Per-field validation messages, when present. Boxed so the (rare,
+    /// validation-only) map doesn't bloat every `ErrorBody` / `Result<_, _>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fields: Option<IndexMap<String, Vec<String>>>,
+    pub fields: Option<Box<IndexMap<String, Vec<String>>>>,
 }
 
 impl From<Error> for ErrorBody {
     fn from(error: Error) -> Self {
         Self {
             code: error.code,
+            kind: error.kind,
             message: error.message,
-            fields: error.fields.map(|fields| *fields),
+            fields: error.fields,
         }
     }
 }
@@ -47,8 +69,11 @@ impl From<Error> for ErrorBody {
 impl ErrorBody {
     /// Hand-builds the JSON object (skips serde reflection on the hot path).
     fn into_value(self) -> Value {
-        let mut object = Map::with_capacity(3);
+        let mut object = Map::with_capacity(4);
         object.insert("code".to_owned(), Value::from(self.code));
+        if !is_default_kind(&self.kind) {
+            object.insert("type".to_owned(), Value::String(self.kind.into_owned()));
+        }
         object.insert("message".to_owned(), Value::String(self.message));
         if let Some(fields) = self.fields {
             object.insert(
@@ -136,8 +161,9 @@ impl Reply {
         Self::Error {
             error: ErrorBody {
                 code: error.code,
+                kind: error.kind,
                 message: error.message,
-                fields: error.fields.map(|fields| *fields),
+                fields: error.fields,
             },
         }
     }

@@ -75,6 +75,10 @@ redundant_pub_crate = "allow"
 # Noisy nursery lint: not every future needs to be `Send` (the router's erasure
 # layer enforces `Send` where it actually matters).
 future_not_send = "allow"
+# The `Action`/`StreamAction` trait methods are async by signature; many impls
+# (hand-written guards, sync action bodies bridged by `#[action]`) legitimately
+# have no `.await`. This lint fights that design, so allow it.
+unused_async_trait_impl = "allow"
 
 [profile.dev]
 opt-level = 0

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use stakit_model::Model;
-use stakit_router::{Error, Frame, Router, action};
+use stakit_router::{Error, Frame, ResponseError, Router, action};
 
 #[derive(Model, Serialize, Deserialize)]
 struct In {
@@ -22,14 +22,10 @@ struct In {
 
 // An action whose error carries sensitive server-side detail (via `?` → 500):
 // the client sees a generic message, with the real text kept in `Error::detail`.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, ResponseError)]
+#[status(500)]
+#[error("postgres://admin:hunter2@db:5432 connection refused")]
 struct DbError;
-impl std::fmt::Display for DbError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("postgres://admin:hunter2@db:5432 connection refused")
-    }
-}
-impl std::error::Error for DbError {}
 
 #[action]
 fn explode() -> Result<String, DbError> {

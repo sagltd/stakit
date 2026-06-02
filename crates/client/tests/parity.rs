@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 
 use stakit_client::{ActionResult, CallOpts, Client, ServerFrame, TransportError};
 use stakit_model::Model;
-use stakit_router::{ClientAction, Cx, Error, Router, action};
+use stakit_router::{ClientAction, Cx, Error, ResponseError, Router, action};
 
 // ── models ─────────────────────────────────────────────────────────────────
 
@@ -69,8 +69,9 @@ struct Req {
     files: Vec<Vec<u8>>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, ResponseError)]
 enum AppError {
+    #[status(500)]
     #[error("boom: {0}")]
     Boom(String),
 }

@@ -31,7 +31,8 @@ use serde_json::{Value, json};
 
 use stakit_model::Model;
 use stakit_router::{
-    ActionExt as _, Cx, Error, Frame, Middleware, Router, StreamActionExt as _, action, err,
+    ActionExt as _, Cx, Error, Frame, Middleware, ResponseError, Router, StreamActionExt as _,
+    action, err,
 };
 
 // ── contexts ─────────────────────────────────────────────────────────────────
@@ -210,14 +211,10 @@ fn array_payload_malformed_entries_become_404_not_panic() {
 
 // ── SAFETY: one failing call must not sink the others (per-call isolation) ────
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error, ResponseError)]
+#[status(500)]
+#[error("kaboom")]
 struct Kaboom;
-impl std::fmt::Display for Kaboom {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("kaboom")
-    }
-}
-impl std::error::Error for Kaboom {}
 
 #[action]
 async fn always_errors(_params: Count) -> Result<u64, Kaboom> {

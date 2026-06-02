@@ -16,9 +16,11 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    AssocType, FnArg, GenericArgument, ItemFn, PatType, PathArguments, ReturnType, Type,
-    parse_macro_input, spanned::Spanned,
+    AssocType, DeriveInput, FnArg, GenericArgument, ItemFn, PatType, PathArguments, ReturnType,
+    Type, parse_macro_input, spanned::Spanned,
 };
+
+mod response_error;
 
 /// See the crate docs.
 #[proc_macro_attribute]
@@ -26,6 +28,21 @@ pub fn action(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
     let is_stream = matches!(attr.to_string().trim(), "stream");
     expand(&func, is_stream)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Derives [`stakit_router::ResponseError`], generating the status/code/message
+/// from per-variant (or per-struct) `#[status(...)]`, `#[code("...")]`, and
+/// `#[message("...")]` attributes.
+///
+/// `#[status(...)]` is required. `#[code]` defaults to the variant name in
+/// `SCREAMING_SNAKE_CASE`; `#[message]` defaults to the `Display` text. Pairs
+/// with `#[derive(thiserror::Error)]` (which supplies `Display` + `#[from]`).
+#[proc_macro_derive(ResponseError, attributes(status, code, message))]
+pub fn derive_response_error(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    response_error::expand(&input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -124,6 +141,9 @@ fn expand(func: &ItemFn, is_stream: bool) -> syn::Result<proc_macro2::TokenStrea
 
                 fn name(&self) -> &'static str { #name_str }
 
+                // A sync action body becomes an `async fn` with no `.await`; that
+                // is the point of the bridge, so silence the lint.
+                #[allow(clippy::unused_async_trait_impl)]
                 async fn run<'a>(
                     &'a self,
                     #cx_bind: #cx_param_ty,

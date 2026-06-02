@@ -5,7 +5,7 @@
 //! `ActionParameters`, `ActionResults`, `ActionKinds`, `ClientActionParameters`,
 //! `ClientActionResults`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -13,6 +13,7 @@ use hashbrown::HashMap;
 
 use crate::action::{ErasedAction, ErasedStreamAction};
 use crate::client::ClientMeta;
+use crate::error::BUILTIN_ERROR_CODES;
 
 pub(crate) fn generate<G, R>(
     actions: &HashMap<&'static str, Arc<dyn ErasedAction<G, R>>>,
@@ -45,6 +46,33 @@ pub(crate) fn generate<G, R>(
         out.push_str(decl);
         out.push_str("\n\n");
     }
+
+    // 1b. the error envelope: a string union of every code the router (built-ins)
+    // and any action's error type can emit, plus the typed `ResponseError` shape
+    // and a guard. Lets clients exhaustively narrow on `error.type`.
+    let mut codes: BTreeSet<&'static str> = BUILTIN_ERROR_CODES.iter().copied().collect();
+    for name in &unary {
+        codes.extend(actions[*name].error_codes());
+    }
+    for name in &stream {
+        codes.extend(streams[*name].error_codes());
+    }
+    let union = codes
+        .iter()
+        .map(|code| format!("\"{code}\""))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let _ = write!(out, "export type ErrorCode = {union};\n\n");
+    out.push_str(concat!(
+        "export interface ResponseError {\n",
+        "  code: number;\n",
+        "  type: ErrorCode;\n",
+        "  message: string;\n",
+        "  fields?: Record<string, string[]>;\n",
+        "}\n\n",
+        "export const isValidationError = (error: ResponseError): boolean =>\n",
+        "  error.type === \"validation\";\n\n",
+    ));
 
     // 2. typed maps (each value is a type *reference*).
     out.push_str("export interface ActionParameters {\n");

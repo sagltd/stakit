@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 use stakit_model::Model;
 use stakit_router::{
-    Action, ActionExt as _, ClientAction, Cx, Error, Frame, Middleware, Router,
+    Action, ActionExt as _, ClientAction, Cx, Error, Frame, Middleware, ResponseError, Router,
     StreamActionExt as _, action, err,
 };
 
@@ -67,19 +67,17 @@ async fn greet_twice(cx: &Cx<App, Req>, params: Greet) -> Result<String, Error> 
 }
 
 // --- custom application error: returned straight from an action ---
-#[derive(Debug)]
+// A 5xx error: thiserror gives `Display`, `ResponseError` gives the status. The
+// `From` genericizes the client message and keeps the real text in `detail`.
+#[derive(Debug, thiserror::Error, ResponseError)]
+#[status(500)]
+#[error("{0}")]
 struct AppError(&'static str);
-impl std::fmt::Display for AppError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
-    }
-}
-impl std::error::Error for AppError {}
 
 #[action]
 async fn maybe_fail(params: Greet) -> Result<Greeting, AppError> {
     if params.name == "boom" {
-        return Err(AppError("kaboom")); // any std error -> 500
+        return Err(AppError("kaboom")); // 5xx -> generic message, detail kept
     }
     Ok(Greeting {
         message: params.name,
@@ -134,16 +132,17 @@ fn progress<'a>(
     }
 }
 
-// --- thiserror-defined app error works out of the box ---
-#[derive(Debug, thiserror::Error)]
+// --- thiserror + ResponseError app error works out of the box ---
+#[derive(Debug, thiserror::Error, ResponseError)]
 enum TodoError {
+    #[status(500)]
     #[error("database is down")]
     Db,
 }
 
 #[action]
 async fn risky(_params: Greet) -> Result<Greeting, TodoError> {
-    Err(TodoError::Db) // thiserror -> std::error::Error -> Into<Error> (500)
+    Err(TodoError::Db) // thiserror Display + ResponseError status -> Into<Error> (500)
 }
 
 // --- client action (server -> client) for duplex ---

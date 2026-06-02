@@ -21,7 +21,7 @@ pub use action::{Action, StreamAction};
 pub use client::{ClientAction, DEFAULT_CLIENT_CALL_TIMEOUT};
 pub use cx::Cx;
 pub use endpoint::{Endpoint, Kind};
-pub use error::Error;
+pub use error::{Error, ErrorCodes, ResponseError};
 pub use middleware::{ActionExt, Guarded, Middleware, StreamActionExt, StreamGuarded};
 pub use reply::{ErrorBody, Frame, Reply};
 pub use router::{Builder, Router};
@@ -49,3 +49,7 @@ pub use futures::Stream;
 
 /// The `#[action]` attribute macro.
 pub use stakit_router_derive::action;
+
+/// The `#[derive(ResponseError)]` macro: declare an action error's HTTP status,
+/// machine code, and client message via attributes.
+pub use stakit_router_derive::ResponseError;

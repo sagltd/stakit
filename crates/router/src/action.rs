@@ -14,7 +14,7 @@ use serde_json::Value;
 use stakit_model::{Model, TSType, Validate};
 
 use crate::error::panic_message;
-use crate::{Cx, Error};
+use crate::{Cx, Error, ErrorCodes};
 
 /// A typed action: validated input, typed output, run in a context.
 ///
@@ -24,9 +24,11 @@ pub trait Action<G, R>: Send + Sync + 'static {
     type Input: Model + DeserializeOwned + Send;
     /// Serializable, TypeScript-exportable output.
     type Output: TSType + Serialize + Send;
-    /// The action's own error type — anything convertible into [`Error`]
-    /// (any `std::error::Error` works out of the box, defaulting to 500).
-    type Error: Into<Error> + Send + 'static;
+    /// The action's own error type: convertible into [`Error`] and exposing its
+    /// machine codes for TypeScript generation. Deriving
+    /// [`ResponseError`](crate::ResponseError) (usually with `thiserror`)
+    /// supplies both; the router's own [`Error`] works too.
+    type Error: Into<Error> + ErrorCodes + Send + 'static;
 
     /// The action's stable name (used for routing + TS).
     fn name(&self) -> &'static str;
@@ -62,6 +64,7 @@ pub(crate) trait ErasedAction<G, R>: Send + Sync {
     fn input_ref(&self) -> String;
     fn output_ref(&self) -> String;
     fn collect_ts(&self, out: &mut std::collections::BTreeMap<String, String>);
+    fn error_codes(&self) -> &'static [&'static str];
     fn dispatch<'a>(
         &'a self,
         cx: &'a Cx<G, R>,
@@ -86,6 +89,10 @@ where
     fn collect_ts(&self, out: &mut std::collections::BTreeMap<String, String>) {
         <A::Input as TSType>::ts_declarations(out);
         <A::Output as TSType>::ts_declarations(out);
+    }
+
+    fn error_codes(&self) -> &'static [&'static str] {
+        <A::Error as ErrorCodes>::error_codes()
     }
 
     fn dispatch<'a>(
@@ -125,8 +132,9 @@ pub trait StreamAction<G, R>: Send + Sync + 'static {
     type Input: Model + DeserializeOwned + Send;
     /// Serializable, TypeScript-exportable item type.
     type Item: TSType + Serialize + Send;
-    /// Per-item error type — anything convertible into [`Error`].
-    type Error: Into<Error> + Send + 'static;
+    /// Per-item error type: convertible into [`Error`] and exposing its machine
+    /// codes for TypeScript generation (see [`Action::Error`]).
+    type Error: Into<Error> + ErrorCodes + Send + 'static;
 
     /// The action's stable name.
     fn name(&self) -> &'static str;
@@ -160,6 +168,7 @@ pub(crate) trait ErasedStreamAction<G, R>: Send + Sync {
     fn input_ref(&self) -> String;
     fn item_ref(&self) -> String;
     fn collect_ts(&self, out: &mut std::collections::BTreeMap<String, String>);
+    fn error_codes(&self) -> &'static [&'static str];
     fn dispatch<'a>(
         &'a self,
         cx: &'a Cx<G, R>,
@@ -184,6 +193,10 @@ where
     fn collect_ts(&self, out: &mut std::collections::BTreeMap<String, String>) {
         <A::Input as TSType>::ts_declarations(out);
         <A::Item as TSType>::ts_declarations(out);
+    }
+
+    fn error_codes(&self) -> &'static [&'static str] {
+        <A::Error as ErrorCodes>::error_codes()
     }
 
     fn dispatch<'a>(
