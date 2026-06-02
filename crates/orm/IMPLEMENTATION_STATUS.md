@@ -250,6 +250,37 @@ Gate: **142 tests pass with all four backends LIVE** (Postgres embedded, SQLite,
 and MySQL/MariaDB via `brew install mariadb`), 0 clippy issues (pedantic+nursery,
 all-features), fmt + doctest green.
 
+## Review loop — round 6 (vector search, typed JSON/structs, full-text search)
+
+- **Vector search** (`src/vector.rs`): `Vector(Vec<f32>)` column type + `Value::Vector`;
+  dialect-aware bind wrapping (`$N::vector` pgvector, `vector32($N)` Turso, plain
+  `sqlite-vec`) so inserts just work; `Select::nearest(col, &q, Distance)` renders the
+  per-backend distance ORDER BY (`<->`/`<=>`/`<#>`, `vector_distance_*`,
+  `vec_distance_*`); and a **selectable** `vector::distance(col, &q, metric)`
+  projection (output `f64`) so you get the score back, not just ordering. E2e on Turso
+  (insert via `vector32`, cosine + L2 nearest, score, blob round-trip via LE-f32
+  decode); pgvector nearest + score SQL render-tested (all 3 metrics).
+- **Typed JSON / structs** (`src/json.rs`): `Json<T>` stores any `serde` struct in a
+  `json`/`jsonb`/text column; `Value::Json` (serde_json::Value) works raw too. Tested.
+- **Full-text search**: `matches(col, query)` → `to_tsvector @@ plainto_tsquery`
+  (Postgres, core/no-extension) or FTS5 `MATCH` (SQLite/Turso). E2e on all three.
+- Review (3 sub-agents: safety, idiomatic, perf+coverage). Fixed: added the
+  selectable distance-score projection (the unanimous CRITICAL gap), `count`/`exists`
+  now clear the vector ORDER BY, `From<[f32;N]>`/`From<&[f32]>` for `Vector`,
+  `Vector`/`Distance`/`Json`/`distance` in the prelude, `vector` unit tests
+  (literal round-trip/empty/malformed), L2+InnerProduct render tests, README rewritten
+  (the stale "not modeled" caveats were wrong — now documents vector/FTS/JSON + ANN
+  index DDL + pg `::text` read caveat honestly).
+- Gate: 151 tests + 4 doctests pass, 0 clippy (all-features). NOTE: builds now require
+  rustc ≥ 1.94 (sqlx 0.9 MSRV); the repo's `rust-toolchain.toml` pins
+  nightly-2025-11-20 (1.93) which is **too old** — verified under `stable` (1.96).
+
+Known follow-ups (next loop): FTS relevance ranking (`ts_rank`/`bm25`) as a typed
+projection + order-by-rank; `Distance::Raw`/custom-distance escape hatch; binary
+vector binds (perf for large embeddings, avoids text formatting + pg `::text` reads);
+live pgvector/PostGIS/sqlite-vec e2e (need the extensions); `Json<T>` serialize-error
+currently falls back to JSON null (infallible `ToValue`); MySQL `MATCH … AGAINST`.
+
 ## Not yet implemented (tracked, with rationale)
 
 - **`copy_into`** bulk path + UNNEST (spec §10) — `insert`/`insert_many`/`returning`/

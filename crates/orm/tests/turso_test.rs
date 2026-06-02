@@ -507,3 +507,127 @@ async fn turso_foreign_key_cascade() {
         "cascade must delete devices when owner is deleted"
     );
 }
+
+#[derive(Table, Debug)]
+#[table(name = "embeds")]
+#[allow(dead_code)]
+struct Embed {
+    #[column(pk)]
+    id: i64,
+    title: String,
+    #[column(sql_type = "blob")]
+    embedding: stakit_orm::Vector,
+}
+
+/// Native Turso/libSQL vector search: insert via `vector32(..)`, nearest-neighbour
+/// via `vector_distance_cos(..)` + ORDER BY + LIMIT (the `.nearest()` builder).
+#[tokio::test]
+async fn turso_vector_search() {
+    use stakit_orm::Distance;
+    let db = Db::connect_turso_local(":memory:").await.expect("open");
+    db.raw("create table embeds (id integer primary key, title text not null, embedding blob not null)")
+        .exec()
+        .await
+        .unwrap();
+
+    db.insert_many(vec![
+        EmbedNew {
+            id: 1,
+            title: "cat".into(),
+            embedding: stakit_orm::Vector::new(vec![1.0, 0.0, 0.0]),
+        },
+        EmbedNew {
+            id: 2,
+            title: "dog".into(),
+            embedding: stakit_orm::Vector::new(vec![0.9, 0.1, 0.0]),
+        },
+        EmbedNew {
+            id: 3,
+            title: "car".into(),
+            embedding: stakit_orm::Vector::new(vec![0.0, 0.0, 1.0]),
+        },
+    ])
+    .exec()
+    .await
+    .expect("insert embeddings");
+
+    // nearest to [1,0,0] by cosine: cat (exact), then dog, then car.
+    let query = [1.0_f32, 0.0, 0.0];
+    let nearest = db
+        .find::<Embed>()
+        .nearest(Embed::embedding, &query, Distance::Cosine)
+        .limit(2)
+        .all()
+        .await
+        .expect("nearest");
+    assert_eq!(nearest.len(), 2);
+    assert_eq!(nearest[0].title, "cat");
+    assert_eq!(nearest[1].title, "dog");
+
+    // get the distance SCORE back via the selectable `distance(..)` projection.
+    let scored = db
+        .select((
+            Embed::title,
+            stakit_orm::vector::distance(Embed::embedding, &query, Distance::Cosine),
+        ))
+        .from::<Embed>()
+        .nearest(Embed::embedding, &query, Distance::Cosine)
+        .limit(1)
+        .all()
+        .await
+        .expect("distance score");
+    assert_eq!(scored[0].0, "cat");
+    assert!(
+        scored[0].1 < 1e-6,
+        "exact match cosine distance ~0, got {}",
+        scored[0].1
+    );
+
+    // L2 metric also works.
+    let by_l2 = db
+        .find::<Embed>()
+        .nearest(Embed::embedding, &query, Distance::L2)
+        .limit(1)
+        .all()
+        .await
+        .expect("l2");
+    assert_eq!(by_l2[0].title, "cat");
+
+    // Vector round-trip read (libSQL blob -> Vec<f32>).
+    let cat = db.get::<Embed>(1).one().await.unwrap().unwrap();
+    assert_eq!(cat.embedding.0, vec![1.0, 0.0, 0.0]);
+}
+
+#[derive(Table, Debug)]
+#[table(name = "tt_articles")]
+#[allow(dead_code)]
+struct TtArticle {
+    title: String,
+    body: String,
+}
+
+/// Full-text search on libSQL via FTS5 `MATCH` (bundled in libSQL).
+#[tokio::test]
+async fn turso_fts5_match() {
+    let db = Db::connect_turso_local(":memory:").await.expect("open");
+    db.raw("create virtual table tt_articles using fts5(title, body)")
+        .exec()
+        .await
+        .expect("create fts5");
+    db.raw("insert into tt_articles (title, body) values ('Rust', 'fast systems programming')")
+        .exec()
+        .await
+        .unwrap();
+    db.raw("insert into tt_articles (title, body) values ('Soup', 'a tasty recipe')")
+        .exec()
+        .await
+        .unwrap();
+    let hits = db
+        .find::<TtArticle>()
+        .filter(matches(TtArticle::body, "systems"))
+        .all()
+        .await
+        .expect("fts match");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].title, "Rust");
+}

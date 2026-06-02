@@ -35,6 +35,7 @@ mod exec;
 pub mod expr;
 mod ident;
 pub mod insert;
+pub mod json;
 mod mutation;
 pub mod nanoid;
 pub mod projection;
@@ -44,6 +45,7 @@ mod render;
 pub mod schema;
 mod sql;
 pub mod value;
+pub mod vector;
 
 #[cfg(feature = "postgres")]
 pub use db::DbConfig;
@@ -61,6 +63,7 @@ pub use driver::{Driver, Row, RowSink, TxConn};
 pub use error::{Error, Result};
 pub use ident::IdentError;
 pub use insert::{Insert, InsertReturning, Insertable, OptionalPresent};
+pub use json::Json;
 pub use mutation::{Delete, Update};
 pub use nanoid::{nanoid, nanoid_custom, nanoid_sized};
 pub use projection::{
@@ -72,6 +75,7 @@ pub use raw::Raw;
 pub use schema::{Col, Column, Expr, ForeignKey, OnDelete, Rel, Table};
 pub use sql::SqlWriter;
 pub use value::{FromValue, ToValue, Value, ValueKind};
+pub use vector::{Distance, Vector};
 
 /// The `#[derive(Table)]` macro (shares its name with the [`Table`] trait, like
 /// serde's `Serialize`).
@@ -89,15 +93,17 @@ pub use stakit_orm_derive::DbEnum;
 pub mod prelude {
     pub use crate::Db;
     pub use crate::DbEnum;
+    pub use crate::Json;
     pub use crate::Migration;
     pub use crate::Table;
     pub use crate::error::{Error, Result};
     pub use crate::expr::{
         ColExpr, Direction, IntoExpr, Order, Predicate, and, any_of, asc, desc, eq, gt, gte,
-        is_null, like, lt, lte, ne, not, or, raw_pred,
+        is_null, like, lt, lte, matches, ne, not, or, raw_pred,
     };
     pub use crate::projection::{
         All, Count, Projection, avg, count, count_col, max, min, sql_expr, sum,
     };
     pub use crate::schema::{Col, Rel, Table as TableTrait};
+    pub use crate::vector::{Distance, Vector, distance};
 }

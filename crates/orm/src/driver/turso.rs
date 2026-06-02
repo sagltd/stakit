@@ -235,6 +235,8 @@ fn to_libsql(value: Value) -> Result<LibsqlValue> {
         Value::Json(x) => {
             LibsqlValue::Text(serde_json::to_string(&x).map_err(|e| Error::Encode(Box::new(e)))?)
         }
+        // Bound as the text literal `[..]`; the SQL writer wraps it in `vector32(..)`.
+        Value::Vector(x) => LibsqlValue::Text(crate::vector::to_literal(&x)),
         Value::Array(..) => {
             return Err(Error::Encode("Turso does not support array binds".into()));
         }
@@ -301,7 +303,27 @@ fn cell_to_value(cell: LibsqlValue, kind: ValueKind) -> Result<Value> {
                 .map(Value::Json)
                 .map_err(|error| Error::Decode(Box::new(error)))?
         }
+        // libSQL stores `vector32` as a BLOB of little-endian f32; decode that
+        // directly (or accept the `[..]` text literal from `vector_extract`).
+        ValueKind::Vector => match cell {
+            LibsqlValue::Blob(bytes) => Value::Vector(decode_f32_blob(&bytes)?),
+            LibsqlValue::Text(text) => Value::Vector(crate::vector::parse_literal(&text)?),
+            _ => return Err(type_error("vector (blob or text)")),
+        },
     })
+}
+
+/// Decode a little-endian `f32` BLOB (libSQL `vector32` storage) into components.
+fn decode_f32_blob(bytes: &[u8]) -> Result<Vec<f32>> {
+    if bytes.len() % 4 != 0 {
+        return Err(Error::Decode(
+            format!("vector blob length {} is not a multiple of 4", bytes.len()).into(),
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
 }
 
 /// Checked narrowing of a `libSQL` `i64` cell into a smaller integer type.

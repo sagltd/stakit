@@ -1170,3 +1170,159 @@ async fn create_index_works() {
         .unwrap();
     assert!(idx.is_empty());
 }
+
+// ----- typed JSON struct storage via Json<T> -----
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct Profile {
+    theme: String,
+    notifications: bool,
+    tags: Vec<String>,
+}
+
+#[derive(Table, Debug)]
+#[table(name = "accounts")]
+#[allow(dead_code)]
+struct Account {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    profile: stakit_orm::Json<Profile>,
+}
+
+#[tokio::test]
+async fn typed_json_struct_round_trips() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    db.raw("create table accounts (id integer primary key, profile text not null)")
+        .exec()
+        .await
+        .unwrap();
+
+    let profile = Profile {
+        theme: "dark".into(),
+        notifications: true,
+        tags: vec!["a".into(), "b".into()],
+    };
+    db.insert(AccountNew {
+        id: 1,
+        profile: stakit_orm::Json(profile.clone()),
+    })
+    .exec()
+    .await
+    .expect("insert struct");
+
+    let got = db.get::<Account>(1).one().await.unwrap().unwrap();
+    assert_eq!(got.profile.0, profile);
+}
+
+// ----- pgvector SQL rendering (no extension needed; checks the generated SQL) -----
+
+#[derive(Table, Debug)]
+#[table(name = "docs_vec")]
+#[allow(dead_code)]
+struct DocVec {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "vector(3)")]
+    embedding: stakit_orm::Vector,
+}
+
+#[test]
+fn pgvector_nearest_renders_operator_and_cast() {
+    use stakit_orm::Distance;
+    // Select::new with no exec uses the default (Postgres) dialect.
+    let sql = stakit_orm::Select::new(DocVec::all())
+        .from::<DocVec>()
+        .nearest(DocVec::embedding, &[1.0, 2.0, 3.0], Distance::Cosine)
+        .limit(5)
+        .to_sql()
+        .unwrap();
+    assert!(
+        sql.contains(r#""docs_vec"."embedding" <=> $1::vector"#),
+        "got: {sql}"
+    );
+    assert!(sql.contains("order by"));
+    assert!(sql.trim_end().ends_with("limit $2"), "got: {sql}");
+
+    // L2 and InnerProduct render the right pgvector operators.
+    let l2 = stakit_orm::Select::new(DocVec::all())
+        .from::<DocVec>()
+        .nearest(DocVec::embedding, &[1.0, 2.0, 3.0], Distance::L2)
+        .to_sql()
+        .unwrap();
+    assert!(
+        l2.contains(r#""docs_vec"."embedding" <-> $1::vector"#),
+        "got: {l2}"
+    );
+    let ip = stakit_orm::Select::new(DocVec::all())
+        .from::<DocVec>()
+        .nearest(DocVec::embedding, &[1.0, 2.0, 3.0], Distance::InnerProduct)
+        .to_sql()
+        .unwrap();
+    assert!(
+        ip.contains(r#""docs_vec"."embedding" <#> $1::vector"#),
+        "got: {ip}"
+    );
+
+    // the selectable distance() projection renders the operator in the SELECT list.
+    let scored = stakit_orm::Select::new((
+        DocVec::id,
+        stakit_orm::vector::distance(DocVec::embedding, &[1.0, 2.0, 3.0], Distance::Cosine),
+    ))
+    .from::<DocVec>()
+    .to_sql()
+    .unwrap();
+    assert!(
+        scored.contains(r#""docs_vec"."embedding" <=> $1::vector"#),
+        "got: {scored}"
+    );
+}
+
+// ----- full-text search (SQLite FTS5, bundled) -----
+
+#[derive(Table, Debug)]
+#[table(name = "articles")]
+#[allow(dead_code)]
+struct Article {
+    title: String,
+    body: String,
+}
+
+#[tokio::test]
+async fn sqlite_fts5_match() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    // FTS5 virtual table (bundled in sqlx's SQLite).
+    db.raw("create virtual table articles using fts5(title, body)")
+        .exec()
+        .await
+        .expect("create fts5");
+    db.raw(
+        "insert into articles (title, body) values ('Rust', 'fast systems programming language')",
+    )
+    .exec()
+    .await
+    .unwrap();
+    db.raw("insert into articles (title, body) values ('Cooking', 'a recipe for soup')")
+        .exec()
+        .await
+        .unwrap();
+
+    let hits = db
+        .find::<Article>()
+        .filter(matches(Article::body, "systems"))
+        .all()
+        .await
+        .expect("fts match");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].title, "Rust");
+}

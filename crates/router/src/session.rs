@@ -102,16 +102,20 @@ where
         let req = self.req.clone();
         let client = self.client.clone();
         let tx = self.out_tx.clone();
+        // Every error this connection emits passes through the router's hook
+        // (redact/rewrite) before hitting the wire — same as the request path.
+        let on_error = Arc::clone(&self.router.on_error);
 
         tokio::spawn(async move {
             let _permit = permit; // released when this action's task ends
             let cx = Cx { app, req, client };
             if let Some(action) = action {
-                let result = action.dispatch(&cx, params).await;
+                let result = action.dispatch(&cx, params).await.map_err(|e| on_error(e));
                 let _ = tx.send(result_frame(id, result)).await;
             } else if let Some(stream) = stream {
                 let mut items = stream.dispatch(&cx, params);
                 while let Some(item) = items.next().await {
+                    let item = item.map_err(|e| on_error(e));
                     let is_err = item.is_err();
                     // Bounded send: applies backpressure to a slow client;
                     // errors only once the receiver (socket) is gone.
@@ -122,7 +126,7 @@ where
                 let _ = tx.send(json!({ "kind": "end", "id": id })).await;
             } else {
                 let _ = tx
-                    .send(result_frame(id, Err(Error::not_found(&name))))
+                    .send(result_frame(id, Err(on_error(Error::not_found(&name)))))
                     .await;
             }
         });

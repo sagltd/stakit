@@ -19,6 +19,20 @@ impl Dialect for PostgresDialect {
     fn supports_any_array(&self) -> bool {
         true
     }
+    fn vector_bind(&self) -> (&'static str, &'static str) {
+        ("", "::vector")
+    }
+    fn vector_distance(&self, metric: crate::vector::Distance) -> crate::vector::DistanceSql {
+        use crate::vector::{Distance, DistanceSql::Operator};
+        match metric {
+            Distance::L2 => Operator(" <-> "),
+            Distance::Cosine => Operator(" <=> "),
+            Distance::InnerProduct => Operator(" <#> "),
+        }
+    }
+    fn full_text(&self) -> super::FullText {
+        super::FullText::TsQuery("english")
+    }
 }
 
 #[cfg(test)]

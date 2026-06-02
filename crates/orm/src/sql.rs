@@ -27,6 +27,9 @@ pub struct SqlWriter {
     numbered_placeholders: bool,
     quote_char: char,
     supports_any_array: bool,
+    vector_bind: (&'static str, &'static str),
+    // Kept for the rare vector-distance path (metric-dependent, can't be a flag).
+    dialect: &'static dyn crate::dialect::Dialect,
 }
 
 impl Default for SqlWriter {
@@ -53,7 +56,21 @@ impl SqlWriter {
             numbered_placeholders: dialect.numbered_placeholders(),
             quote_char: dialect.quote_char(),
             supports_any_array: dialect.supports_any_array(),
+            vector_bind: dialect.vector_bind(),
+            dialect,
         }
+    }
+
+    /// How this backend renders a vector distance (for nearest-neighbour ordering).
+    #[must_use]
+    pub fn vector_distance(&self, metric: crate::vector::Distance) -> crate::vector::DistanceSql {
+        self.dialect.vector_distance(metric)
+    }
+
+    /// How this backend renders a full-text match predicate.
+    #[must_use]
+    pub fn full_text(&self) -> crate::dialect::FullText {
+        self.dialect.full_text()
     }
 
     /// Append raw SQL text (keywords, punctuation — never user values).
@@ -83,13 +100,22 @@ impl SqlWriter {
     /// Queue a bind value and write its positional placeholder (`$N` for
     /// Postgres, `?N` for SQLite/libSQL).
     pub fn push_bind(&mut self, value: Value) {
+        // Vector binds are wrapped so the backend reads the placeholder as a vector
+        // (`$N::vector` / `vector32($N)` / plain), both on insert and in queries.
+        let vector = matches!(value, Value::Vector(_));
         self.binds.push(value);
         let position = self.binds.len();
+        if vector {
+            self.sql.push_str(self.vector_bind.0);
+        }
         self.sql.push(self.placeholder_prefix);
         if self.numbered_placeholders {
             // Avoid `format!` allocation in the hot path.
             let mut buffer = itoa_buffer();
             self.sql.push_str(itoa(position, &mut buffer));
+        }
+        if vector {
+            self.sql.push_str(self.vector_bind.1);
         }
     }
 

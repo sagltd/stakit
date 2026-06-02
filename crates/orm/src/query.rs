@@ -10,12 +10,21 @@ use crate::projection::Projection;
 use crate::schema::Table;
 use crate::sql::{BindBuffer, SqlWriter};
 use crate::value::Value;
+use crate::vector::{Distance, DistanceSql};
 use smallvec::SmallVec;
 
 struct Join {
     keyword: &'static str,
     table: &'static str,
     on: Predicate,
+}
+
+/// A nearest-neighbour ordering: `ORDER BY distance(column, query)`.
+struct NearestOrder {
+    table: &'static str,
+    name: &'static str,
+    query: Vec<f32>,
+    metric: Distance,
 }
 
 /// A `SELECT` query under construction.
@@ -28,6 +37,7 @@ pub struct Select<P> {
     group: SmallVec<[(&'static str, &'static str); 4]>,
     having: Option<Predicate>,
     order: SmallVec<[Order; 4]>,
+    nearest: Option<NearestOrder>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -46,6 +56,7 @@ impl<P: Projection> Select<P> {
             group: SmallVec::new(),
             having: None,
             order: SmallVec::new(),
+            nearest: None,
             limit: None,
             offset: None,
         }
@@ -127,6 +138,27 @@ impl<P: Projection> Select<P> {
         self
     }
 
+    /// Order by vector distance to `query` (nearest-neighbour search): appends
+    /// `ORDER BY <distance>(column, query)` rendered for the active backend
+    /// (`<->`/`<=>`/`<#>` on pgvector, `vector_distance_*` on Turso,
+    /// `vec_distance_*` on `sqlite-vec`). Combine with `.limit(k)` for top-k. See
+    /// [`crate::vector`].
+    #[must_use]
+    pub fn nearest<T, Ty>(
+        mut self,
+        column: crate::schema::Col<T, Ty>,
+        query: &[f32],
+        metric: Distance,
+    ) -> Self {
+        self.nearest = Some(NearestOrder {
+            table: column.table,
+            name: column.name,
+            query: query.to_vec(),
+            metric,
+        });
+        self
+    }
+
     /// Set `LIMIT` (bound as a parameter).
     #[must_use]
     pub const fn limit(mut self, limit: i64) -> Self {
@@ -157,6 +189,7 @@ impl<P: Projection> Select<P> {
             group,
             having,
             order,
+            nearest,
             limit,
             offset,
             exec: _,
@@ -186,9 +219,30 @@ impl<P: Projection> Select<P> {
             writer.push(" having ");
             having.write(&mut writer)?;
         }
+        let mut order_started = false;
         for (index, order) in order.iter().enumerate() {
             writer.push(if index == 0 { " order by " } else { ", " });
             order.write(&mut writer)?;
+            order_started = true;
+        }
+        if let Some(nearest) = nearest {
+            writer.push(if order_started { ", " } else { " order by " });
+            match writer.vector_distance(nearest.metric) {
+                DistanceSql::Operator(op) => {
+                    writer.push_qualified(nearest.table, nearest.name)?;
+                    writer.push(op);
+                    writer.push_bind(Value::Vector(nearest.query));
+                }
+                DistanceSql::Function(function) => {
+                    writer.push(function);
+                    writer.push("(");
+                    writer.push_qualified(nearest.table, nearest.name)?;
+                    writer.push(", ");
+                    writer.push_bind(Value::Vector(nearest.query));
+                    writer.push(")");
+                }
+            }
+            writer.push(" asc");
         }
         if let Some(limit) = limit {
             writer.push(" limit ");
@@ -280,6 +334,7 @@ impl<P: Projection> Select<P> {
         self.limit = None;
         self.offset = None;
         self.order.clear();
+        self.nearest = None;
         let exec = self.take_exec()?;
         let (_projection, inner, arguments) = self.into_sql()?;
         let sql = format!("select count(*) from ({inner}) as __count");
@@ -301,6 +356,7 @@ impl<P: Projection> Select<P> {
         self.limit = None;
         self.offset = None;
         self.order.clear();
+        self.nearest = None;
         let exec = self.take_exec()?;
         let (_projection, inner, arguments) = self.into_sql()?;
         let sql = format!("select exists({inner})");

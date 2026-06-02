@@ -154,6 +154,16 @@ pub enum Predicate {
     Or(Box<Self>, Box<Self>),
     /// `NOT (inner)`.
     Not(Box<Self>),
+    /// Full-text match: FTS5 `column MATCH ?` (`SQLite`/Turso) or
+    /// `to_tsvector(column) @@ plainto_tsquery(?)` (Postgres).
+    Match {
+        /// Column table.
+        table: &'static str,
+        /// Column name.
+        name: &'static str,
+        /// The search query text.
+        query: String,
+    },
     /// A raw SQL fragment (developer-trusted `&'static str`) — e.g. an aggregate
     /// `HAVING` like `count(*) > 5` that the typed builder can't model.
     Raw(&'static str),
@@ -212,12 +222,43 @@ impl Predicate {
                 writer.push(")");
                 Ok(())
             }
+            Self::Match { table, name, query } => write_match(writer, table, name, query),
             Self::Raw(fragment) => {
                 writer.push(fragment);
                 Ok(())
             }
         }
     }
+}
+
+/// Render a full-text match per dialect: FTS5 `col MATCH ?`, or Postgres
+/// `to_tsvector('<cfg>', col) @@ plainto_tsquery('<cfg>', $1)`. `cfg` is a fixed
+/// `&'static` config name (no injection); the query text is always bound.
+fn write_match(
+    writer: &mut SqlWriter,
+    table: &'static str,
+    name: &'static str,
+    query: String,
+) -> Result<(), IdentError> {
+    match writer.full_text() {
+        crate::dialect::FullText::Fts5Match => {
+            writer.push_qualified(table, name)?;
+            writer.push(" match ");
+            writer.push_bind(Value::Text(query));
+        }
+        crate::dialect::FullText::TsQuery(config) => {
+            writer.push("to_tsvector('");
+            writer.push(config);
+            writer.push("', ");
+            writer.push_qualified(table, name)?;
+            writer.push(") @@ plainto_tsquery('");
+            writer.push(config);
+            writer.push("', ");
+            writer.push_bind(Value::Text(query));
+            writer.push(")");
+        }
+    }
+    Ok(())
 }
 
 /// Render list membership. On backends with array binds (Postgres) this is one
@@ -388,6 +429,19 @@ pub fn or(left: Predicate, right: Predicate) -> Predicate {
 #[must_use]
 pub fn not(inner: Predicate) -> Predicate {
     Predicate::Not(Box::new(inner))
+}
+
+/// Full-text search on `column` for `query`.
+///
+/// FTS5 `MATCH` on `SQLite`/Turso (the table must be an `fts5` virtual table), or
+/// `to_tsvector @@ plainto_tsquery` on Postgres. Combine with `.order_by`/`.limit`.
+#[must_use]
+pub fn matches<T, Ty>(column: crate::schema::Col<T, Ty>, query: impl Into<String>) -> Predicate {
+    Predicate::Match {
+        table: column.table,
+        name: column.name,
+        query: query.into(),
+    }
 }
 
 /// Sort direction.

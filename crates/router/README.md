@@ -126,9 +126,46 @@ Notes:
 - `cx` is shared (`&`), so a guard enriches the request via interior mutability
   (e.g. `req.user: OnceLock<User>`) — `before` validates the token *and* injects
   the user; the action just reads `cx.req.user`.
-- The guard runs **after** input deserialize + validation (it's inside the
-  action's `run`); it short-circuits the action body, not the whole pipeline.
+- The guard runs **before** input deserialize + validation, so an unauthorized
+  caller is rejected without the validation schema ever being exercised (no
+  field-level error leak past the gate). `Err` short-circuits the whole pipeline.
 - Works on streaming actions too — `before` runs once before the stream starts.
+
+## Error handling: crash safety + `.on_error`
+
+**Crash safety.** A panicking action — yours or a dependency's — never crashes
+the app or the connection. Each action (and each stream item) runs inside
+`catch_unwind`; a panic becomes a generic `500` reply (or a single error frame
+for streams) and the router keeps serving. The panic's text is kept server-side,
+never sent to the client. (Requires the default `unwind` panic strategy; a binary
+built with `panic = "abort"` aborts on panic before anything can be caught.)
+
+**`.on_error`.** Errors can carry sensitive detail. The `.on_error(prev => new)`
+hook rewrites every outgoing error at the wire boundary — unary replies, stream
+error frames, and websocket `call` results. Default is identity. Use it to redact
+in production while keeping rich errors in development:
+
+```rust
+let dev = std::env::var("APP_ENV").as_deref() != Ok("production");
+
+let router = Router::builder()
+    .ctx(App { /* … */ })
+    .on_error(move |e| {
+        if dev {
+            // Surface the server-side detail to developers.
+            e.detail().map_or_else(|| e, |d| Error::new(e.code, format!("[dev] {d}")))
+        } else {
+            // Redact to a fixed, code-only message in production.
+            Error::new(e.code, "request failed")
+        }
+    })
+    .register(/* … */)
+    .build();
+```
+
+Internal errors (anything `?`-propagated) are *already* generic by default — the
+client sees `"internal server error"` with the real text in `Error::detail` for
+logging. `.on_error` is the extra knob for shaping every error uniformly.
 
 ## Testing actions — no server needed
 

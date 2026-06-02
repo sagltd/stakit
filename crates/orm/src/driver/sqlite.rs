@@ -52,6 +52,13 @@ impl Row for SqliteRow {
             ValueKind::Date => read!(self, index, kind, NaiveDate, Value::Date),
             ValueKind::NaiveTime => read!(self, index, kind, NaiveTime, Value::NaiveTime),
             ValueKind::Json => read!(self, index, kind, serde_json::Value, Value::Json),
+            ValueKind::Vector => {
+                let cell: Option<String> = self.try_get(index).map_err(into_decode)?;
+                match cell {
+                    Some(text) => Ok(Value::Vector(crate::vector::parse_literal(&text)?)),
+                    None => Ok(Value::Null(kind)),
+                }
+            }
         }
     }
 
@@ -213,6 +220,7 @@ fn bind_scalar(args: &mut SqliteArguments, value: Value) -> Result<()> {
         Value::Date(x) => args.add(x),
         Value::NaiveTime(x) => args.add(x),
         Value::Json(x) => args.add(x),
+        Value::Vector(x) => args.add(crate::vector::to_literal(&x)),
         // Arrays never reach SQLite: the dialect has `supports_any_array() == false`,
         // so list membership is rendered as `IN (?, …)` with scalar binds.
         Value::Array(..) => {
@@ -229,7 +237,8 @@ fn bind_null(args: &mut SqliteArguments, kind: ValueKind) -> Result<()> {
         ValueKind::I64 => args.add(None::<i64>),
         ValueKind::F32 | ValueKind::F64 => args.add(None::<f64>),
         ValueKind::Bool => args.add(None::<bool>),
-        ValueKind::Text => args.add(None::<String>),
+        // Vector binds as its `[..]` text literal, so its null is a text null too.
+        ValueKind::Text | ValueKind::Vector => args.add(None::<String>),
         ValueKind::Bytes => args.add(None::<Vec<u8>>),
         ValueKind::Uuid => args.add(None::<Uuid>),
         ValueKind::Timestamptz => args.add(None::<DateTime<Utc>>),

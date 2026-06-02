@@ -1,5 +1,7 @@
 //! End-to-end tests for the agent loop, driven by a mock streaming provider.
 #![allow(dead_code)]
+// Mock providers satisfy the async `Provider` trait but do no async work.
+#![allow(clippy::unused_async_trait_impl)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

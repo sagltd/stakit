@@ -45,6 +45,10 @@ pub enum Value {
     NaiveTime(NaiveTime),
     /// `json`/`jsonb` — an arbitrary JSON document.
     Json(serde_json::Value),
+    /// An embedding vector (`f32` components) for vector search. Bound as the
+    /// backend's vector literal (`$N::vector` on pgvector, `vector32($N)` on Turso,
+    /// JSON text on `sqlite-vec`); see [`crate::vector`].
+    Vector(Vec<f32>),
     /// A homogeneous array of scalar values (for `= ANY($1)` / `IN`), carrying
     /// the element kind so an empty array still binds with a concrete type.
     Array(ValueKind, Vec<Self>),
@@ -82,6 +86,8 @@ pub enum ValueKind {
     NaiveTime,
     /// `json`/`jsonb`.
     Json,
+    /// An embedding vector for vector search.
+    Vector,
 }
 
 fn mismatch(expected: &str, got: &Value) -> Error {

@@ -78,7 +78,7 @@ future_not_send = "allow"
 
 [profile.dev]
 opt-level = 0
-debug = true
+debug = false          # no debugger in use → drop debuginfo (biggest target-size win)
 overflow-checks = true
 incremental = true
 

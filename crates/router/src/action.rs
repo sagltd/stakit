@@ -1,7 +1,9 @@
 //! The [`Action`] trait and its type-erased form.
 
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 
+use futures::FutureExt as _;
 use futures::Stream;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
@@ -11,6 +13,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use stakit_model::{Model, TSType, Validate};
 
+use crate::error::panic_message;
 use crate::{Cx, Error};
 
 /// A typed action: validated input, typed output, run in a context.
@@ -90,15 +93,25 @@ where
         cx: &'a Cx<G, R>,
         params: Value,
     ) -> BoxFuture<'a, Result<Value, Error>> {
+        // The whole pipeline runs inside `catch_unwind`: a panicking action (or
+        // guard) becomes a `500` error instead of crashing the app/connection.
         Box::pin(async move {
-            // Guard first — before any deserialize/validate, so a rejected caller
-            // never sees input-schema validation errors.
-            self.before(cx).await?;
-            let input: A::Input = serde_json::from_value(params).map_err(|e| Error::decode(&e))?;
-            input.validate().map_err(Error::validation)?;
-            let result = self.run(cx, input).await.map_err(Into::into);
-            self.after(cx).await;
-            serde_json::to_value(result?).map_err(|e| Error::encode(&e))
+            let work = AssertUnwindSafe(async move {
+                self.before(cx).await?; // guard before deserialize/validate
+                let input: A::Input =
+                    serde_json::from_value(params).map_err(|e| Error::decode(&e))?;
+                input.validate().map_err(Error::validation)?;
+                let result = self.run(cx, input).await.map_err(Into::into);
+                self.after(cx).await;
+                serde_json::to_value(result?).map_err(|e| Error::encode(&e))
+            });
+            match work.catch_unwind().await {
+                Ok(result) => result,
+                Err(panic) => Err(Error::internal(format!(
+                    "action panicked: {}",
+                    panic_message(&*panic)
+                ))),
+            }
         })
     }
 }
@@ -179,10 +192,18 @@ where
         params: Value,
     ) -> BoxStream<'a, Result<Value, Error>> {
         Box::pin(async_stream::stream! {
-            // Guard before any deserialize/validate (no schema leak past it).
-            if let Err(error) = self.before(cx).await {
-                yield Err(error);
-                return;
+            // Guard before any deserialize/validate (no schema leak past it),
+            // caught so a panicking guard becomes an error frame, not a crash.
+            match AssertUnwindSafe(self.before(cx)).catch_unwind().await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    yield Err(error);
+                    return;
+                }
+                Err(panic) => {
+                    yield Err(Error::internal(format!("action panicked: {}", panic_message(&*panic))));
+                    return;
+                }
             }
             let input: A::Input = match serde_json::from_value(params) {
                 Ok(input) => input,
@@ -196,12 +217,27 @@ where
                 return;
             }
             let mut items = ::std::pin::pin!(self.run(cx, input));
-            while let Some(item) = items.next().await {
-                yield item
-                    .map_err(Into::into)
-                    .and_then(|value| serde_json::to_value(value).map_err(|e| Error::encode(&e)));
+            // Each item poll is caught: a panic mid-stream ends it with an error
+            // frame rather than crashing.
+            loop {
+                match AssertUnwindSafe(items.next()).catch_unwind().await {
+                    Ok(Some(item)) => {
+                        yield item.map_err(Into::into).and_then(|value| {
+                            serde_json::to_value(value).map_err(|e| Error::encode(&e))
+                        });
+                    }
+                    Ok(None) => break,
+                    Err(panic) => {
+                        yield Err(Error::internal(format!("action panicked: {}", panic_message(&*panic))));
+                        return;
+                    }
+                }
             }
-            self.after(cx).await;
+            // `after` is caught too: a panicking teardown hook ends the stream
+            // with an error frame instead of escaping the spawned task.
+            if let Err(panic) = AssertUnwindSafe(self.after(cx)).catch_unwind().await {
+                yield Err(Error::internal(format!("action panicked: {}", panic_message(&*panic))));
+            }
         })
     }
 }

@@ -434,20 +434,62 @@ Now `db.insert`, `db.find::<Item>()`, `db.get`, `#[derive(Row)]`, and
 blanket `Option<T>` impl). Rule of thumb: impl **(1)+(2)** to store/read it, add **(3)**
 to compare against it in `WHERE`.
 
-This same point is how DB extensions like **pgvector** and **PostGIS** plug in:
-represent the value as text/bytes and round-trip it. Caveats today:
+PostGIS plugs in the same way: store `geometry` as WKT (`Text`) or WKB (`Bytes`), and
+use `db.raw(...)`/`sql_expr` for `ST_*` functions and operators.
 
-- **Reading** works directly (`vector`/`geometry` columns have text output → parse in
-  `FromValue`).
-- **Writing** to a native `vector`/`geometry` column usually needs an explicit cast —
-  the typed `insert` binds a plain param and does not add `::vector`. Use
-  `db.raw("insert … values ($1::vector)")` for the cast.
-- **Operators** (`<->` KNN, `ST_DWithin`, …) aren't modeled by the typed builder — use
-  `sql_expr::<T>("…")` in projections and `raw_pred("…")` / `db.raw(…)` in filters.
+## Vector search (pgvector / Turso / sqlite-vec)
 
-So custom scalar types are first-class and tested; full native vector/geo support is
-reachable via the raw/`sql_expr` escape hatches (first-class binary + operators are
-tracked as future work).
+First-class. Store embeddings in a `Vector` column; `nearest()` renders the right SQL
+per backend (`<->`/`<=>`/`<#>` on pgvector, `vector_distance_*` on Turso,
+`vec_distance_*` on `sqlite-vec`), and `vector::distance(..)` is a **selectable**
+projection that returns the score.
+
+```rust
+use stakit_orm::prelude::*;          // Vector, Distance, distance
+
+#[derive(Table)]
+#[table(name = "docs")]
+struct Doc {
+    #[column(pk)] id: i64,
+    #[column(sql_type = "vector(3)")] embedding: Vector,   // pg: vector(N); turso: blob; sqlite-vec: vec0
+}
+
+let q = [0.1_f32, 0.2, 0.3];
+// top-5 nearest by cosine
+let hits = db.find::<Doc>().nearest(Doc::embedding, &q, Distance::Cosine).limit(5).all().await?;
+// …with the score: Vec<(i64, f64)>
+let scored = db.select((Doc::id, distance(Doc::embedding, &q, Distance::Cosine)))
+    .from::<Doc>()
+    .nearest(Doc::embedding, &q, Distance::Cosine)
+    .limit(5)
+    .all().await?;
+```
+
+`Vector` binds correctly on insert too (pg `$1::vector`, Turso `vector32($1)`). Setup
+and caveats per backend:
+
+| Backend     | Column DDL              | ANN index (you create it)                              | Notes |
+|-------------|-------------------------|--------------------------------------------------------|-------|
+| Postgres    | `vector(N)` (pgvector)  | `CREATE INDEX … USING hnsw (embedding vector_cosine_ops)` | reading the column back needs `embedding::text`; metric must match the index opclass |
+| Turso/libSQL| `blob`                  | `libsql_vector_idx(embedding)`                          | works in-process; round-trips as LE-f32 blob |
+| sqlite-vec  | `vec0` virtual table    | built into `vec0`                                      | needs the `sqlite-vec` loadable extension |
+
+Without an ANN index `nearest()` is an exact full scan. `Distance` is L2/Cosine/Inner­Product;
+for any other metric use `sql_expr`/`raw`. (Verified e2e on Turso; pgvector/sqlite-vec
+need their extensions, which aren't bundled.)
+
+## Full-text search (Postgres / SQLite FTS5 / Turso FTS5)
+
+`matches(col, query)` renders `to_tsvector @@ plainto_tsquery` on Postgres and FTS5
+`MATCH` on SQLite/Turso (create the table `USING fts5(...)` there). The query text is
+always a bound parameter.
+
+```rust
+let hits = db.find::<Article>().filter(matches(Article::body, "systems")).all().await?;
+```
+
+Relevance ranking (`ts_rank` / `bm25`) is not yet a typed projection — order by it via
+`raw_pred`/`db.raw` for now. `MySQL` full-text (`MATCH … AGAINST`) is not supported.
 
 ## Custom backends
 

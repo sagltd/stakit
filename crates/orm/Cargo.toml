@@ -21,6 +21,7 @@ turso = ["dep:libsql"]
 [dependencies]
 stakit-orm-derive.workspace = true
 sqlx.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 libsql = { workspace = true, optional = true }
 smallvec.workspace = true

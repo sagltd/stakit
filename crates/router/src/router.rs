@@ -32,7 +32,12 @@ pub struct Router<G, R> {
     pub(crate) streams: HashMap<&'static str, Arc<dyn ErasedStreamAction<G, R>>>,
     pub(crate) client_actions: Vec<ClientMeta>,
     pub(crate) client_call_timeout: Duration,
+    pub(crate) on_error: ErrorHook,
 }
+
+/// A hook that transforms every outgoing error before it reaches the client —
+/// e.g. redact details in production, or surface them in development.
+pub(crate) type ErrorHook = Arc<dyn Fn(Error) -> Error + Send + Sync>;
 
 impl<G, R> Router<G, R>
 where
@@ -48,6 +53,7 @@ where
             streams: HashMap::new(),
             client_actions: Vec::new(),
             client_call_timeout: DEFAULT_CLIENT_CALL_TIMEOUT,
+            on_error: Arc::new(|error| error),
         }
     }
 
@@ -100,9 +106,10 @@ where
     }
 
     /// Routes one call to its action (404 if unknown), runs it, wraps the result.
+    /// Every error passes through the router's `on_error` hook first.
     async fn dispatch_one(&self, req: R, action: &str, params: Value) -> Reply {
         let Some(handler) = self.actions.get(action) else {
-            return Reply::error(Error::not_found(action));
+            return Reply::error((self.on_error)(Error::not_found(action)));
         };
         let cx = Cx {
             app: Arc::clone(&self.app),
@@ -111,7 +118,7 @@ where
         };
         match handler.dispatch(&cx, params).await {
             Ok(data) => Reply::ok(data),
-            Err(error) => Reply::error(error),
+            Err(error) => Reply::error((self.on_error)(error)),
         }
     }
 
@@ -125,6 +132,7 @@ where
         R: Clone,
     {
         let app = Arc::clone(&self.app);
+        let on_error = Arc::clone(&self.on_error);
         let entries = match payload {
             Value::Array(items) => parse_array(items),
             Value::Object(map) => map.into_iter().collect(),
@@ -150,6 +158,7 @@ where
                     handler,
                     Arc::clone(&app),
                     req.clone(),
+                    Arc::clone(&on_error),
                 )));
             }
             let mut merged = futures::stream::select_all(subs);
@@ -188,6 +197,7 @@ fn action_stream<G, R>(
     handler: Option<Arc<dyn ErasedStreamAction<G, R>>>,
     app: Arc<G>,
     req: R,
+    on_error: ErrorHook,
 ) -> impl Stream<Item = Frame>
 where
     G: Send + Sync + 'static,
@@ -195,7 +205,7 @@ where
 {
     async_stream::stream! {
         let Some(handler) = handler else {
-            yield Frame::error(index, action.clone(), Error::not_found(&action));
+            yield Frame::error(index, action.clone(), (on_error)(Error::not_found(&action)));
             return;
         };
         let cx = Cx {
@@ -210,7 +220,7 @@ where
             match item {
                 Ok(value) => yield Frame::next(index, action.clone(), value),
                 Err(error) => {
-                    yield Frame::error(index, action, error);
+                    yield Frame::error(index, action, (on_error)(error));
                     return;
                 }
             }
@@ -250,6 +260,7 @@ pub struct Builder<G, R> {
     streams: HashMap<&'static str, Arc<dyn ErasedStreamAction<G, R>>>,
     client_actions: Vec<ClientMeta>,
     client_call_timeout: Duration,
+    on_error: ErrorHook,
 }
 
 impl<G, R> Builder<G, R>
@@ -288,6 +299,21 @@ where
         self
     }
 
+    /// Installs an error hook: every outgoing error passes through `f` before
+    /// reaching the client (`prev => new`; default is identity). Use it to redact
+    /// sensitive detail in production while keeping rich errors in development —
+    /// e.g. `.on_error(|e| if prod { Error::new(e.code, "error") } else { e })`.
+    /// Runs at every error boundary: unary replies, stream error frames, and
+    /// websocket `call` results.
+    #[must_use]
+    pub fn on_error<F>(mut self, f: F) -> Self
+    where
+        F: Fn(Error) -> Error + Send + Sync + 'static,
+    {
+        self.on_error = Arc::new(f);
+        self
+    }
+
     /// Declares a client action (server→client). Used by `cx.client_call::<C>()`
     /// and included in the generated TypeScript.
     #[must_use]
@@ -318,6 +344,7 @@ where
             streams: self.streams,
             client_actions: self.client_actions,
             client_call_timeout: self.client_call_timeout,
+            on_error: self.on_error,
         }
     }
 }

@@ -458,5 +458,37 @@ async fn postgres_enums_temporal_json_native() {
         .unwrap();
     assert!(orphan.is_none(), "cascade should delete the author's posts");
 
+    // Full-text search (core Postgres, no extension): to_tsvector @@ plainto_tsquery.
+    db.raw("create table pg_articles (id bigint primary key, body text not null)")
+        .exec()
+        .await
+        .expect("create pg_articles");
+    db.raw("insert into pg_articles (id, body) values (1, 'fast systems programming language')")
+        .exec()
+        .await
+        .unwrap();
+    db.raw("insert into pg_articles (id, body) values (2, 'a recipe for tomato soup')")
+        .exec()
+        .await
+        .unwrap();
+    let hits = db
+        .select(PgArticle::all())
+        .from::<PgArticle>()
+        .filter(matches(PgArticle::body, "systems"))
+        .all()
+        .await
+        .expect("fts");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 1);
+
     postgres.stop().await.ok();
+}
+
+#[derive(Table, Debug)]
+#[table(name = "pg_articles")]
+#[allow(dead_code)]
+struct PgArticle {
+    #[column(pk)]
+    id: i64,
+    body: String,
 }

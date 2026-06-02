@@ -20,6 +20,17 @@ impl Dialect for TursoDialect {
     fn supports_any_array(&self) -> bool {
         false
     }
+    fn vector_bind(&self) -> (&'static str, &'static str) {
+        ("vector32(", ")")
+    }
+    fn vector_distance(&self, metric: crate::vector::Distance) -> crate::vector::DistanceSql {
+        use crate::vector::{Distance, DistanceSql::Function};
+        match metric {
+            Distance::L2 => Function("vector_distance_l2"),
+            Distance::Cosine => Function("vector_distance_cos"),
+            Distance::InnerProduct => Function("vector_distance_dot"),
+        }
+    }
 }
 
 #[cfg(test)]

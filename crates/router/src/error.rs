@@ -134,6 +134,15 @@ where
     }
 }
 
+/// Extracts a readable message from a caught panic payload.
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&'static str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic".to_owned())
+}
+
 /// Builds an [`Error`]: `err!(code, msg)` or `err!(msg)` (defaults to 500). The
 /// message is anything `Display`.
 #[macro_export]

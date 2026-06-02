@@ -45,6 +45,7 @@ impl Row for MySqlRow {
             ValueKind::Date => read!(self, index, kind, NaiveDate, Value::Date),
             ValueKind::NaiveTime => read!(self, index, kind, NaiveTime, Value::NaiveTime),
             ValueKind::Json => read!(self, index, kind, serde_json::Value, Value::Json),
+            ValueKind::Vector => Err(Error::Decode("MySQL has no vector type".into())),
         }
     }
 
@@ -206,6 +207,9 @@ fn bind_scalar(args: &mut MySqlArguments, value: Value) -> Result<()> {
         Value::Date(x) => args.add(x),
         Value::NaiveTime(x) => args.add(x),
         Value::Json(x) => args.add(x),
+        Value::Vector(..) => {
+            return Err(Error::Encode("MySQL has no vector type".into()));
+        }
         Value::Array(..) => {
             return Err(Error::Encode("MySQL does not support array binds".into()));
         }
@@ -229,6 +233,7 @@ fn bind_null(args: &mut MySqlArguments, kind: ValueKind) -> Result<()> {
         ValueKind::Date => args.add(None::<NaiveDate>),
         ValueKind::NaiveTime => args.add(None::<NaiveTime>),
         ValueKind::Json => args.add(None::<serde_json::Value>),
+        ValueKind::Vector => return Err(Error::Encode("MySQL has no vector type".into())),
     };
     result.map_err(Error::Encode)
 }

@@ -42,6 +42,7 @@ impl Row for PgRow {
             ValueKind::Date => read!(self, index, kind, NaiveDate, Value::Date),
             ValueKind::NaiveTime => read!(self, index, kind, NaiveTime, Value::NaiveTime),
             ValueKind::Json => read!(self, index, kind, serde_json::Value, Value::Json),
+            ValueKind::Vector => read_vector(self, index),
         }
     }
 
@@ -204,6 +205,8 @@ fn bind_scalar(args: &mut PgArguments, value: Value) -> Result<()> {
         Value::Date(x) => args.add(x),
         Value::NaiveTime(x) => args.add(x),
         Value::Json(x) => args.add(x),
+        // Bound as the text literal `[..]`; the SQL writer adds the `::vector` cast.
+        Value::Vector(x) => args.add(crate::vector::to_literal(&x)),
         Value::Array(kind, values) => return bind_array(args, kind, values),
     };
     result.map_err(Error::Encode)
@@ -217,7 +220,8 @@ fn bind_null(args: &mut PgArguments, kind: ValueKind) -> Result<()> {
         ValueKind::F32 => args.add(None::<f32>),
         ValueKind::F64 => args.add(None::<f64>),
         ValueKind::Bool => args.add(None::<bool>),
-        ValueKind::Text => args.add(None::<String>),
+        // Vector binds as its `[..]` text literal, so its null is a text null too.
+        ValueKind::Text | ValueKind::Vector => args.add(None::<String>),
         ValueKind::Bytes => args.add(None::<Vec<u8>>),
         ValueKind::Uuid => args.add(None::<Uuid>),
         ValueKind::Timestamptz => args.add(None::<DateTime<Utc>>),
@@ -227,6 +231,16 @@ fn bind_null(args: &mut PgArguments, kind: ValueKind) -> Result<()> {
         ValueKind::Json => args.add(None::<serde_json::Value>),
     };
     result.map_err(Error::Encode)
+}
+
+/// Read a pgvector column (text form `[..]`) into a [`Value::Vector`]. The query
+/// must select it as text (e.g. `embedding::text`) for this to decode.
+fn read_vector(row: &PgRow, index: usize) -> Result<Value> {
+    let cell: Option<String> = row.try_get(index).map_err(into_decode)?;
+    match cell {
+        Some(text) => Ok(Value::Vector(crate::vector::parse_literal(&text)?)),
+        None => Ok(Value::Null(ValueKind::Vector)),
+    }
 }
 
 /// Collect homogeneous scalar `values` of `kind` into a typed `Vec` and bind it
@@ -260,6 +274,9 @@ fn bind_array(args: &mut PgArguments, kind: ValueKind, values: Vec<Value>) -> Re
         ValueKind::NaiveTime => collect_add!(NaiveTime),
         ValueKind::Json => {
             return Err(Error::Encode("json array binds are not supported".into()));
+        }
+        ValueKind::Vector => {
+            return Err(Error::Encode("vector array binds are not supported".into()));
         }
     };
     result.map_err(Error::Encode)

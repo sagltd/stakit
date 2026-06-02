@@ -229,6 +229,8 @@ pub trait Provider: Clone + Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
+    // The mock provider satisfies the async trait but does no async work.
+    #![allow(clippy::unused_async_trait_impl)]
     use super::*;
 
     #[test]

@@ -6,6 +6,8 @@
 //! outside developer can ship their own provider and tools as a downstream
 //! crate without forking or patching `stakit-ai-sdk`.
 #![allow(dead_code)]
+// The fake provider satisfies the async `Provider` trait but does no async work.
+#![allow(clippy::unused_async_trait_impl)]
 
 use futures::StreamExt;
 use stakit_ai_sdk::{

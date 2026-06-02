@@ -3289,6 +3289,7 @@ dependencies = [
  "getrandom 0.4.2",
  "libsql",
  "postgresql_embedded",
+ "serde",
  "serde_json",
  "smallvec",
  "sqlx 0.9.0",
