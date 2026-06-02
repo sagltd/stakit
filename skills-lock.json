@@ -1,6 +1,60 @@
 {
   "version": 1,
   "skills": {
+    "allocator-migration": {
+      "source": "tursodatabase/turso",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/allocator-migration/SKILL.md",
+      "computedHash": "ad15d60e82a7b0636e57d441eddddb65de08b3fb3ff8b87099f19367082f4525"
+    },
+    "async-io-model": {
+      "source": "tursodatabase/turso",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/async-io-model/SKILL.md",
+      "computedHash": "84c34110a84c7380a572567a931fe62c06ed6aa1c4e9ddc1347f2c1c03ec301a"
+    },
+    "cdc": {
+      "source": "tursodatabase/turso",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/cdc/SKILL.md",
+      "computedHash": "7b3db5a77c31ff312f4ed062c76d14beba3a56206477c4fa86f2449fea7e6d02"
+    },
+    "code-quality": {
+      "source": "tursodatabase/turso",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/code-quality/SKILL.md",
+      "computedHash": "4bd34c624734d588f607750ab1c5aa2de6f8255bb1dd572529d5a1906f6ea155"
+    },
+    "differential-fuzzer": {
+      "source": "tursodatabase/turso",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/differential-fuzzer/SKILL.md",
+      "computedHash": "0c5cb20a81c2daea91110614eff53d38e8643f5e2a3150e26ff1c6b9fac73cd7"
+    },
+    "index-knowledge": {
+      "source": "tursodatabase/turso",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/index-knowledge/SKILL.md",
+      "computedHash": "0882b222a89c593250c5f494a73f3c35147451f1447846cf25bc181d748094f1"
+    },
+    "memory-benchmark": {
+      "source": "tursodatabase/turso",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/memory-benchmark/SKILL.md",
+      "computedHash": "312fc6959fa69b7bc23a8d6872b726d76db836e4ef6fa6665f75f5a8dbbf2067"
+    },
+    "postgresql-optimization": {
+      "source": "github/awesome-copilot",
+      "sourceType": "github",
+      "skillPath": "skills/postgresql-optimization/SKILL.md",
+      "computedHash": "8022448de70ba9a485e3b5bce34c5bbc644f93eb39b68431c9f7dabcf03aeb09"
+    },
+    "postgresql-table-design": {
+      "source": "wshobson/agents",
+      "sourceType": "github",
+      "skillPath": "plugins/database-design/skills/postgresql/SKILL.md",
+      "computedHash": "dcace78e5cef7d8dce8ffef7ebee146e6c83a438aa4cf80bf502730e870c02d4"
+    },
     "rust-async-patterns": {
       "source": "wshobson/agents",
       "sourceType": "github",
@@ -12,6 +66,36 @@
       "sourceType": "github",
       "skillPath": "skills/rust-best-practices/SKILL.md",
       "computedHash": "fd336f2f772eb46ddf8658de5f9dd8faa1f35615b316665307fc82eeb4b2e658"
+    },
+    "sql-code-review": {
+      "source": "github/awesome-copilot",
+      "sourceType": "github",
+      "skillPath": "skills/sql-code-review/SKILL.md",
+      "computedHash": "ae157a0eeaa4c4712e850e85d71d25f2a53168f94011f3a08b888424f41220ee"
+    },
+    "sql-optimization": {
+      "source": "github/awesome-copilot",
+      "sourceType": "github",
+      "skillPath": "skills/sql-optimization/SKILL.md",
+      "computedHash": "47c930907f25d67454ac8c2d155785eae3dce72242960d0c0e9ebf2ced9cd231"
+    },
+    "storage-format": {
+      "source": "tursodatabase/turso",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/storage-format/SKILL.md",
+      "computedHash": "8488348d21eb6cac971bf3df4732fcad17d7a99d3fe1895933d13c2359f56255"
+    },
+    "testing": {
+      "source": "tursodatabase/turso",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/testing/SKILL.md",
+      "computedHash": "8a56f437a837f6900f931ac5de481fc3d99b40b88df4cc787c63fcb9d1a83758"
+    },
+    "transaction-correctness": {
+      "source": "tursodatabase/turso",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/transaction-correctness/SKILL.md",
+      "computedHash": "83f138a0c62057efcf9cf3a888006a6d62540a56065c53f599d10c6e98e9980f"
     }
   }
 }
