@@ -92,6 +92,9 @@ pub struct Post {
     #[column(references = User::id, on_delete = "cascade")]
     pub author_id: Uuid,
     pub title: String,
+    pub views: i32,
+    #[column(name = "created_at", default = "now()")]
+    pub created_at: DateTime<Utc>,
     #[column(nullable)]
     pub body: Option<String>,
 
@@ -138,12 +141,19 @@ types).
 | `on_delete = "cascade"` is a valid keyword | compile (macro) | match against allowed set (`cascade`/`restrict`/`set null`/`no action`) |
 | FK target is actually pk/unique; DB has the constraint | migration gen / apply | snapshot diff / runtime |
 
-`#[column(default = "...")]` and `#[table(name = "...")]`/`#[column(name = "...")]`
-take **string literals only** — they are trusted developer input emitted verbatim
-into DDL/identifiers, never accept a runtime `String`. Defaults are emitted into
-`create table ... default <literal>` as-is (see §5 + §17 for the safety
-boundary). Semantic/DB-truth checks that a proc-macro cannot see from another
-struct's site are deferred to migration generation, not the build.
+**The FK type-equality witness is compile-time only.** It fires only when the
+schema is compiled as part of the normal `cargo build` — so the schema file MUST
+be a real build target (not behind a `cfg`, not generator-only). The syn migration
+generator (§5) has no type info and **cannot** evaluate `<User as Table>::PkTy`; at
+gen time it does a weaker **spelling-level** FK check (FK column canonical spelling
+== referenced PK column spelling) as defense-in-depth, and hard-errors on
+mismatch. Semantic type-equality is rustc's job; gen-time catches spelling drift.
+
+`#[column(default = "...")]`, `#[column(sql_type = "...")]`, and
+`#[table/column(name = "...")]` take **string literals only** — trusted developer
+input emitted verbatim into DDL/identifiers, never a runtime `String` (see §5 +
+§17 for the safety boundary). Other semantic/DB-truth checks a proc-macro cannot
+see from another struct's site are deferred to migration generation.
 
 ## 5. Migrations — generated, sqlx-applied
 
@@ -180,6 +190,8 @@ resolution. Rules:
 - Any unknown spelling is a **hard error**, never a silent guess. The escape
   hatch is `#[column(sql_type = "...")]` to state the SQL type explicitly (and is
   required for custom/feature-gated types like `Decimal`).
+- Identifiers > 63 UTF-8 bytes are a **hard error** (Postgres truncates at
+  NAMEDATALEN=63, which would silently collide names; §17).
 
 Rationale: no compile, no DB, no app boot; reuses `syn` (already a workspace
 dep). Constraint: schema must live in known parseable file(s) in the configured
@@ -291,10 +303,24 @@ let some = db.select(User::all()).from::<User>()
 
 `eq` (and friends) is generic via an `IntoExpr<Ty>` bound: `fn eq<L: ColExpr, R:
 IntoExpr<L::Ty>>(l: L, r: R)`. This makes `eq(Post::id, Comment::post_id)`
-(col=col, both `Ty = Uuid`) and `eq(Post::id, pid)` (col=value, `pid: Uuid`) both
-type-check, while `eq(User::id, 5)` or `eq(User::id, "str")` **fail to compile**
-(`i32`/`&str` do not satisfy `IntoExpr<Uuid>`). Values are bound as positional
-`$N` params (injection-safe).
+(col=col) and `eq(Post::id, pid)` (col=value) both type-check, while
+`eq(User::id, 5)` or `eq(User::id, "str")` **fail to compile**.
+
+**The `IntoExpr` impl set is the type-safety boundary and is hand-curated** (no
+reflexive `impl<Ty> IntoExpr<Ty> for Ty` — that blanket is a coherence hazard
+against the `Col` impl). Specifically:
+
+- `impl<T, Ty> IntoExpr<Ty> for Col<T, Ty>` — column on the RHS (joins).
+- One value impl per supported scalar via a tiny wrapper to dodge coherence:
+  values are accepted through `impl<Ty: Encode + Type<Postgres>> IntoExpr<Ty> for Val<Ty>`
+  plus targeted ergonomic impls (`&str: IntoExpr<String>`, `&str:
+  IntoExpr<Option<String>>`, `&[u8]: IntoExpr<Vec<u8>>`, `T: IntoExpr<Option<T>>`).
+- Deliberately **absent**: numeric widening (`i32 → i64`), `&str → Uuid`, etc., so
+  type mismatches stay compile errors.
+
+Values are bound as positional `$N` params (injection-safe). `LIMIT`/`OFFSET` are
+also **bound params** (`limit $n offset $m`), never literals — literal pagination
+would mint a new prepared statement per page (§16).
 
 **IN lists use `= ANY($1)`, never `in ($1,$2,…)`.** A literal IN list makes the
 SQL text vary with the element count → a new prepared statement per length →
@@ -328,7 +354,14 @@ mutation builders have no `.one()/.all()`. `count`/`exists` are **projections**
 |---|---|---|
 | `.exec()` | `u64` | rows affected |
 | `.returning(proj).all()` | `Vec<Output>` | `RETURNING` many |
-| `.returning(proj).one()` | `Output` | `RETURNING` from a known-single row (non-`Option`; row just written) |
+| `Insert::returning(proj).one()` | `Output` | non-`Option` — a plain single-row insert always produces exactly one row |
+| `Update`/`Delete`/`Insert…on_conflict(do_nothing)` `.returning(proj).one()` | `Option<Output>` | may match/produce **zero** rows |
+| `.returning(proj).one_or_err()` / `.exact_one()` | `Output` | erroring forms (`NotFound` / `TooManyRows`) |
+
+Non-`Option` `.one()` is restricted to plain `Insert` (the row is definitely
+written). For `Update`/`Delete`/`do_nothing` the `WHERE`/conflict may match zero
+rows, so their `.one()` is `Option<Output>` — use `.one_or_err()`/`.exact_one()`
+when a row is required.
 
 ## 7. Select projections — the `Projection` trait
 
@@ -339,18 +372,22 @@ through the terminal (`.all()` → `Vec<Output>`, etc.).
 ```rust
 pub trait Projection {
     type Output;
-    /// SQL select-list fragments, in order.
-    fn columns(&self) -> SmallVec<[SqlExpr; 8]>;
-    /// Decode one row. Column ordinals are 0..N in `columns()` order, so this
-    /// reads positionally (`row.try_get(0)`, …) — ordinals are fixed at build
-    /// time, NOT looked up by name per row.
-    fn decode(row: &PgRow) -> Result<Self::Output>;
+    /// Append this projection's SQL select-list fragments into a caller-owned
+    /// buffer (no large by-value return; see §15 size budget).
+    fn write_columns(&self, out: &mut SmallVec<[SqlExpr; 8]>);
+    /// Decode one row. `&self` is required: instance-carrying projections (the
+    /// `row!` form) hold per-field state. Reads are positional by compile-time
+    /// literal ordinal (`row.try_get(0usize)`), not a per-row name lookup —
+    /// `PgRow::try_get(usize)` is O(1).
+    fn decode(&self, row: &PgRow) -> Result<Self::Output>;
 }
 ```
 
-The trait carries a **`decode`** method (the earlier draft omitted it — without it
-the terminal cannot turn a `PgRow` into `Output`). Three decode strategies are
-provided by **distinct, non-overlapping wrapper types** (no coherence conflict):
+The trait carries **`decode(&self, …)`** (an earlier draft made it a no-`self`
+associated fn — wrong: the `row!` form holds per-field state and the terminal
+already owns the projection instance, so `proj.decode(&row)` is what runs). The
+static wrappers simply ignore `&self`. Decode strategies are provided by
+**distinct, non-overlapping wrapper types** (no coherence conflict):
 
 | `select(...)` argument | wrapper type | `Output` | decode |
 |---|---|---|---|
@@ -420,30 +457,41 @@ rows[0].post_count;   // i64, named, no predeclare
 plain column's type (e.g. that `User::email` is `String`). The earlier "generic
 struct + `r.get(0)`" sketch does **not** work: `r.get(N)` is generic in its target
 type and a bare generic struct field provides nothing to anchor inference →
-"type annotations needed". The fix is to drive each field's type from the
-**column token's own associated type** (`Col<T, Ty>::Ty`), not from `r.get`:
+"type annotations needed". The fix drives each field's type from the **column
+token's own associated `Expr::Out`** (no extractor closure — closures carry no
+info and only host a bound). The macro emits a **complete inline `Projection`
+impl** for an anonymous local struct (not a shared library `build` — there is no
+fixed arity cap because it is generated per call):
 
 ```rust
 {
-    // Each field's type comes from its expr's associated Output type, which the
-    // EXPR carries (the macro doesn't need to spell it). sql! fields carry an
-    // explicit type (1st arg). Result is a local struct, fully concrete.
-    struct Row<E, U, P, Y> { email: E, user_id: U, post_count: P, year: Y }
-    RowProjection::build(
-        // (sql fragment, typed extractor) per field; extractor type fixes the generic
-        field(User::email,        |r, i| r.try_get(i)),   // E = <Col as Expr>::Out = String
-        field(User::id,           |r, i| r.try_get(i)),   // U = Uuid
-        field(count(Post::id),    |r, i| r.try_get(i)),   // P = i64
-        field_sql::<i32>("extract(year from {})", Post::created_at),  // Y = i32 (explicit)
-    )
+    struct Row { email: String, user_id: Uuid, post_count: i64, year: i32 }
+    //          ^ field types are written by the macro from each expr/sql! type:
+    //            plain cols -> <Col<_,Ty> as Expr>::Out via `field(expr): Field<X>`
+    //            where Field<X> requires X::Out: Decode<Postgres> + Type<Postgres>;
+    //            sql! fields -> the explicit 1st-arg type.
+    struct __Proj { fields: (Field<Col<User,String>>, Field<Col<User,Uuid>>,
+                             Field<Count>, FieldSql<i32>) }
+    impl Projection for __Proj {
+        type Output = Row;
+        fn write_columns(&self, out: &mut SmallVec<[SqlExpr; 8]>) { /* push each */ }
+        fn decode(&self, r: &PgRow) -> Result<Row> {
+            Ok(Row { email: r.try_get(0)?, user_id: r.try_get(1)?,
+                     post_count: r.try_get(2)?, year: r.try_get(3)? })
+        }
+    }
+    __Proj { fields: (field(User::email), field(User::id),
+                      field(count(Post::id)), field_sql::<i32>("extract(year from {})", Post::created_at)) }
 }
-// Output = Row<String, Uuid, i64, i32>
+// Output = Row { email: String, user_id: Uuid, post_count: i64, year: i32 }
 ```
 
-`field(expr, extractor)` ties the extractor's return type to `<expr as Expr>::Out`
-via a bound, so the local struct's generics resolve from the **expression types**,
-which are known to the type system even though the macro can't write them. `sql!`
-fields supply the type explicitly. Ordinals are assigned in declaration order.
+`field<X: Expr>(e: X) -> Field<X>` where `X::Out: Decode + Type<Postgres>`: the
+field's decoded type **is** `X::Out`, named in `Field`'s impl, so there is no
+"annotations needed" hole and no closure. `decode` reads each field by its
+compile-time literal ordinal; the macro maps **struct-field → SELECT-list ordinal**
+at expansion time, so a field declared out of SELECT order still gets the correct
+index. `sql!` fields supply the type explicitly via `field_sql::<T>`.
 
 **`sql!` rules** (raw SQL fragment, typed):
 
@@ -473,46 +521,61 @@ Mirrors Drizzle's relational builder. Method names match Drizzle: `find_many` /
 ```rust
 // db.query.users.findMany({ with: { posts: true } })
 let users = db.query::<User>().with(User::posts).find_many().await?;   // Vec<UserWith>
-for u in &users { for p in &u.posts { /* loaded */ } }
+for u in &users {
+    for p in u.posts.get()? { /* `get()` errs if this relation was NOT requested */ }
+}
 
-// nested with + filter + order + limit
+// nested with + filter + order + limit   (v3 target API — see restrictions)
 let posts = db.query::<Post>()
     .with(Post::comments, |c| c.with(Comment::author))
-    .filter(eq(Post::id, 10))
+    .filter(eq(Post::id, pid))             // pid: Uuid (type-matched, see §6)
     .order_by(asc(Post::id))
     .limit(5)
     .find_many().await?;
 
 // findFirst
-let one = db.query::<User>().filter(eq(User::id, 1)).find_first().await?;  // Option<UserWith>
+let one = db.query::<User>().filter(eq(User::id, uid)).find_first().await?;  // Option<UserWith>
 
-// columns selection (Drizzle `columns: { id: true }`)
+// columns selection (Drizzle `columns: { id: true }`) — v3 (cannot combine with .with in v2)
 let slim = db.query::<Post>().columns((Post::id, Post::title)).find_many().await?;
 ```
 
 **Loading strategy:** batched, not N+1, not one giant join. One query per relation
-level using **`... where fk = ANY($1)`** (the array-bind rule from §6 — stable
-statement, no 65535 cap on parent-key count), stitched in Rust via `hashbrown`
-map (Drizzle's default behavior). **Latency = sum of round-trips** (one per
-relation level), issued sequentially; not pipelined in v2.
+using **`... where fk = ANY($1)`** (array-bind rule from §6 — stable statement, no
+65535 cap on parent-key count), stitched in Rust. **Latency = one round-trip per
+relation**, summed across levels; sibling relations at the same level are
+**serialized in v2** (so it's per-relation, not per-level). Stitch is O(N+M): one
+`hashbrown` map **pre-sized to parent count** (`with_capacity(N)`, no rehash
+thrash), O(N) child `Vec`s, **no sort, no dedup** (child order preserved from the
+child query's `ORDER BY`).
 
 **The hard part (honest):** API 1 maps cleanly to Rust. API 2's typed result needs
 codegen — Drizzle leans on TS structural typing, Rust has none. Result-type
 strategy for **v2**:
 
 - The `#[has_many]`/`#[belongs_to]` derive generates **one fixed `UserWith` type
-  per table** with a field for **every** declared relation (`Vec<Post>` for
-  has-many, `Option<Author>` for belongs-to), populated only for relations named
-  in `.with(...)` and empty otherwise. This avoids the combinatorial explosion of
-  one type per `.with()` combination.
+  per table** with a field per declared relation, each wrapped in a **loaded-state
+  marker** to avoid the "loaded-but-empty vs not-requested" ambiguity:
+  ```rust
+  pub enum Loaded<T> { NotLoaded, Loaded(T) }
+  // generated:
+  struct UserWith { /* User's columns */, posts: Loaded<Vec<Post>>, /* … */ }
+  impl Loaded<T> { fn get(&self) -> Result<&T> /* err if NotLoaded */ }
+  ```
+  A relation not named in `.with(...)` is `NotLoaded` (accessing it errors, not
+  silently empty); a requested has-many with zero children is `Loaded(vec![])`;
+  a requested belongs-to with a NULL/absent FK is `Loaded(None)`. This single
+  fixed type avoids the combinatorial explosion of one type per `.with()` combo.
 - **v2 restrictions (stated, not hidden):** `.with()` is **one level deep**;
   nested `.with(rel, |c| c.with(...))` and combining `.columns(...)` *with*
   `.with(...)` are **v3**. The nested/`columns`+`with` examples above are the v3
   target API, shown for direction.
 
-Phasing: **v2** = relational, one fixed `UserWith`, one level of `.with()`,
-`= ANY($1)` batched load. **v3** = nested `.with()`, `columns`+`with` combined,
-CTEs, subqueries, broader aggregates, optional concurrent per-subtree loading.
+Phasing: **v2** = relational, one fixed `UserWith` with `Loaded<_>` fields, one
+level of `.with()`, `= ANY($1)` batched load. **v3** = nested `.with()`,
+`columns`+`with` combined, CTEs, subqueries, broader aggregates, optional
+concurrent sibling loading (one pooled connection per concurrent sibling —
+interacts with `.stream()` pool pressure, §16).
 
 ## 9. Raw escape hatch
 
@@ -560,34 +623,41 @@ let n = db.copy_into::<User>(users).await?;
 | Rows | API | Mechanism |
 |---|---|---|
 | 1 | `insert` | single `INSERT` |
-| 2 – ~tens of thousands | `insert_many` | multi-row `INSERT ... VALUES (...),…`, one round-trip **per chunk** |
-| huge (10k+) | `copy_into` | `COPY ... FROM STDIN` via sqlx `PgCopyIn` — single stream, no per-row parse/plan/bind |
+| 2 – ~tens of thousands | `insert_many` | **`INSERT … SELECT * FROM UNNEST($1::T[], $2::U[], …)`** — one array param **per column** |
+| huge (10k+) | `copy_into` | `COPY … FROM STDIN` via sqlx `PgCopyIn` — single stream, no per-row parse/plan/bind |
 
-**Param-limit + round-trips:** Postgres caps bind params at 65535 per statement.
-`insert_many` computes `rows_per_stmt = (65535 − reserved) / column_count`, where
-`reserved` accounts for non-VALUES binds (e.g. `on_conflict … do_update set x =
-$n`). Round-trips = `ceil(rows / rows_per_stmt)` — **not** "one round-trip" for
-large inputs (a 1M-row, 10-col insert ≈ 153 serialized statements). Above ~tens
-of thousands, use `copy_into`.
+**`insert_many` uses UNNEST, not multi-row VALUES.** `INSERT INTO users (a,b,c)
+SELECT * FROM UNNEST($1::int[], $2::text[], $3::uuid[])` binds **one array per
+column** (column-count params total, not rows×cols). Consequences:
 
-**Statement-cache cardinality:** a varying final-chunk size would mint a new
-prepared statement per distinct row count. `insert_many` **buckets** chunk sizes
-to powers of two (padding the last chunk's statement shape, not the data) so the
-number of distinct insert statements stays small and the cache doesn't thrash.
+- **One stable prepared statement for any row count** — no statement-cache thrash,
+  no chunk-size bucketing. (Multi-row VALUES was rejected: its text varies with
+  row count → a new statement per length, and "padding the statement shape but not
+  the data" is impossible — you can't bind fewer rows than the VALUES tuples
+  without inserting garbage.)
+- **65535 param cap is unreachable** (you'd need 65535 *columns*). The old
+  `rows_per_stmt` chunk math is gone; a normal `insert_many` is **one round-trip**.
+- Array binds are binary-encoded (extended binary protocol, §16).
+- Caveats: `on_conflict … do_update` works (EXCLUDED mechanics differ slightly from
+  VALUES); columns relying on DB `DEFAULT` per-row are omitted from the INSERT list
+  (UNNEST supplies a value for every listed column). For very large arrays the
+  planner can misestimate cardinality — that is exactly the point where the docs
+  steer to `copy_into`.
 
-**Transaction tradeoff:** by default all chunks run in one transaction
-(all-or-nothing, no partial writes). For very large loads this is one long
-transaction holding locks and growing WAL — so `insert_many` accepts a
-`.commit_per_chunk()` opt-out for bulk loads that don't need global atomicity, and
-the docs steer large loads to `copy_into`.
+**Transaction tradeoff:** the single UNNEST insert is naturally atomic. The only
+reason to split is array size; for that, `insert_many` accepts `.commit_per_chunk()`
+(splits into N UNNEST inserts, each committed). On a mid-load failure it returns
+the **count of rows successfully committed** so the caller can resume/reconcile;
+an idempotent key (`on_conflict do_nothing`) is recommended for resumable loads.
 
 **`copy_into` is single-stream** (one logical round-trip). On any error mid-stream
 it calls `PgCopyIn::abort` before returning, so the connection is never returned
-to the pool stuck in COPY protocol state. **Binary-format caveat:** `COPY … (FORMAT
-BINARY)` requires a binary encoder for every column type; types in §16 without a
-binary COPY encoder fall back to text COPY (still fast, less than binary). The
-"≥5× `insert_many`" figure (§15) is a *measured* result, not a guaranteed target —
-the multiple depends on row width and network.
+to the pool stuck in COPY protocol state. **Binary-format is a whole-stream,
+all-columns decision** made up front: `COPY … (FORMAT BINARY)` needs a binary
+encoder for *every* column, so if **any** column type lacks one the **entire**
+COPY uses text format (chosen at build time from the column set, never discovered
+mid-stream). The "≥5× `insert_many`" figure (§15) is a *measured* result, not a
+guaranteed target — it depends on row width and network.
 
 Recommended defaults: `insert_many` for normal app writes; `copy_into` for
 seed/import/ETL.
@@ -595,8 +665,8 @@ seed/import/ETL.
 ## 11. Transactions
 
 Real pg transactions via sqlx. The **closure form is the supported path** and
-performs an explicit, awaited `ROLLBACK` in its error/cancel arm. The manual form
-relies on sqlx's drop behavior, which is **best-effort, not a guarantee** (see
+performs an explicit, awaited `ROLLBACK` on the **`Err`-return** path. The manual
+form relies on sqlx's drop behavior, which is **best-effort, not a guarantee** (see
 caveat below).
 
 **Executor abstraction:** we define our **own** `Executor` trait (not sqlx's
@@ -605,8 +675,18 @@ directly), with `async fn run(&mut self, …)`, implemented for `Db` (pool) and
 for `&mut Transaction` each call must reborrow (`&mut *tx`). Our trait takes
 `&mut self` and reborrows internally, so the same `select/insert/update/...` API
 works on both a pool and a transaction, and sequential `tx.insert(..); tx.insert(..)`
-calls compile. The closure-transaction signature uses the standard HRTB form
-(`for<'c> FnOnce(&'c mut Tx) -> impl Future + 'c`).
+calls compile.
+
+**Transaction-closure signature.** The bare `for<'c> FnOnce(&'c mut Tx) -> impl
+Future + 'c` form is *not* literally expressible (can't put `impl Future` in an
+HRTB return), and the naive `F: FnOnce(&mut Tx) -> Fut, Fut: Future` form can't
+tie `Fut`'s borrow to the `&mut Tx` (the "closure returning a future that borrows
+its argument" hole). v1 uses stable **`AsyncFnOnce`** (edition 2024 / Rust ≥ 1.85,
+which the workspace targets):
+`fn transaction<T>(&self, f: impl for<'c> AsyncFnOnce(&'c mut Tx) -> Result<T> + Send) -> impl Future<Output = Result<T>> + Send`.
+Fallback if `AsyncFnOnce` HRTB ergonomics bite: the boxed form
+`for<'c> FnOnce(&'c mut Tx) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>`
+(one alloc per transaction, definitely compiles). Spike this early (§19).
 
 ### Closure style (recommended — cannot forget rollback)
 
@@ -643,8 +723,12 @@ in-flight query on the transaction's connection, the rollback may not run before
 reuse, and a cancelled mid-query connection may need to be **closed** rather than
 rolled back. Therefore:
 
-- Prefer the **closure form** (`db.transaction(|tx| …)`) — it rolls back
-  explicitly with `.await` on the error/cancel arm.
+- Prefer the **closure form** (`db.transaction(|tx| …)`) — it awaits an explicit
+  `ROLLBACK` on the **`Err`-return** path. On **cancellation** (the closure future
+  is dropped mid-poll) no async code can run during `Drop`, so it falls back to
+  sqlx's best-effort drop-rollback — same as the manual form. "Awaited rollback on
+  cancel" is impossible; only `Err`-return can await. (This corrects an over-claim:
+  the closure form is *not* a cure for timeout/cancellation rollback.)
 - The manual `begin()` + drop form is best-effort; callers SHOULD `commit()` or
   `rollback()` explicitly rather than relying on drop.
 - Per-query timeouts (§16) that drop an in-flight tx query may force the
@@ -829,19 +913,19 @@ a false "0 allocations".
 | `bench_bind_encode` | encode N typed values → `PgArguments` | report allocs honestly (args buffer grows) |
 | `bench_predicate_compose` | `and(eq, or(gt, lt))` tree build | 0 metadata alloc (within inline cap) |
 | `bench_builder_step_alloc` | each chained `.filter()/.order_by()` does **0 allocs** until terminal (guards invariant 1) | 0 alloc per step |
-| `bench_insert_chunk_calc` | `insert_many` chunk+bucket planning, 10k rows | < 1 µs; 0 alloc beyond the chunk vec |
-| `bench_projection_row_macro` | `row!`-generated decode path vs `#[derive(Row)]` path | **0 delta** (shared impl by construction) |
+| `bench_insert_unnest_build` | `insert_many` UNNEST array build for 10k rows (one array per column) | linear in rows; allocs = column-count arrays, reported |
+| `bench_projection_row_macro` | `row!` decode path vs `#[derive(Row)]` path | **0 delta** — both lower to `try_get::<X::Out>(literal_ordinal)` per field |
 | `bench_error_map` | `sqlx::Error` → `Error` SQLSTATE mapping | < 100 ns |
-| `size_of` checks | `size_of::<SqlExpr>()`, builder struct size, inline smallvec footprint | recorded; guards stack-frame bloat |
+| `size_of` checks | `size_of::<SqlExpr>()`, builder struct size, inline smallvec footprint | **`SqlExpr` ≤ 32 bytes** (index/enum, no owned `String` inline — fragments reference tokens / write into the shared buffer); guards stack-frame + `write_columns` copy cost |
 
 | Bench (integration, embedded pg, CI) | Measures | Target |
 |---|---|---|
 | `bench_decode_row` | decode N rows into `User` via sqlx `FromRow` vs raw `query_as` | informational, ±20% (CI noise floor) |
-| `bench_decode_row_macro` | `row!` decode (precomputed ordinals) vs derive | informational, ±20% |
-| `bench_relation_stitch` | `with()` hashbrown stitch, N parents × M children: map build + assign, allocs, peak mem | informational; bounded-memory asserted |
+| `bench_decode_row_macro` | `row!` decode (literal ordinals) vs derive | informational, ±20% |
+| `bench_relation_stitch` | `with()` stitch, N parents × M children | O(N+M) time; **divan alloc** = ≈ N child-Vecs + 1 pre-sized map, 0 reallocs (not RSS) |
 | `bench_with_roundtrips` | 1-level `.with()` vs manual join vs N+1 | `.with()` ≪ N+1 |
-| `bench_statement_cache_hitrate` | re-parse rate across varying IN/`insert_many` sizes | **near-100% hit** (guards the `= ANY($1)` + bucketing rules) |
-| `bench_stream_memory` | peak RSS over a 1M-row `.stream()` | bounded (does not buffer full set) |
+| `bench_statement_cache_hitrate` | re-parse rate across (a) varying IN/insert sizes **and** (b) builder-shape cardinality | **near-100% on axis (a)**; (b) characterizes the LRU cliff vs `statement_cache_capacity` |
+| `bench_stream_memory` | rows buffered at once + **divan bytes/iter** over a 1M-row `.stream()` | O(row width), **not** O(N) — measured via alloc profiling, not RSS |
 | `bench_insert_throughput` | rows/sec: `insert` vs `insert_many` vs `copy_into` at 1/1k/100k | informational; `copy_into` measured multiple reported, not gated |
 
 Pure benches run in the default loop and carry **strict** ns/alloc gates
@@ -877,11 +961,13 @@ has variance far above a 3% delta, so tight numeric gates there would be flaky.
    zero (`bench_select_build_wide`). Inline cap chosen against a realistic p95,
    balanced against stack-frame size (`size_of` checks).
 3. Column/relation tokens are zero-sized; no per-query allocation for schema info.
-4. `insert_many` issues one statement **per chunk**; round-trips grow with size
-   (§10) — not "one round-trip" for large inputs.
+4. `insert_many` is **one UNNEST statement / one round-trip** for any row count
+   (one array param per column), not chunked VALUES (§10).
 5. All generated queries go through sqlx's **prepared, extended (binary) protocol**
-   path — no simple-protocol fallback. IN lists use `= ANY($1)` and `insert_many`
-   buckets chunk sizes so the statement cache stays hot (`bench_statement_cache_hitrate`).
+   path — no simple-protocol fallback. IN lists use `= ANY($1)`, `insert_many` uses
+   UNNEST, and `LIMIT`/`OFFSET` are binds, so per-shape statement count is stable
+   (`bench_statement_cache_hitrate`); builder-shape cardinality vs the 256-cap LRU
+   is the residual axis to watch (§16).
 6. No `format!`-per-row in any hot path; SQL assembled into one `String` with
    computed capacity (that String is the 1 unavoidable alloc, per the budget above).
 
@@ -931,20 +1017,37 @@ string for a query shape**. Two well-known traps are designed out:
 - **IN lists:** `in ($1,$2,…)` varies its text with element count → a new
   statement per length → thrash. We render `= ANY($1)` instead (§6) — one stable
   statement for any length.
-- **`insert_many`:** a varying row count per call/last-chunk varies the `VALUES`
-  text. We **bucket** chunk sizes to powers of two (§10) so distinct statement
-  shapes stay bounded.
+- **`insert_many`:** uses UNNEST with one array param per column (§10), so a
+  **single statement serves any row count** — no bucketing needed.
+- **`LIMIT`/`OFFSET`:** bound params (§6), not literals — otherwise every page is
+  a distinct statement (pagination would defeat the cache).
+
+What is **not** bounded by these rules: the **combinatorial cardinality of builder
+shapes** itself. Each distinct (projection × predicate set × order × join × paging-
+present) combination is a distinct prepared statement. A table with 5 optional
+filters and 3 orderings is already ~96 shapes; a few such tables exceed
+`statement_cache_capacity` (256, **per connection**). sqlx's cache is **LRU**: over
+capacity it `DEALLOCATE`s the least-recently-used statement and re-parses on the
+next miss — no error, but a silent parse-thrash perf cliff. Guidance: 256 suits
+small schemas; high-shape-cardinality apps should raise it. `bench_statement_cache_hitrate`
+(§15) exercises **both** axes — IN/insert size **and** builder-shape cardinality.
 
 Values are never embedded in SQL text (they are binds) — a perf invariant and a
-security invariant (§17). `bench_statement_cache_hitrate` (§15) guards this.
+security invariant (§17).
 
 ### Timeouts & cancellation
 
 - Every terminal accepts an optional per-query timeout; on elapse the future is
-  dropped → sqlx cancels. Default inherits `DbConfig`.
-- Cancellation is safe, but cancelling an in-flight query **on a transaction's
-  connection** may force that connection closed rather than rolled back (§11
-  caveat) — correctness over reuse.
+  dropped. **Dropping a sqlx query future does not send a Postgres `CancelRequest`**
+  — it stops polling, leaving an unread result on the connection, so sqlx may
+  **close that connection** on cleanup. This applies to **any** pooled connection,
+  not just transaction ones: a timeout storm can churn/deplete the pool and
+  cascade into acquire-timeouts (an availability concern). Mitigations: set a
+  server-side `statement_timeout` GUC (the real cancellation mechanism), and/or use
+  an out-of-band cancel on a separate connection for the timeout path. Documented,
+  not hidden.
+- Cancelling an in-flight query **on a transaction's connection** may force that
+  connection closed rather than rolled back (§11 caveat) — correctness over reuse.
 
 ### Observability
 
@@ -1023,9 +1126,20 @@ pagination. `bench_stream_memory` (§15) asserts bounded client memory.
   alone is not a sanitizer; embedded-quote doubling is the actual defense and is a
   tested invariant.) Note attribute strings (`#[column(name=…)]`,
   `#[table(name=…)]`) are trusted developer input, but are still quoted correctly.
-- **DDL strings:** `#[column(default = "…")]` is emitted **verbatim** into
-  `create table` DDL — trusted developer literals only, never templated from
-  runtime/env. The column API accepts no runtime `String` for `default`/`name`.
+- **Identifier length (NAMEDATALEN):** Postgres silently truncates identifiers to
+  63 bytes, so two names sharing a 63-byte prefix would collide (wrong FK target,
+  or a snapshot diff that mis-detects a "new" column). The identifier renderer and
+  the migration generator **hard-error on any identifier > 63 UTF-8 bytes** rather
+  than truncate.
+- **DDL strings (trusted, verbatim, literal-only):** `#[column(default = "…")]`,
+  `#[column(sql_type = "…")]`, and `#[table(name=…)]`/`#[column(name=…)]` are
+  emitted into DDL from string literals only — never templated from runtime/env.
+  The column API accepts no runtime `String` for these. **There is no
+  literal-vs-function escaping** of `default`/`sql_type` (a developer writing
+  `default = "O'Brien"` produces invalid DDL): the **review-before-apply gate (§5)
+  is the only control**, by design. (Future option: split `default_value =
+  <typed literal>` (auto-escaped) vs `default_expr = "<sql>"` (verbatim), mirroring
+  the value-vs-raw split elsewhere.)
 - **Raw escape hatch is unaudited by design:** `db.raw(&str)` and the exposed
   `db.pool()` put SQL-text responsibility on the caller (values still via
   `.bind()`). `&'static str` was rejected as security theater (`Box::leak`
@@ -1036,6 +1150,11 @@ pagination. `bench_stream_memory` (§15) asserts bounded client memory.
   (§16). stakit cannot stop Postgres server-side logging or a caller echoing
   `Error::Display` (which can carry pg messages with values, §12) — both are
   documented operator/caller responsibilities.
+- **Schema-info disclosure:** the typed error variants (`Unique { constraint }`,
+  `NotNull { column }`, …) place schema identifiers (constraint/column names) into
+  `Error::Display`. These names reveal schema structure; like the transparent
+  fallback, log them server-side and map to a generic message before returning to
+  untrusted clients.
 - **`unsafe` forbidden** (workspace lint), no exceptions — including benches
   (divan alloc profiling, not a custom `GlobalAlloc`, §15/§16).
 - **Transactions:** drop-rollback is best-effort (§11); the closure form does an
@@ -1077,13 +1196,27 @@ Highest-risk items to prototype first (de-risk before committing the full v1):
 - **Migration diff** for type changes / renames is ambiguous (rename vs drop+add);
   v1 covers additive changes, surfaces the rest for hand-editing.
 
-Resolved during review (now specified, not open): `Projection::decode` method;
-lowercase column-const `#[allow(non_upper_case_globals)]`; FK type-equality via
-`PhantomData` witness (not `const assert!`); `IntoExpr<Ty>` for `eq`; terminal
-split (Select vs mutation); honest allocation budget (1 String + 1 args, not "0
-allocs"); divan alloc profiling (no `unsafe` allocator); drop-rollback as
-best-effort with explicit closure rollback; identifier-quote doubling; error
-value-leak boundary; credential redaction.
+Resolved during review (now specified, not open):
+
+- *Round 1:* lowercase column-const `#[allow(non_upper_case_globals)]`; FK
+  type-equality via `PhantomData` witness (not `const assert!`); `IntoExpr<Ty>`
+  for `eq` (curated impl set, no reflexive blanket); terminal split (Select vs
+  mutation); honest allocation budget (1 String + 1 args, not "0 allocs"); divan
+  alloc profiling (no `unsafe` allocator); identifier-quote doubling; error
+  value-leak boundary; credential redaction.
+- *Round 2:* `Projection::decode(&self, …)` (instance-carrying `row!`);
+  `row!` via `field<X: Expr>` with `X::Out: Decode` (no extractor closure, no
+  inference hole) emitting a complete inline impl; **UNNEST** for `insert_many`
+  (kills VALUES bucketing, param-cap, and last-chunk statement thrash);
+  `returning().one()` non-`Option` restricted to plain `Insert`
+  (Update/Delete/`do_nothing` → `Option`); relational `Loaded<T>` (loaded-vs-empty
+  vs not-requested); FK type check is compile-time-only (schema must be a build
+  target) + gen-time spelling check; transaction closure rollback honest
+  (`Err`-return only, not cancel); `AsyncFnOnce`/boxed transaction signature;
+  timeout-drop pool-depletion documented; NAMEDATALEN 63-byte hard error;
+  `LIMIT`/`OFFSET` bound; builder-shape statement-cache cardinality + LRU cliff;
+  `Post::views`/`created_at` added; `sql_type` added to DDL trust inventory;
+  `SqlExpr` ≤ 32-byte budget + `write_columns`.
 
 - **Quality gate:** all crates must pass `./code-check.sh` (fmt, clippy
   pedantic+nursery `-D warnings`, build, nextest, doctests); `unsafe` forbidden;
