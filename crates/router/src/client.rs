@@ -34,8 +34,9 @@ pub trait ClientAction {
 /// TypeScript metadata for a registered client action.
 pub(crate) struct ClientMeta {
     pub(crate) name: &'static str,
-    pub(crate) params_ts: String,
-    pub(crate) return_ts: String,
+    pub(crate) params_ref: String,
+    pub(crate) return_ref: String,
+    pub(crate) decls: std::collections::BTreeMap<String, String>,
 }
 
 /// A test stub for `client_call`: maps `(action name, params)` to a reply.

@@ -80,10 +80,15 @@ pub use stakit_orm_derive::Table;
 /// The `#[derive(Row)]` macro: a named projection over `#[from(<expr>)]` fields.
 pub use stakit_orm_derive::Row;
 
+/// The `#[derive(DbEnum)]` macro: makes a fieldless enum a column type (stored as
+/// text by default, or as an integer with `#[db_enum(int)]`).
+pub use stakit_orm_derive::DbEnum;
+
 /// Common imports: the [`Db`] handle, the derive, query operators, and core
 /// traits/types.
 pub mod prelude {
     pub use crate::Db;
+    pub use crate::DbEnum;
     pub use crate::Migration;
     pub use crate::Table;
     pub use crate::error::{Error, Result};

@@ -687,3 +687,486 @@ async fn custom_column_type_round_trips() {
     let got = db.find::<Doc>().one().await.unwrap().unwrap();
     assert_eq!(got.tags, Tags(vec!["red".into(), "blue".into()]));
 }
+
+// ----- Option<String> nullability + a fully-usable custom type (select, insert,
+// AND filter) via ToValue/FromValue/IntoExpr -----
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Color {
+    Red,
+    Green,
+}
+
+impl stakit_orm::ToValue for Color {
+    fn to_value(self) -> stakit_orm::Value {
+        stakit_orm::Value::Text(
+            match self {
+                Self::Red => "red",
+                Self::Green => "green",
+            }
+            .to_owned(),
+        )
+    }
+}
+impl stakit_orm::FromValue for Color {
+    const KIND: stakit_orm::ValueKind = stakit_orm::ValueKind::Text;
+    fn from_value(value: stakit_orm::Value) -> stakit_orm::Result<Self> {
+        match value {
+            stakit_orm::Value::Text(s) if s == "red" => Ok(Self::Red),
+            stakit_orm::Value::Text(s) if s == "green" => Ok(Self::Green),
+            other => Err(stakit_orm::Error::Decode(
+                format!("bad Color: {other:?}").into(),
+            )),
+        }
+    }
+}
+// Enables eq()/ne()/etc. against a Color column.
+impl stakit_orm::expr::IntoExpr<Self> for Color {
+    fn into_operand(self) -> stakit_orm::expr::Operand {
+        stakit_orm::expr::Operand::Value(stakit_orm::ToValue::to_value(self))
+    }
+}
+
+#[derive(Table, Debug, PartialEq, Eq)]
+#[table(name = "items2")]
+struct Item2 {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    color: Color,
+    #[column(nullable)]
+    note: Option<String>,
+}
+
+#[tokio::test]
+async fn nullable_and_custom_type_select_insert_filter() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    db.raw("create table items2 (id integer primary key, color text not null, note text)")
+        .exec()
+        .await
+        .unwrap();
+
+    db.insert_many(vec![
+        Item2New {
+            id: 1,
+            color: Color::Red,
+            note: Some("hi".into()),
+        },
+        Item2New {
+            id: 2,
+            color: Color::Green,
+            note: None,
+        },
+    ])
+    .exec()
+    .await
+    .unwrap();
+
+    // Option<String> round-trips Some and None.
+    let one = db.get::<Item2>(1).one().await.unwrap().unwrap();
+    assert_eq!(one.note, Some("hi".to_owned()));
+    assert_eq!(one.color, Color::Red);
+    let two = db.get::<Item2>(2).one().await.unwrap().unwrap();
+    assert_eq!(two.note, None);
+
+    // filter on the custom column (IntoExpr).
+    let reds = db
+        .find::<Item2>()
+        .filter(eq(Item2::color, Color::Red))
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(reds.len(), 1);
+    assert_eq!(reds[0].id, 1);
+
+    // filter on Option<String> column with &str (Some path) and is_null (None path).
+    let with_note = db
+        .find::<Item2>()
+        .filter(eq(Item2::note, "hi"))
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(with_note.len(), 1);
+    let no_note = db
+        .find::<Item2>()
+        .filter(is_null(Item2::note))
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(no_note.len(), 1);
+    assert_eq!(no_note[0].id, 2);
+}
+
+// ----- #[derive(DbEnum)] — string enum + number enum, out of the box -----
+
+#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Active,
+    #[db_enum(rename = "archived_v2")]
+    Archived,
+}
+
+#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[db_enum(int)]
+enum Level {
+    Low = 1,
+    Mid = 5,
+    High = 9,
+}
+
+#[derive(Table, Debug, PartialEq, Eq)]
+#[table(name = "tickets")]
+struct Ticket {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    status: Status,
+    #[column(sql_type = "int")]
+    level: Level,
+}
+
+#[tokio::test]
+async fn derive_db_enum_string_and_number() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    db.raw("create table tickets (id integer primary key, status text not null, level integer not null)")
+        .exec()
+        .await
+        .unwrap();
+
+    db.insert_many(vec![
+        TicketNew {
+            id: 1,
+            status: Status::Active,
+            level: Level::Low,
+        },
+        TicketNew {
+            id: 2,
+            status: Status::Archived,
+            level: Level::High,
+        },
+    ])
+    .exec()
+    .await
+    .unwrap();
+
+    // round-trip both enums
+    let t1 = db.get::<Ticket>(1).one().await.unwrap().unwrap();
+    assert_eq!(t1.status, Status::Active);
+    assert_eq!(t1.level, Level::Low);
+    let t2 = db.get::<Ticket>(2).one().await.unwrap().unwrap();
+    assert_eq!(t2.status, Status::Archived);
+    assert_eq!(t2.level, Level::High);
+
+    // string enum stored under its renamed label
+    let rows = db
+        .raw("select id, status from tickets where id = 2")
+        .bind(2_i64)
+        .all::<StatusRow>()
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status, "archived_v2");
+
+    // number enum stored as its discriminant
+    let levels = db
+        .raw("select id, level from tickets order by id")
+        .all::<LevelRow>()
+        .await
+        .unwrap();
+    assert_eq!(levels[0].level, 1); // Low
+    assert_eq!(levels[1].level, 9); // High
+
+    // filter on both enum columns (IntoExpr)
+    let active = db
+        .find::<Ticket>()
+        .filter(eq(Ticket::status, Status::Active))
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, 1);
+    let high = db
+        .find::<Ticket>()
+        .filter(eq(Ticket::level, Level::High))
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(high.len(), 1);
+    assert_eq!(high[0].id, 2);
+}
+
+#[derive(Table, Debug)]
+#[table(name = "tickets")]
+#[allow(dead_code)]
+struct LevelRow {
+    #[column(pk)]
+    id: i64,
+    level: i32,
+}
+
+#[derive(Table, Debug)]
+#[table(name = "tickets")]
+#[allow(dead_code)]
+struct StatusRow {
+    #[column(pk)]
+    id: i64,
+    status: String,
+}
+
+// ----- chrono temporal types: DateTime<Utc>, NaiveDateTime, NaiveDate, NaiveTime -----
+
+#[derive(Table, Debug, PartialEq, Eq)]
+#[table(name = "events")]
+struct Event {
+    #[column(pk)]
+    id: i64,
+    at: chrono::DateTime<chrono::Utc>, // timestamptz
+    local: chrono::NaiveDateTime,      // timestamp
+    day: chrono::NaiveDate,            // date
+    alarm: chrono::NaiveTime,          // time
+}
+
+#[tokio::test]
+async fn chrono_temporal_types_round_trip() {
+    use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    db.raw("create table events (id integer primary key, at text not null, local text not null, day text not null, alarm text not null)")
+        .exec()
+        .await
+        .unwrap();
+
+    let at = Utc.with_ymd_and_hms(2026, 6, 2, 8, 30, 0).unwrap();
+    let local = NaiveDate::from_ymd_opt(2026, 6, 2)
+        .unwrap()
+        .and_hms_opt(8, 30, 0)
+        .unwrap();
+    let day = NaiveDate::from_ymd_opt(1990, 1, 15).unwrap();
+    let alarm = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+
+    db.insert(EventNew {
+        id: 1,
+        at,
+        local,
+        day,
+        alarm,
+    })
+    .exec()
+    .await
+    .unwrap();
+
+    let got = db.get::<Event>(1).one().await.unwrap().unwrap();
+    assert_eq!(got.at, at);
+    assert_eq!(got.local, local);
+    assert_eq!(got.day, day);
+    assert_eq!(got.alarm, alarm);
+
+    // filter on a temporal column
+    let on_day = db
+        .find::<Event>()
+        .filter(eq(Event::day, day))
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(on_day.len(), 1);
+}
+
+// ----- JSON column -----
+
+#[derive(Table, Debug)]
+#[table(name = "docs2")]
+#[allow(dead_code)]
+struct Doc2 {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    meta: serde_json::Value,
+    #[column(nullable, sql_type = "text")]
+    extra: Option<serde_json::Value>,
+}
+
+#[tokio::test]
+async fn json_column_round_trips() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    db.raw("create table docs2 (id integer primary key, meta text not null, extra text)")
+        .exec()
+        .await
+        .unwrap();
+
+    let meta = serde_json::json!({ "a": 1, "tags": ["x", "y"], "nested": { "ok": true } });
+    db.insert(Doc2New {
+        id: 1,
+        meta: meta.clone(),
+        extra: None,
+    })
+    .exec()
+    .await
+    .unwrap();
+
+    let got = db.get::<Doc2>(1).one().await.unwrap().unwrap();
+    assert_eq!(got.meta, meta);
+    assert_eq!(got.meta["nested"]["ok"], serde_json::json!(true));
+    assert_eq!(got.extra, None);
+}
+
+// ----- foreign key ON DELETE CASCADE -----
+
+#[derive(Table, Debug)]
+#[table(name = "owners")]
+#[allow(dead_code)]
+struct Owner {
+    #[column(pk)]
+    id: i64,
+    name: String,
+}
+
+#[derive(Table, Debug)]
+#[table(name = "devices")]
+#[allow(dead_code)]
+struct Device {
+    #[column(pk)]
+    id: i64,
+    #[column(references = Owner::id, on_delete = "cascade")]
+    owner_id: i64,
+    label: String,
+}
+
+#[tokio::test]
+async fn foreign_key_on_delete_cascade() {
+    // Use connect_sqlite (NOT a hand-built pool) with a multi-connection file DB and
+    // NO manual pragma — this proves connect_sqlite enables FK enforcement on every
+    // pooled connection, so cascade works the way a real app would get it.
+    let path = std::env::temp_dir().join(format!("stakit_fk_{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let db = Db::connect_sqlite(&url).await.expect("connect");
+    db.raw("create table owners (id integer primary key, name text not null)")
+        .exec()
+        .await
+        .unwrap();
+    db.raw("create table devices (id integer primary key, owner_id integer not null references owners(id) on delete cascade, label text not null)")
+        .exec()
+        .await
+        .unwrap();
+
+    db.insert(OwnerNew {
+        id: 1,
+        name: "Ann".into(),
+    })
+    .exec()
+    .await
+    .unwrap();
+    db.insert_many(vec![
+        DeviceNew {
+            id: 1,
+            owner_id: 1,
+            label: "phone".into(),
+        },
+        DeviceNew {
+            id: 2,
+            owner_id: 1,
+            label: "laptop".into(),
+        },
+    ])
+    .exec()
+    .await
+    .unwrap();
+    assert_eq!(db.find::<Device>().count().await.unwrap(), 2);
+
+    // deleting the owner cascades to its devices
+    db.delete::<Owner>()
+        .filter(eq(Owner::id, 1))
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(db.find::<Device>().count().await.unwrap(), 0);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+// ----- create index -----
+
+#[derive(Table, Debug)]
+#[table(name = "logs")]
+#[allow(dead_code)]
+struct LogRow {
+    #[column(pk)]
+    id: i64,
+    #[column(index)]
+    user_id: i64,
+    msg: String,
+}
+
+#[tokio::test]
+async fn create_index_works() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    db.migrate(&[Migration {
+        version: "0001",
+        statements: &[
+            "create table logs (id integer primary key, user_id integer not null, msg text not null)",
+            "create index idx_logs_user_id on logs (user_id)",
+        ],
+    }])
+    .await
+    .expect("migrate with index");
+
+    db.insert_many(vec![
+        LogRowNew {
+            id: 1,
+            user_id: 7,
+            msg: "a".into(),
+        },
+        LogRowNew {
+            id: 2,
+            user_id: 7,
+            msg: "b".into(),
+        },
+        LogRowNew {
+            id: 3,
+            user_id: 9,
+            msg: "c".into(),
+        },
+    ])
+    .exec()
+    .await
+    .unwrap();
+
+    // index is present and query using it returns correct rows
+    let mine = db
+        .find::<LogRow>()
+        .filter(eq(LogRow::user_id, 7))
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(mine.len(), 2);
+    // verify the index object exists in sqlite_master
+    let idx = db
+        .raw("select id, user_id, msg from logs where 0")
+        .all::<LogRow>()
+        .await
+        .unwrap();
+    assert!(idx.is_empty());
+}

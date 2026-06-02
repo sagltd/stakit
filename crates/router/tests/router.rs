@@ -15,7 +15,8 @@ use std::sync::OnceLock;
 
 use stakit_model::Model;
 use stakit_router::{
-    Action, ActionExt as _, ClientAction, Cx, Error, Frame, Middleware, Router, action, err,
+    Action, ActionExt as _, ClientAction, Cx, Error, Frame, Middleware, Router,
+    StreamActionExt as _, action, err,
 };
 
 // --- contexts ---
@@ -232,6 +233,14 @@ fn unknown_action_is_404() {
 }
 
 #[test]
+fn malformed_params_yield_decode_error() {
+    // `name` must be a string — a number fails to deserialize → 400.
+    let env = call(&router(), true, "greet", json!({"name": 123}));
+    assert_eq!(env["status"], "error");
+    assert_eq!(env["error"]["code"], 400);
+}
+
+#[test]
 fn action_to_action_call() {
     let env = call(&router(), true, "greet_twice", json!({"name": "sam"}));
     assert_eq!(env["data"], json!("Hello, sam! Hello, sam!"));
@@ -311,10 +320,14 @@ fn axum_style_single_handler_routes_everything() {
 }
 
 #[test]
-fn custom_app_error_propagates_as_500() {
+fn custom_app_error_is_generic_500_with_detail_kept_server_side() {
     let env = call(&router(), true, "maybe_fail", json!({"name": "boom"}));
     assert_eq!(env["error"]["code"], 500);
-    assert_eq!(env["error"]["message"], "kaboom");
+    // client sees a generic message — the internal text is NOT leaked
+    assert_eq!(env["error"]["message"], "internal server error");
+    // ...it's kept server-side (for logging) in `Error::detail`
+    let e: Error = AppError("kaboom").into();
+    assert_eq!(e.detail(), Some("kaboom"));
 }
 
 #[test]
@@ -383,7 +396,10 @@ fn stream_payload_runs_multiple_actions() {
 fn thiserror_app_error_works_out_of_the_box() {
     let env = call(&router(), true, "risky", json!({"name": "x"}));
     assert_eq!(env["error"]["code"], 500);
-    assert_eq!(env["error"]["message"], "database is down");
+    // generic to the client; thiserror's text stays server-side in `detail`
+    assert_eq!(env["error"]["message"], "internal server error");
+    let e: Error = TodoError::Db.into();
+    assert_eq!(e.detail(), Some("database is down"));
 }
 
 #[tokio::test]
@@ -667,6 +683,154 @@ fn middleware_passes_and_injects_user() {
     let ok = block_on(auth_router().on_request(req, payload("whoami_authed", json!(null))));
     assert_eq!(ok["whoami_authed"]["status"], "ok");
     assert_eq!(ok["whoami_authed"]["data"], json!("alice")); // injected by the guard
+}
+
+static AFTER_RAN: AtomicUsize = AtomicUsize::new(0);
+
+struct Audit;
+impl Middleware<App, AuthReq> for Audit {
+    async fn after(&self, _cx: &Cx<App, AuthReq>) {
+        AFTER_RAN.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn middleware_after_runs_once_the_action_completes() {
+    ACTION_CALLS.store(0, Ordering::SeqCst);
+    AFTER_RAN.store(0, Ordering::SeqCst);
+    let router = Router::builder()
+        .ctx(App {
+            greeting: "Hi".to_owned(),
+        })
+        .register(counted.middleware(Audit))
+        .build();
+
+    block_on(router.on_request(AuthReq::default(), payload("counted", json!(null))));
+    assert_eq!(ACTION_CALLS.load(Ordering::SeqCst), 1); // action ran
+    assert_eq!(AFTER_RAN.load(Ordering::SeqCst), 1); // ...then `after`
+}
+
+// guard on a *streaming* action (exercises `StreamGuarded`).
+struct RequireAdmin;
+impl Middleware<App, Req> for RequireAdmin {
+    async fn before(&self, cx: &Cx<App, Req>) -> Result<(), Error> {
+        if cx.req.admin {
+            Ok(())
+        } else {
+            Err(err!(403, "admin only"))
+        }
+    }
+}
+
+#[test]
+fn stream_middleware_guards_the_stream() {
+    let router = Router::builder()
+        .ctx(App {
+            greeting: "Hi".to_owned(),
+        })
+        .register_stream(count.middleware(RequireAdmin))
+        .build();
+
+    // denied → a single 403 error frame, the stream body never starts
+    let denied: Vec<Frame> = block_on(
+        router
+            .on_stream(Req { admin: false }, payload("count", json!({"n": 3})))
+            .collect(),
+    );
+    assert!(matches!(denied.first(), Some(Frame::Error { error, .. }) if error.code == 403));
+    assert_eq!(denied.len(), 1);
+
+    // allowed → 2 items + End
+    let allowed: Vec<Frame> = block_on(
+        router
+            .on_stream(Req { admin: true }, payload("count", json!({"n": 2})))
+            .collect(),
+    );
+    assert_eq!(allowed.len(), 3);
+    assert!(matches!(allowed.last(), Some(Frame::End { .. })));
+}
+
+// ── generic struct / enum as an action return ───────────────────────────────
+
+#[derive(Model, Serialize, Deserialize)]
+struct Message<T> {
+    is_success: bool,
+    data: T,
+}
+
+#[derive(Model, Serialize, Deserialize)]
+struct User {
+    id: u64,
+    name: String,
+}
+
+#[derive(Model, Serialize, Deserialize)]
+enum ApiResult<T> {
+    Found(T),
+    Missing,
+}
+
+#[action]
+async fn login(_params: Greet) -> Result<Message<User>, Error> {
+    Ok(Message {
+        is_success: true,
+        data: User {
+            id: 1,
+            name: "alice".to_owned(),
+        },
+    })
+}
+
+#[action]
+async fn lookup(_params: Greet) -> Result<ApiResult<User>, Error> {
+    Ok(ApiResult::Found(User {
+        id: 2,
+        name: "bob".to_owned(),
+    }))
+}
+
+fn generic_router() -> Router<App, Req> {
+    Router::builder()
+        .ctx(App {
+            greeting: "Hi".to_owned(),
+        })
+        .register(login)
+        .register(lookup)
+        .build()
+}
+
+#[test]
+fn action_returns_generic_struct() {
+    let out = block_on(
+        generic_router().on_request(Req { admin: true }, payload("login", json!({"name": "x"}))),
+    );
+    assert_eq!(out["login"]["status"], "ok");
+    assert_eq!(out["login"]["data"]["is_success"], true);
+    assert_eq!(out["login"]["data"]["data"]["name"], "alice"); // nested generic value
+}
+
+#[test]
+fn action_returns_generic_enum() {
+    let out = block_on(
+        generic_router().on_request(Req { admin: true }, payload("lookup", json!({"name": "x"}))),
+    );
+    // serde externally-tagged: ApiResult::Found(User) -> { "Found": {…} }
+    assert_eq!(out["lookup"]["data"]["Found"]["name"], "bob");
+}
+
+#[test]
+fn generic_types_generate_valid_typescript() {
+    let ts = generic_router().generate_ts();
+    // the monomorphized generic interface + the nested type it references
+    assert!(ts.contains("export interface MessageUser {"), "{ts}");
+    assert!(ts.contains("export interface User {"), "{ts}");
+    assert!(ts.contains("data: User"), "{ts}");
+    // result map references the monomorphized name
+    assert!(ts.contains("login: MessageUser;"), "{ts}");
+    assert!(ts.contains("lookup: ApiResultUser;"), "{ts}");
+    // never a declaration embedded inline (the old nested-type bug)
+    assert!(!ts.contains(": export "), "{ts}");
+    assert!(!ts.contains("<export "), "{ts}");
 }
 
 #[test]

@@ -227,3 +227,88 @@ async fn mysql_relations() {
         .expect("belongs_to");
     assert_eq!(with_author[0].1.as_ref().unwrap().name, "Ann");
 }
+
+#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum MyKind {
+    A,
+    B,
+}
+
+#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[db_enum(int)]
+enum MyRank {
+    Low = 1,
+    High = 9,
+}
+
+#[derive(Table, Debug)]
+#[table(name = "mt_things")]
+#[allow(dead_code)]
+struct MtThing {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "varchar(16)")]
+    kind: MyKind,
+    #[column(sql_type = "int")]
+    rank: MyRank,
+    at: chrono::DateTime<chrono::Utc>,
+    local: chrono::NaiveDateTime,
+    day: chrono::NaiveDate,
+    alarm: chrono::NaiveTime,
+    meta: serde_json::Value,
+}
+
+/// Enums (text + int), all chrono temporal types, and JSON against real `MySQL`.
+#[tokio::test]
+async fn mysql_enums_temporal_json() {
+    use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
+    let Ok(url) = std::env::var("MYSQL_URL") else {
+        eprintln!("MYSQL_URL not set; skipping MySQL types e2e");
+        return;
+    };
+    let db = Db::connect_mysql(&url).await.expect("connect");
+    db.raw("drop table if exists mt_things").exec().await.ok();
+    db.raw(
+        "create table mt_things (id bigint primary key, kind varchar(16) not null, rank int not null, \
+         at datetime not null, local datetime not null, day date not null, alarm time not null, meta json not null)",
+    )
+    .exec()
+    .await
+    .expect("create");
+
+    let at = Utc.with_ymd_and_hms(2026, 6, 2, 8, 30, 0).unwrap();
+    let day = NaiveDate::from_ymd_opt(1990, 1, 15).unwrap();
+    let alarm = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+    let local = day.and_hms_opt(8, 30, 0).unwrap();
+    let meta = serde_json::json!({ "k": [1, 2, 3] });
+
+    db.insert(MtThingNew {
+        id: 1,
+        kind: MyKind::B,
+        rank: MyRank::High,
+        at,
+        local,
+        day,
+        alarm,
+        meta: meta.clone(),
+    })
+    .exec()
+    .await
+    .expect("insert");
+
+    let got = db.get::<MtThing>(1).one().await.unwrap().unwrap();
+    assert_eq!(got.kind, MyKind::B);
+    assert_eq!(got.rank, MyRank::High);
+    assert_eq!(got.local, local);
+    assert_eq!(got.day, day);
+    assert_eq!(got.alarm, alarm);
+    assert_eq!(got.meta, meta);
+
+    let highs = db
+        .find::<MtThing>()
+        .filter(eq(MtThing::rank, MyRank::High))
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(highs.len(), 1);
+}

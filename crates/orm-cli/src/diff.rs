@@ -171,6 +171,21 @@ fn column_ddl(column: &Column) -> String {
     ddl
 }
 
+/// Conventional index name for a single-column index.
+fn index_name(table: &str, column: &str) -> String {
+    format!("idx_{table}_{column}")
+}
+
+/// `create index "idx_t_c" on "t" ("c");` (portable across Postgres/SQLite/MySQL).
+fn create_index_sql(table: &str, column: &str) -> String {
+    format!(
+        "create index {} on {} ({});",
+        quote(&index_name(table, column)),
+        quote(table),
+        quote(column)
+    )
+}
+
 fn create_table_sql(table: &Table) -> String {
     let mut lines: Vec<String> = table
         .columns
@@ -217,14 +232,26 @@ fn alter_type_sql(table: &str, to: &Column) -> String {
 /// Render the forward (up) SQL for a change.
 fn up(change: &Change) -> String {
     match change {
-        Change::CreateTable(table) => create_table_sql(table),
+        Change::CreateTable(table) => {
+            let mut sql = create_table_sql(table);
+            for column in table.columns.iter().filter(|c| c.index) {
+                sql.push('\n');
+                sql.push_str(&create_index_sql(&table.name, &column.name));
+            }
+            sql
+        }
         Change::DropTable(table) => format!("drop table {};", quote(&table.name)),
         Change::AddColumn { table, column } => {
-            format!(
+            let mut sql = format!(
                 "alter table {} add column {};",
                 quote(table),
                 column_ddl(column)
-            )
+            );
+            if column.index {
+                sql.push('\n');
+                sql.push_str(&create_index_sql(table, &column.name));
+            }
+            sql
         }
         Change::DropColumn { table, column } => {
             format!(
@@ -309,6 +336,7 @@ mod tests {
             nullable: false,
             pk: name == "id",
             unique: false,
+            index: false,
             default: None,
             references: None,
         }
@@ -335,6 +363,38 @@ mod tests {
         fn rename_target(&mut self, _: &str, _: &Column, candidates: &[Column]) -> Option<String> {
             candidates.first().map(|c| c.name.clone())
         }
+    }
+
+    fn indexed_col(name: &str, ty: &str) -> Column {
+        let mut column = col(name, ty);
+        column.index = true;
+        column
+    }
+
+    #[test]
+    fn create_table_emits_create_index_for_indexed_columns() {
+        let new = table(
+            "logs",
+            vec![col("id", "bigint"), indexed_col("user_id", "bigint")],
+        );
+        let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
+        assert!(up.contains("create table \"logs\""));
+        assert!(
+            up.contains("create index \"idx_logs_user_id\" on \"logs\" (\"user_id\");"),
+            "missing create index, got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn add_indexed_column_emits_create_index() {
+        let old = table("logs", vec![col("id", "bigint")]);
+        let new = table(
+            "logs",
+            vec![col("id", "bigint"), indexed_col("user_id", "bigint")],
+        );
+        let up = up_sql(&diff(&old, &new, &mut NeverRename));
+        assert!(up.contains("add column \"user_id\""));
+        assert!(up.contains("create index \"idx_logs_user_id\" on \"logs\" (\"user_id\");"));
     }
 
     #[test]

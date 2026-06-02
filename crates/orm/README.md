@@ -109,10 +109,76 @@ struct Post {
 - compile-time **foreign-key type checks** (`author_id` must match `User`'s PK type)
 - compile-time identifier validation (empty / NUL / 63-byte limit)
 
-Column attributes: `pk`, `unique`, `nullable`, `default = "<sql>"`, `name = "<col>"`,
-`sql_type = "<type>"`, `references = Type::col`,
+Column attributes: `pk`, `unique`, `index`, `nullable`, `default = "<sql>"`,
+`name = "<col>"`, `sql_type = "<type>"`, `references = Type::col`,
 `on_delete = "cascade|restrict|set null|no action"`. Composite primary keys are
-rejected (use exactly one `#[column(pk)]`).
+rejected (use exactly one `#[column(pk)]`). `#[column(index)]` makes the CLI emit a
+`CREATE INDEX` for that column.
+
+### Foreign keys & `ON DELETE CASCADE`
+
+```rust
+#[derive(Table)]
+#[table(name = "devices")]
+struct Device {
+    #[column(pk)]
+    id: i64,
+    #[column(references = User::id, on_delete = "cascade")] // delete user → delete devices
+    user_id: i64,
+}
+```
+
+The FK type is checked at compile time. `connect_sqlite` and `connect_turso_local`/
+`_remote` enable `PRAGMA foreign_keys = ON` on every connection, so cascade is enforced
+(SQLite/libSQL leave it off by default); Postgres/MySQL enforce FKs natively.
+
+### Enums — `#[derive(DbEnum)]`
+
+Fieldless enums become column types out of the box, stored as text (default) or int:
+
+```rust
+#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum Status { Active, #[db_enum(rename = "archived_v2")] Archived } // text
+
+#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[db_enum(int)]
+enum Level { Low = 1, Mid = 5, High = 9 } // int (Rust discriminants)
+```
+
+Use them with `#[column(sql_type = "text")]` / `"int"`. They work in select, insert,
+and filters (`eq(Ticket::status, Status::Active)`). Duplicate labels/values are a
+compile error. Stored as portable `text`/`int` columns (not native PG/MySQL enum types).
+
+### Date & time (chrono)
+
+| Rust type (chrono)   | SQL type      | Use for                              |
+|----------------------|---------------|--------------------------------------|
+| `DateTime<Utc>`      | `timestamptz` | absolute instants, audit logs        |
+| `NaiveDateTime`      | `timestamp`   | wall-clock, tz managed externally    |
+| `NaiveDate`          | `date`        | birthdays, calendar days             |
+| `NaiveTime`          | `time`        | recurring daily times (`08:00:00`)   |
+
+All four bind, read, and filter on every backend (`Option<_>` for nullable). Best
+practice: store absolute events as `DateTime<Utc>`, context-free calendar values as
+the naive types.
+
+### JSON
+
+`serde_json::Value` is a column type (`json`/`jsonb`; text on SQLite/Turso):
+
+```rust
+#[derive(Table)]
+#[table(name = "docs")]
+struct Doc {
+    #[column(pk)]
+    id: i64,
+    meta: serde_json::Value,                 // jsonb
+    #[column(nullable)]
+    extra: Option<serde_json::Value>,
+}
+```
+
+Select/insert work directly; filter on JSON via `raw_pred(...)`.
 
 ## Query
 
@@ -292,41 +358,83 @@ Variants include `Unique`, `ForeignKey`, `NotNull`, `Check`, `NotFound`,
 `TooManyRows`, `Unsupported`, plus the concrete backend errors
 `Database(sqlx::Error)` and (with `turso`) `Turso(libsql::Error)` — not boxed.
 
-## Custom column types & extensions (pgvector, PostGIS, …)
+## Nullable columns
 
-Any type that implements `ToValue` + `FromValue` is usable as a column type — map it
-to an existing `Value` variant (`Text`/`Bytes`/`I64`/…):
+`Option<T>` is the nullable mapping for any supported `T` — `NULL` ⇄ `None`,
+automatically, everywhere:
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Tags(Vec<String>);
+#[derive(Table)]
+#[table(name = "users")]
+struct User {
+    #[column(pk)]
+    id: i64,
+    #[column(nullable)]
+    bio: Option<String>, // nullability is also inferred from Option<_>
+}
 
-impl stakit_orm::ToValue for Tags {
-    fn to_value(self) -> stakit_orm::Value {
-        stakit_orm::Value::Text(self.0.join(","))
+// select reads Some/None; insert binds None as SQL NULL
+let u = db.get::<User>(1).one().await?;          // u.bio: Option<String>
+// filter both sides:
+let with_bio = db.find::<User>().filter(eq(User::bio, "hi")).all().await?;   // Some
+let no_bio   = db.find::<User>().filter(is_null(User::bio)).all().await?;    // None
+```
+
+## Custom column types & extensions (pgvector, PostGIS, …)
+
+Add a brand-new column type by mapping it to an existing `Value` variant
+(`Text` / `Bytes` / `I64` / `F64` / `Bool` / `Uuid` / `Timestamptz` / `Date`). Three
+small impls — the last is only needed if you filter on the column:
+
+```rust
+use stakit_orm::{ToValue, FromValue, Value, ValueKind, Error, Result};
+use stakit_orm::expr::{IntoExpr, Operand};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Color { Red, Green }
+
+// (1) bind — how the value goes INTO the database
+impl ToValue for Color {
+    fn to_value(self) -> Value {
+        Value::Text(match self { Self::Red => "red", Self::Green => "green" }.to_owned())
     }
 }
-impl stakit_orm::FromValue for Tags {
-    const KIND: stakit_orm::ValueKind = stakit_orm::ValueKind::Text;
-    fn from_value(v: stakit_orm::Value) -> stakit_orm::Result<Self> {
+
+// (2) decode — how it comes BACK; KIND picks which cell shape to read
+impl FromValue for Color {
+    const KIND: ValueKind = ValueKind::Text;
+    fn from_value(v: Value) -> Result<Self> {
         match v {
-            stakit_orm::Value::Text(s) => Ok(Self(s.split(',').map(String::from).collect())),
-            other => Err(stakit_orm::Error::Decode(format!("bad Tags: {other:?}").into())),
+            Value::Text(s) if s == "red"   => Ok(Self::Red),
+            Value::Text(s) if s == "green" => Ok(Self::Green),
+            other => Err(Error::Decode(format!("bad Color: {other:?}").into())),
         }
     }
 }
 
+// (3) filter — lets eq()/ne()/gt()/… accept a Color (optional)
+impl IntoExpr<Color> for Color {
+    fn into_operand(self) -> Operand { Operand::Value(self.to_value()) }
+}
+
 #[derive(Table)]
-#[table(name = "docs")]
-struct Doc {
+#[table(name = "items")]
+struct Item {
     #[column(pk)]
     id: i64,
-    #[column(sql_type = "text")]
-    tags: Tags,
+    #[column(sql_type = "text")] // the SQL column type for migrations
+    color: Color,
+    #[column(nullable)]
+    note: Option<String>,
 }
 ```
 
-This is the extension point for DB extensions like **pgvector** and **PostGIS**:
+Now `db.insert`, `db.find::<Item>()`, `db.get`, `#[derive(Row)]`, and
+`eq(Item::color, Color::Red)` all work — and `Option<Color>` works automatically (the
+blanket `Option<T>` impl). Rule of thumb: impl **(1)+(2)** to store/read it, add **(3)**
+to compare against it in `WHERE`.
+
+This same point is how DB extensions like **pgvector** and **PostGIS** plug in:
 represent the value as text/bytes and round-trip it. Caveats today:
 
 - **Reading** works directly (`vector`/`geometry` columns have text output → parse in

@@ -213,6 +213,43 @@ environment/infra-blocked — there is no in-process MySQL in Rust, and this mac
 `mysqld`/Docker, so the `MySQL` driver is verified by shared-code-path + offline SQL
 rendering + `MYSQL_URL`-gated e2e (runnable in CI with a MySQL service).
 
+## Review loop — round 5 (enums, date/time, JSON, indexes, FK cascade) + audit
+
+New capabilities (all tested across backends):
+- **`#[derive(DbEnum)]`** — fieldless enums as columns out of the box: text by default
+  (variant name, `#[db_enum(rename="...")]` per variant), or `#[db_enum(int)]` storing
+  the discriminant (`= N` / `#[db_enum(value=N)]` / declaration index). Generates
+  `ToValue`/`FromValue`/`IntoExpr`. **Duplicate labels/values are a compile error**
+  (would otherwise be a silent lossy round-trip). Stored as portable `text`/`int`
+  columns — native PG `CREATE TYPE` / MySQL `ENUM` (1–2 byte) optimization is **not**
+  generated (documented; reachable via `sql_type` + manual DDL, with a cast caveat on PG).
+- **Full chrono temporal**: `Value::{Timestamptz, NaiveDateTime, Date, NaiveTime}` →
+  `DateTime<Utc>`/`NaiveDateTime`/`NaiveDate`/`NaiveTime` → `timestamptz`/`timestamp`/
+  `date`/`time`. Bind+read on all four drivers; Turso stores temporals as text with a
+  fixed `NaiveDateTime` format (Display-vs-FromStr hazard fixed) and accepts
+  `CURRENT_TIMESTAMP`-style values for `DateTime<Utc>`.
+- **JSON**: `Value::Json` (serde_json::Value) → `json`/`jsonb`; bind+read on all four
+  (Turso via text). Select/insert; filter via `raw_pred`.
+- **Indexes**: `#[column(index)]` → `Column.is_index`; CLI `gen` emits `CREATE INDEX`
+  on table-create and column-add. (Toggling index on an existing column is not yet
+  diffed — use a manual migration; composite indexes are future work.)
+- **FK `ON DELETE CASCADE` now actually enforced**: `connect_sqlite` sets
+  `SqliteConnectOptions::foreign_keys(true)` on every pooled connection, and
+  `connect_turso_local`/`_remote` run `PRAGMA foreign_keys = ON` — previously cascade
+  silently no-opped on SQLite/Turso (the prior test only passed because it set the
+  pragma by hand). Postgres/MySQL enforce FKs natively.
+
+Audit (3 background sub-agents: enums/JSON/custom, date/time, indexes/FK/migrations)
+found and fixed: the SQLite/Turso FK-pragma CRITICAL above, the DbEnum duplicate-guard,
+and the Turso `CURRENT_TIMESTAMP` decode fallback. Known remaining (documented): CLI
+`gen` DDL is Postgres-flavored (runtime `Db::migrate` is universal); native enum types
+and JSON-path operators are out of scope; index-toggle diffing and composite indexes
+are future work.
+
+Gate: **142 tests pass with all four backends LIVE** (Postgres embedded, SQLite, Turso,
+and MySQL/MariaDB via `brew install mariadb`), 0 clippy issues (pedantic+nursery,
+all-features), fmt + doctest green.
+
 ## Not yet implemented (tracked, with rationale)
 
 - **`copy_into`** bulk path + UNNEST (spec §10) — `insert`/`insert_many`/`returning`/

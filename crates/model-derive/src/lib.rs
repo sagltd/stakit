@@ -73,8 +73,8 @@ pub fn model(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let (ident, ir) = ir::parse(input)?;
-    let validate = emit_validate::expand(&ident, &ir);
-    let ts = emit_ts::expand(&ident, &ir);
+    let validate = emit_validate::expand(&ident, &ir, &input.generics);
+    let ts = emit_ts::expand(&ident, &ir, &input.generics);
     Ok(quote::quote! {
         #validate
         #ts

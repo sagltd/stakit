@@ -9,7 +9,7 @@ mod types;
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, Ident, LitStr, Path, Type, parse_macro_input};
+use syn::{Data, DeriveInput, Fields, Ident, LitInt, LitStr, Path, Type, parse_macro_input};
 use types::{is_relation, sql_type, unwrap_generic};
 
 /// Derive [`Table`](stakit_orm::Table) for a struct.
@@ -29,6 +29,197 @@ pub fn derive_row(input: TokenStream) -> TokenStream {
     expand_row(&input)
         .unwrap_or_else(|error| error.to_compile_error())
         .into()
+}
+
+/// Derive `ToValue` + `FromValue` + `IntoExpr` for a fieldless enum so it can be a
+/// column type out of the box.
+///
+/// Default stores the **variant name as text** (`Value::Text`) — portable to every
+/// backend (Postgres/MySQL accept a string for native enum columns; SQLite/Turso
+/// store it as `TEXT`). `#[db_enum(int)]` stores the **discriminant as an integer**
+/// (`Value::I32`), using each variant's explicit `= N` discriminant, a
+/// `#[db_enum(value = N)]` override, or the 0-based declaration index. Per-variant
+/// `#[db_enum(rename = "...")]` overrides the text label.
+///
+/// Declare the column's SQL type explicitly, e.g. `#[column(sql_type = "text")]` for
+/// a text enum or `#[column(sql_type = "int")]` for a numeric one (or a native enum
+/// type name like `"mood"`).
+#[proc_macro_derive(DbEnum, attributes(db_enum))]
+pub fn derive_db_enum(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    expand_db_enum(&input)
+        .unwrap_or_else(|error| error.to_compile_error())
+        .into()
+}
+
+/// Return the first value that appears more than once, if any.
+fn first_duplicate(values: &[String]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    values.iter().find(|v| !seen.insert(*v)).cloned()
+}
+
+#[allow(clippy::too_many_lines)]
+fn expand_db_enum(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let name = &input.ident;
+    let Data::Enum(data) = &input.data else {
+        return Err(syn::Error::new_spanned(
+            name,
+            "DbEnum can only derive for enums",
+        ));
+    };
+
+    // Container repr: `#[db_enum(int)]` or `#[db_enum(text)]` (default text).
+    let mut as_int = false;
+    for attr in &input.attrs {
+        if !attr.path().is_ident("db_enum") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("int") {
+                as_int = true;
+                Ok(())
+            } else if meta.path.is_ident("text") {
+                as_int = false;
+                Ok(())
+            } else {
+                Err(meta.error("expected `int` or `text`"))
+            }
+        })?;
+    }
+
+    let mut idents = Vec::new();
+    let mut texts = Vec::new();
+    let mut ints = Vec::new();
+    for (index, variant) in data.variants.iter().enumerate() {
+        if !matches!(variant.fields, Fields::Unit) {
+            return Err(syn::Error::new_spanned(
+                &variant.ident,
+                "DbEnum variants must be unit (fieldless)",
+            ));
+        }
+        let mut text = variant.ident.to_string();
+        // int value: explicit Rust discriminant (`= N`) wins, then declaration index.
+        let mut int_value: i64 = i64::try_from(index).unwrap_or(i64::MAX);
+        if let Some((_, syn::Expr::Lit(expr_lit))) = &variant.discriminant {
+            if let syn::Lit::Int(lit) = &expr_lit.lit {
+                int_value = lit.base10_parse()?;
+            }
+        }
+        for attr in &variant.attrs {
+            if !attr.path().is_ident("db_enum") {
+                continue;
+            }
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("rename") {
+                    text = meta.value()?.parse::<LitStr>()?.value();
+                    Ok(())
+                } else if meta.path.is_ident("value") {
+                    int_value = meta.value()?.parse::<LitInt>()?.base10_parse()?;
+                    Ok(())
+                } else {
+                    Err(meta.error("expected `rename = \"...\"` or `value = N`"))
+                }
+            })?;
+        }
+        idents.push(variant.ident.clone());
+        texts.push(text);
+        ints.push(int_value);
+    }
+
+    if idents.is_empty() {
+        return Err(syn::Error::new_spanned(
+            name,
+            "DbEnum needs at least one variant",
+        ));
+    }
+
+    // Reject collisions — two variants mapping to the same stored value would make
+    // the round-trip lossy (decode picks only the first), silently corrupting data.
+    if as_int {
+        if let Some(dup) = first_duplicate(&ints.iter().map(i64::to_string).collect::<Vec<_>>()) {
+            return Err(syn::Error::new_spanned(
+                name,
+                format!("DbEnum has two variants with the same int value `{dup}`"),
+            ));
+        }
+    } else if let Some(dup) = first_duplicate(&texts) {
+        return Err(syn::Error::new_spanned(
+            name,
+            format!("DbEnum has two variants with the same text label {dup:?}"),
+        ));
+    }
+
+    let body = if as_int {
+        let mut lits = Vec::with_capacity(ints.len());
+        for value in &ints {
+            let narrowed = i32::try_from(*value).map_err(|_| {
+                syn::Error::new_spanned(name, format!("DbEnum int value {value} out of i32 range"))
+            })?;
+            lits.push(proc_macro2::Literal::i32_unsuffixed(narrowed));
+        }
+        quote! {
+            #[automatically_derived]
+            impl ::stakit_orm::ToValue for #name {
+                fn to_value(self) -> ::stakit_orm::Value {
+                    ::stakit_orm::Value::I32(match self { #( Self::#idents => #lits ),* })
+                }
+            }
+            #[automatically_derived]
+            impl ::stakit_orm::FromValue for #name {
+                const KIND: ::stakit_orm::ValueKind = ::stakit_orm::ValueKind::I32;
+                fn from_value(value: ::stakit_orm::Value) -> ::stakit_orm::Result<Self> {
+                    match value {
+                        ::stakit_orm::Value::I32(n) => match n {
+                            #( #lits => ::core::result::Result::Ok(Self::#idents), )*
+                            other => ::core::result::Result::Err(::stakit_orm::Error::Decode(
+                                ::std::format!(concat!("invalid ", stringify!(#name), ": {}"), other).into(),
+                            )),
+                        },
+                        other => ::core::result::Result::Err(::stakit_orm::Error::Decode(
+                            ::std::format!(concat!("expected int for ", stringify!(#name), ", got {:?}"), other).into(),
+                        )),
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            #[automatically_derived]
+            impl ::stakit_orm::ToValue for #name {
+                fn to_value(self) -> ::stakit_orm::Value {
+                    ::stakit_orm::Value::Text(match self { #( Self::#idents => #texts ),* }.to_owned())
+                }
+            }
+            #[automatically_derived]
+            impl ::stakit_orm::FromValue for #name {
+                const KIND: ::stakit_orm::ValueKind = ::stakit_orm::ValueKind::Text;
+                fn from_value(value: ::stakit_orm::Value) -> ::stakit_orm::Result<Self> {
+                    match value {
+                        ::stakit_orm::Value::Text(s) => match s.as_str() {
+                            #( #texts => ::core::result::Result::Ok(Self::#idents), )*
+                            other => ::core::result::Result::Err(::stakit_orm::Error::Decode(
+                                ::std::format!(concat!("invalid ", stringify!(#name), ": {:?}"), other).into(),
+                            )),
+                        },
+                        other => ::core::result::Result::Err(::stakit_orm::Error::Decode(
+                            ::std::format!(concat!("expected text for ", stringify!(#name), ", got {:?}"), other).into(),
+                        )),
+                    }
+                }
+            }
+        }
+    };
+
+    Ok(quote! {
+        #body
+
+        #[automatically_derived]
+        impl ::stakit_orm::expr::IntoExpr<#name> for #name {
+            fn into_operand(self) -> ::stakit_orm::expr::Operand {
+                ::stakit_orm::expr::Operand::Value(<Self as ::stakit_orm::ToValue>::to_value(self))
+            }
+        }
+    })
 }
 
 fn expand_row(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -118,6 +309,7 @@ fn expand_row(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     })
 }
 
+#[allow(clippy::struct_excessive_bools)] // column flags (pk/unique/index/nullable)
 struct ColumnModel {
     field: Ident,
     col_name: String,
@@ -125,6 +317,7 @@ struct ColumnModel {
     sql_type: String,
     is_pk: bool,
     is_unique: bool,
+    is_index: bool,
     is_nullable: bool,
     default: Option<String>,
     references: Option<(Path, String)>,
@@ -331,6 +524,7 @@ fn parse_column(ident: &Ident, field: &syn::Field) -> syn::Result<ColumnModel> {
         sql_type: String::new(),
         is_pk: false,
         is_unique: false,
+        is_index: false,
         is_nullable: unwrap_generic(&field.ty, "Option").is_some(),
         default: None,
         references: None,
@@ -346,6 +540,8 @@ fn parse_column(ident: &Ident, field: &syn::Field) -> syn::Result<ColumnModel> {
                 model.is_pk = true;
             } else if meta.path.is_ident("unique") {
                 model.is_unique = true;
+            } else if meta.path.is_ident("index") {
+                model.is_index = true;
             } else if meta.path.is_ident("nullable") {
                 model.is_nullable = true;
             } else if meta.path.is_ident("name") {
@@ -455,6 +651,7 @@ fn column_literal(column: &ColumnModel) -> proc_macro2::TokenStream {
     let sql_type = &column.sql_type;
     let is_pk = column.is_pk;
     let is_unique = column.is_unique;
+    let is_index = column.is_index;
     let is_nullable = column.is_nullable;
     let default = column.default.as_ref().map_or_else(
         || quote! { ::core::option::Option::None },
@@ -479,6 +676,7 @@ fn column_literal(column: &ColumnModel) -> proc_macro2::TokenStream {
             sql_type: #sql_type,
             is_pk: #is_pk,
             is_unique: #is_unique,
+            is_index: #is_index,
             is_nullable: #is_nullable,
             default: #default,
             references: #references,

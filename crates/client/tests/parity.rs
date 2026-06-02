@@ -297,7 +297,8 @@ async fn unary_app_error_is_action_error() {
     assert!(result.is_error());
     let error = result.error().unwrap();
     assert_eq!(error.code, 500);
-    assert!(error.message.contains("boom"));
+    // internal error text is NOT leaked to the client — it sees a generic message
+    assert_eq!(error.message, "internal server error");
 }
 
 #[tokio::test] // 3

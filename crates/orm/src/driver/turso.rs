@@ -11,7 +11,7 @@ use super::{BoxRow, Driver, Row, RowSink, TxConn};
 use crate::dialect::{Dialect, TursoDialect};
 use crate::error::{Error, Result};
 use crate::sql::BindBuffer;
-use crate::value::{DateTime, NaiveDate, Utc, Uuid, Value, ValueKind};
+use crate::value::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc, Uuid, Value, ValueKind};
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use libsql::{Connection, Value as LibsqlValue};
@@ -162,6 +162,11 @@ impl TxConn for TursoTxConn {
     }
 }
 
+/// Canonical text format for a `NaiveDateTime` stored in `libSQL` (so write and
+/// read agree — `NaiveDateTime`'s `Display` uses a space but its `FromStr` wants a
+/// `T`, which would not round-trip). `%.f` makes fractional seconds optional.
+const NAIVE_DATETIME_FMT: &str = "%Y-%m-%d %H:%M:%S%.f";
+
 /// `libSQL` indexes columns with an `i32`.
 fn column_index(index: usize) -> Result<i32> {
     i32::try_from(index).map_err(|_| Error::Decode("column index out of range".into()))
@@ -224,7 +229,12 @@ fn to_libsql(value: Value) -> Result<LibsqlValue> {
         Value::Bytes(x) => LibsqlValue::Blob(x),
         Value::Uuid(x) => LibsqlValue::Text(x.to_string()),
         Value::Timestamptz(x) => LibsqlValue::Text(x.to_rfc3339()),
+        Value::NaiveDateTime(x) => LibsqlValue::Text(x.format(NAIVE_DATETIME_FMT).to_string()),
         Value::Date(x) => LibsqlValue::Text(x.to_string()),
+        Value::NaiveTime(x) => LibsqlValue::Text(x.to_string()),
+        Value::Json(x) => {
+            LibsqlValue::Text(serde_json::to_string(&x).map_err(|e| Error::Encode(Box::new(e)))?)
+        }
         Value::Array(..) => {
             return Err(Error::Encode("Turso does not support array binds".into()));
         }
@@ -256,14 +266,39 @@ fn cell_to_value(cell: LibsqlValue, kind: ValueKind) -> Result<Value> {
         }
         ValueKind::Timestamptz => {
             let text = as_text(cell)?;
+            // Our own writes use RFC3339; but a `current_timestamp`/DEFAULT yields
+            // SQLite's "YYYY-MM-DD HH:MM:SS" (no offset) — accept that as UTC too.
             DateTime::parse_from_rfc3339(&text)
-                .map(|dt| Value::Timestamptz(dt.with_timezone(&Utc)))
+                .map(|dt| dt.with_timezone(&Utc))
+                .or_else(|_| {
+                    NaiveDateTime::parse_from_str(&text, NAIVE_DATETIME_FMT)
+                        .map(|naive| naive.and_utc())
+                })
+                .map(Value::Timestamptz)
+                .map_err(|error| Error::Decode(Box::new(error)))?
+        }
+        ValueKind::NaiveDateTime => {
+            let text = as_text(cell)?;
+            NaiveDateTime::parse_from_str(&text, NAIVE_DATETIME_FMT)
+                .map(Value::NaiveDateTime)
                 .map_err(|error| Error::Decode(Box::new(error)))?
         }
         ValueKind::Date => {
             let text = as_text(cell)?;
             text.parse::<NaiveDate>()
                 .map(Value::Date)
+                .map_err(|error| Error::Decode(Box::new(error)))?
+        }
+        ValueKind::NaiveTime => {
+            let text = as_text(cell)?;
+            text.parse::<NaiveTime>()
+                .map(Value::NaiveTime)
+                .map_err(|error| Error::Decode(Box::new(error)))?
+        }
+        ValueKind::Json => {
+            let text = as_text(cell)?;
+            serde_json::from_str(&text)
+                .map(Value::Json)
                 .map_err(|error| Error::Decode(Box::new(error)))?
         }
     })

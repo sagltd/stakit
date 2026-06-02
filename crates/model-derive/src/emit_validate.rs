@@ -7,7 +7,7 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{Expr, Ident};
+use syn::{Expr, Generics, Ident};
 
 use crate::ir::{Body, Field, Ir, Rule, Variant};
 
@@ -16,13 +16,17 @@ fn v() -> TokenStream {
     quote!(::stakit_model::validate)
 }
 
-pub(crate) fn expand(ident: &Ident, ir: &Ir) -> TokenStream {
+pub(crate) fn expand(ident: &Ident, ir: &Ir, generics: &Generics) -> TokenStream {
     let body = match ir {
         Ir::Struct { body } => struct_body(body),
         Ir::Enum { variants } => enum_body(variants),
     };
+    // No bound added to type params: the body only touches `#[validate]`-rule'd
+    // fields (a `dive`d generic field would need `T: Validate`, added by hand).
+    // This keeps `Message<String>` / `Message<u32>` working (scalars aren't `Validate`).
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     quote! {
-        impl ::stakit_model::Validate for #ident {
+        impl #impl_generics ::stakit_model::Validate for #ident #ty_generics #where_clause {
             fn validate(&self) -> ::core::result::Result<(), ::stakit_model::ValidationErrors> {
                 let mut __errors = ::stakit_model::ValidationErrors::new();
                 #body

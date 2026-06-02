@@ -126,11 +126,22 @@ impl Db {
 
     /// Connect to a `SQLite` `url` (e.g. `sqlite::memory:` or `sqlite://file.db`).
     ///
+    /// Enables `PRAGMA foreign_keys = ON` on **every** pooled connection, so
+    /// `ON DELETE CASCADE` (and all FK enforcement) actually works — `SQLite` leaves
+    /// it off per-connection by default. (If you build your own pool and pass it to
+    /// [`Db::sqlite`], enable it yourself via `SqliteConnectOptions::foreign_keys`.)
+    ///
     /// # Errors
-    /// Returns an error if the connection cannot be established.
+    /// Returns an error if the URL is invalid or the connection cannot be established.
     #[cfg(feature = "sqlite")]
     pub async fn connect_sqlite(url: &str) -> Result<Self> {
-        Ok(Self::sqlite(sqlx::SqlitePool::connect(url).await?))
+        use std::str::FromStr as _;
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(url)
+            .map_err(Error::Database)?
+            .foreign_keys(true);
+        Ok(Self::sqlite(
+            sqlx::sqlite::SqlitePool::connect_with(options).await?,
+        ))
     }
 
     /// Wrap an existing sqlx `MySQL` pool.
@@ -168,6 +179,7 @@ impl Db {
             .await
             .map_err(Error::Turso)?;
         let connection = database.connect().map_err(Error::Turso)?;
+        enable_libsql_foreign_keys(&connection).await?;
         Ok(Self::turso(connection))
     }
 
@@ -182,6 +194,7 @@ impl Db {
             .await
             .map_err(Error::Turso)?;
         let connection = database.connect().map_err(Error::Turso)?;
+        enable_libsql_foreign_keys(&connection).await?;
         Ok(Self::turso(connection))
     }
 
@@ -515,6 +528,17 @@ impl Tx {
     pub fn raw(&self, sql: impl Into<String>) -> Raw {
         Raw::new(self.exec.clone(), sql)
     }
+}
+
+/// Turn on `libSQL` FK enforcement on a fresh connection (off by default, like
+/// `SQLite`), so `ON DELETE CASCADE` works.
+#[cfg(feature = "turso")]
+async fn enable_libsql_foreign_keys(connection: &libsql::Connection) -> Result<()> {
+    connection
+        .execute("PRAGMA foreign_keys = ON", ())
+        .await
+        .map_err(Error::Turso)?;
+    Ok(())
 }
 
 /// Build the `WHERE <pk> = $1` predicate for `T::get`. Falls back to the

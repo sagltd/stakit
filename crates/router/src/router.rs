@@ -203,22 +203,19 @@ where
             req,
             client: ClientHandle::default(),
         };
-        let dispatched = handler.dispatch(&cx, params);
-        match dispatched {
-            Err(error) => yield Frame::error(index, action, error),
-            Ok(mut items) => {
-                while let Some(item) = items.next().await {
-                    match item {
-                        Ok(value) => yield Frame::next(index, action.clone(), value),
-                        Err(error) => {
-                            yield Frame::error(index, action, error);
-                            return;
-                        }
-                    }
+        // `dispatch` runs the action's `before` guard + deserialize + validate
+        // inside the stream; any of those failing surfaces as one `Err` item.
+        let mut items = handler.dispatch(&cx, params);
+        while let Some(item) = items.next().await {
+            match item {
+                Ok(value) => yield Frame::next(index, action.clone(), value),
+                Err(error) => {
+                    yield Frame::error(index, action, error);
+                    return;
                 }
-                yield Frame::end(index, action);
             }
         }
+        yield Frame::end(index, action);
     }
 }
 
@@ -295,10 +292,14 @@ where
     /// and included in the generated TypeScript.
     #[must_use]
     pub fn client_action<C: ClientAction>(mut self) -> Self {
+        let mut decls = std::collections::BTreeMap::new();
+        <C::Params as TSType>::ts_declarations(&mut decls);
+        <C::Return as TSType>::ts_declarations(&mut decls);
         self.client_actions.push(ClientMeta {
             name: C::NAME,
-            params_ts: <C::Params as TSType>::to_ts(),
-            return_ts: <C::Return as TSType>::to_ts(),
+            params_ref: <C::Params as TSType>::ts_ref(),
+            return_ref: <C::Return as TSType>::ts_ref(),
+            decls,
         });
         self
     }

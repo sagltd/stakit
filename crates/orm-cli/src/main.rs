@@ -4,9 +4,15 @@
 //! `stakit-orm` migration CLI.
 //!
 //! `stakit-orm gen <name> [--schema <path>] [--migrations <dir>]` diffs the
-//! `#[derive(Table)]` structs in the schema file against the snapshot in the
-//! migrations directory and writes a reversible sqlx migration (`.up.sql` +
-//! `.down.sql`), prompting for replace-vs-add when a change is ambiguous.
+//! `#[derive(Table)]` structs reachable from the schema entry file against the
+//! snapshot in the migrations directory and writes a reversible sqlx migration
+//! (`.up.sql` + `.down.sql`), prompting for replace-vs-add when a change is
+//! ambiguous.
+//!
+//! The schema may be split across modules: starting at `--schema` (default
+//! `src/schema.rs`), the parser follows `mod name;` to its file
+//! (`schema/name.rs` or `schema/name/mod.rs`, honoring `#[path = "..."]`) and
+//! recurses inline `mod name { ... }` blocks, so every table the schema uses is read.
 
 mod diff;
 mod migrate;
@@ -130,9 +136,9 @@ fn cmd_gen(args: &[String]) -> i32 {
 }
 
 fn run_gen(options: &Options) -> Result<String, String> {
-    let source = std::fs::read_to_string(&options.schema)
-        .map_err(|error| format!("read {}: {error}", options.schema.display()))?;
-    let new_schema = parse::parse_schema(&source)?;
+    // Follows `mod` declarations from the entry file across the module tree, so a
+    // schema split over many files is read in full.
+    let new_schema = parse::parse_schema_path(&options.schema)?;
     let snapshot_path = options.migrations.join(".snapshot.json");
     let old_schema = load_snapshot(&snapshot_path)?;
 

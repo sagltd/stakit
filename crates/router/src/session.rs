@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use futures::StreamExt as _;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::client::ClientHandle;
 use crate::reply::ErrorBody;
@@ -19,6 +19,12 @@ use crate::{Cx, Error, Router};
 /// to action execution when a client drains its socket slowly.
 const OUTGOING_BUFFER: usize = 1024;
 
+/// Max concurrently-running actions per connection. A hostile peer can't spawn
+/// unbounded tasks by flooding `call` frames — excess calls are rejected (`429`)
+/// immediately rather than queued, so a suspended `client_call` can't deadlock
+/// the resume path. Generous: one connection rarely runs this many at once.
+const MAX_INFLIGHT_CALLS: usize = 512;
+
 /// A live duplex session over one connection.
 pub struct Session<G, R> {
     router: Arc<Router<G, R>>,
@@ -26,6 +32,7 @@ pub struct Session<G, R> {
     client: ClientHandle,
     out_tx: mpsc::Sender<Value>,
     out_rx: Option<mpsc::Receiver<Value>>,
+    inflight: Arc<Semaphore>,
 }
 
 impl<G, R> Session<G, R>
@@ -42,6 +49,7 @@ where
             client,
             out_tx,
             out_rx: Some(out_rx),
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CALLS)),
         }
     }
 
@@ -77,6 +85,17 @@ where
             .to_owned();
         let params = frame.get("params").cloned().unwrap_or(Value::Null);
 
+        // Bound concurrent actions per connection; reject (not queue) when full
+        // so a hostile peer can't spawn unbounded tasks and a suspended
+        // `client_call` can't deadlock waiting on a permit.
+        let Ok(permit) = Arc::clone(&self.inflight).try_acquire_owned() else {
+            let _ = self.out_tx.try_send(result_frame(
+                id,
+                Err(Error::new(429, "too many in-flight requests")),
+            ));
+            return;
+        };
+
         let action = self.router.actions.get(name.as_str()).cloned();
         let stream = self.router.streams.get(name.as_str()).cloned();
         let app = Arc::clone(&self.router.app);
@@ -85,27 +104,22 @@ where
         let tx = self.out_tx.clone();
 
         tokio::spawn(async move {
+            let _permit = permit; // released when this action's task ends
             let cx = Cx { app, req, client };
             if let Some(action) = action {
                 let result = action.dispatch(&cx, params).await;
                 let _ = tx.send(result_frame(id, result)).await;
             } else if let Some(stream) = stream {
-                match stream.dispatch(&cx, params) {
-                    Err(error) => {
-                        let _ = tx.send(result_frame(id, Err(error))).await;
-                    }
-                    Ok(mut items) => {
-                        while let Some(item) = items.next().await {
-                            let is_err = item.is_err();
-                            // Bounded send: applies backpressure to a slow client;
-                            // errors only once the receiver (socket) is gone.
-                            if tx.send(result_frame(id, item)).await.is_err() || is_err {
-                                return;
-                            }
-                        }
-                        let _ = tx.send(json!({ "kind": "end", "id": id })).await;
+                let mut items = stream.dispatch(&cx, params);
+                while let Some(item) = items.next().await {
+                    let is_err = item.is_err();
+                    // Bounded send: applies backpressure to a slow client;
+                    // errors only once the receiver (socket) is gone.
+                    if tx.send(result_frame(id, item)).await.is_err() || is_err {
+                        return;
                     }
                 }
+                let _ = tx.send(json!({ "kind": "end", "id": id })).await;
             } else {
                 let _ = tx
                     .send(result_frame(id, Err(Error::not_found(&name))))

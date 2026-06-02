@@ -11,6 +11,10 @@ use crate::client::{Client, encode_query};
 use crate::options::CallOpts;
 use crate::result::ActionResult;
 
+/// Largest a single (newline-terminated) stream frame may grow to before the
+/// client gives up — bounds memory against a server that never sends `\n`.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 /// Wire shape of one stream frame (see `docs/transport.md`).
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -83,6 +87,11 @@ impl Client {
             while let Some(chunk) = byte_stream.next().await {
                 let Ok(chunk) = chunk else { break };
                 buf.extend_from_slice(&chunk);
+                // Guard against a server that never emits a newline (unbounded
+                // memory): a single frame over the cap aborts the stream.
+                if buf.len() > MAX_FRAME_BYTES {
+                    break;
+                }
                 while let Some(newline) = buf.iter().position(|byte| *byte == b'\n') {
                     let line: Vec<u8> = buf.drain(..=newline).collect();
                     let line = &line[..line.len() - 1];

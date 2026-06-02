@@ -101,7 +101,9 @@ value_into_expr!(
     Vec<u8>,
     sqlx::types::Uuid,
     sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>,
+    sqlx::types::chrono::NaiveDateTime,
     sqlx::types::chrono::NaiveDate,
+    sqlx::types::chrono::NaiveTime,
 );
 
 /// Ergonomic string literals against `text` columns.

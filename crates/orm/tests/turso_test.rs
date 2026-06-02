@@ -367,3 +367,143 @@ async fn turso_relations() {
     assert_eq!(with_author[0].1.as_ref().unwrap().name, "Ann");
     assert_eq!(with_author[2].1.as_ref().unwrap().name, "Bo");
 }
+
+#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    A,
+    B,
+}
+
+#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[db_enum(int)]
+enum Rank {
+    Low = 1,
+    High = 9,
+}
+
+#[derive(Table, Debug, PartialEq)]
+#[table(name = "things")]
+struct Thing {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    kind: Kind,
+    #[column(sql_type = "int")]
+    rank: Rank,
+    at: chrono::DateTime<chrono::Utc>,
+    day: chrono::NaiveDate,
+    alarm: chrono::NaiveTime,
+    local: chrono::NaiveDateTime,
+    #[column(sql_type = "text")]
+    meta: serde_json::Value,
+}
+
+/// Enums (string + int), all chrono temporal types, and JSON on the non-sqlx
+/// libSQL backend (stored as TEXT/INTEGER and round-tripped).
+#[tokio::test]
+async fn turso_enums_temporal_json() {
+    use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
+    let db = Db::connect_turso_local(":memory:").await.expect("open");
+    db.raw("create table things (id integer primary key, kind text not null, rank integer not null, at text not null, day text not null, alarm text not null, local text not null, meta text not null)")
+        .exec()
+        .await
+        .unwrap();
+
+    let at = Utc.with_ymd_and_hms(2026, 6, 2, 8, 30, 0).unwrap();
+    let day = NaiveDate::from_ymd_opt(1990, 1, 15).unwrap();
+    let alarm = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+    let local = day.and_hms_opt(8, 30, 0).unwrap();
+    let meta = serde_json::json!({ "k": [1, 2, 3] });
+
+    db.insert(ThingNew {
+        id: 1,
+        kind: Kind::B,
+        rank: Rank::High,
+        at,
+        day,
+        alarm,
+        local,
+        meta: meta.clone(),
+    })
+    .exec()
+    .await
+    .unwrap();
+
+    let got = db.get::<Thing>(1).one().await.unwrap().unwrap();
+    assert_eq!(got.kind, Kind::B);
+    assert_eq!(got.rank, Rank::High);
+    assert_eq!(got.at, at);
+    assert_eq!(got.day, day);
+    assert_eq!(got.alarm, alarm);
+    assert_eq!(got.local, local);
+    assert_eq!(got.meta, meta);
+
+    // filter on enum columns
+    let highs = db
+        .find::<Thing>()
+        .filter(eq(Thing::rank, Rank::High))
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(highs.len(), 1);
+}
+
+#[derive(Table, Debug)]
+#[table(name = "tt_owners")]
+#[allow(dead_code)]
+struct TtOwner {
+    #[column(pk)]
+    id: i64,
+    name: String,
+}
+
+#[derive(Table, Debug)]
+#[table(name = "tt_devices")]
+#[allow(dead_code)]
+struct TtDevice {
+    #[column(pk)]
+    id: i64,
+    #[column(references = TtOwner::id, on_delete = "cascade")]
+    owner_id: i64,
+}
+
+/// FK ON DELETE CASCADE on `libSQL` — proves `connect_turso_local` enables FK
+/// enforcement (off by default), so deleting an owner removes its devices.
+#[tokio::test]
+async fn turso_foreign_key_cascade() {
+    let db = Db::connect_turso_local(":memory:").await.expect("open");
+    db.raw("create table tt_owners (id integer primary key, name text not null)")
+        .exec()
+        .await
+        .unwrap();
+    db.raw("create table tt_devices (id integer primary key, owner_id integer not null references tt_owners(id) on delete cascade)")
+        .exec()
+        .await
+        .unwrap();
+    db.insert(TtOwnerNew {
+        id: 1,
+        name: "Ann".into(),
+    })
+    .exec()
+    .await
+    .unwrap();
+    db.insert_many(vec![
+        TtDeviceNew { id: 1, owner_id: 1 },
+        TtDeviceNew { id: 2, owner_id: 1 },
+    ])
+    .exec()
+    .await
+    .unwrap();
+    assert_eq!(db.find::<TtDevice>().count().await.unwrap(), 2);
+
+    db.delete::<TtOwner>()
+        .filter(eq(TtOwner::id, 1))
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(
+        db.find::<TtDevice>().count().await.unwrap(),
+        0,
+        "cascade must delete devices when owner is deleted"
+    );
+}

@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 
 /// Re-exported scalar types so callers/drivers share one definition.
 pub use sqlx::types::Uuid;
-pub use sqlx::types::chrono::{DateTime, NaiveDate, Utc};
+pub use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 
 /// A backend-neutral, owned SQL value (bind input or decoded cell).
 #[derive(Debug, Clone, PartialEq)]
@@ -35,10 +35,16 @@ pub enum Value {
     Bytes(Vec<u8>),
     /// `uuid`.
     Uuid(Uuid),
-    /// `timestamptz`.
+    /// `timestamptz` — an absolute instant ([`DateTime<Utc>`]).
     Timestamptz(DateTime<Utc>),
-    /// `date`.
+    /// `timestamp` (no time zone) — a naive wall-clock datetime.
+    NaiveDateTime(NaiveDateTime),
+    /// `date` — a calendar date.
     Date(NaiveDate),
+    /// `time` — a wall-clock time of day.
+    NaiveTime(NaiveTime),
+    /// `json`/`jsonb` — an arbitrary JSON document.
+    Json(serde_json::Value),
     /// A homogeneous array of scalar values (for `= ANY($1)` / `IN`), carrying
     /// the element kind so an empty array still binds with a concrete type.
     Array(ValueKind, Vec<Self>),
@@ -66,10 +72,16 @@ pub enum ValueKind {
     Bytes,
     /// `uuid`.
     Uuid,
-    /// `timestamptz`.
+    /// `timestamptz` (absolute instant).
     Timestamptz,
+    /// `timestamp` without time zone (naive datetime).
+    NaiveDateTime,
     /// `date`.
     Date,
+    /// `time` of day.
+    NaiveTime,
+    /// `json`/`jsonb`.
+    Json,
 }
 
 fn mismatch(expected: &str, got: &Value) -> Error {
@@ -123,7 +135,10 @@ scalar_value!(String, Text, Text, "text");
 scalar_value!(Vec<u8>, Bytes, Bytes, "bytes");
 scalar_value!(Uuid, Uuid, Uuid, "uuid");
 scalar_value!(DateTime<Utc>, Timestamptz, Timestamptz, "timestamptz");
+scalar_value!(NaiveDateTime, NaiveDateTime, NaiveDateTime, "timestamp");
 scalar_value!(NaiveDate, Date, Date, "date");
+scalar_value!(NaiveTime, NaiveTime, NaiveTime, "time");
+scalar_value!(serde_json::Value, Json, Json, "json");
 
 impl ToValue for &str {
     fn to_value(self) -> Value {

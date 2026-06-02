@@ -42,6 +42,7 @@ pub struct ForeignKey {
 
 /// Static metadata for one column, emitted by `#[derive(Table)]`.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // column flags (pk/unique/index/nullable)
 pub struct Column {
     /// SQL column name.
     pub name: &'static str,
@@ -52,6 +53,8 @@ pub struct Column {
     pub is_pk: bool,
     /// Whether a `UNIQUE` constraint applies.
     pub is_unique: bool,
+    /// Whether a (non-unique) secondary index should be created on this column.
+    pub is_index: bool,
     /// Whether the column is nullable.
     pub is_nullable: bool,
     /// Verbatim SQL `DEFAULT` expression, if any.

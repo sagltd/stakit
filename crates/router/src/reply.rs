@@ -39,7 +39,7 @@ impl From<Error> for ErrorBody {
         Self {
             code: error.code,
             message: error.message,
-            fields: error.fields,
+            fields: error.fields.map(|fields| *fields),
         }
     }
 }
@@ -137,7 +137,7 @@ impl Reply {
             error: ErrorBody {
                 code: error.code,
                 message: error.message,
-                fields: error.fields,
+                fields: error.fields.map(|fields| *fields),
             },
         }
     }

@@ -21,7 +21,6 @@
 use std::future::Future;
 
 use futures::Stream;
-use futures::StreamExt as _;
 
 use crate::{Action, Cx, Error, StreamAction};
 
@@ -84,21 +83,30 @@ where
 {
     type Input = A::Input;
     type Output = A::Output;
-    type Error = Error;
+    type Error = A::Error;
 
     fn name(&self) -> &'static str {
         self.action.name()
     }
 
-    async fn run<'a>(
+    // The guard rides the `before`/`after` hooks (which the router runs *before*
+    // deserialize/validate), so a rejected caller never reaches parsing/the body.
+    async fn before<'a>(&'a self, cx: &'a Cx<G, R>) -> Result<(), Error> {
+        self.action.before(cx).await?;
+        self.mw.before(cx).await
+    }
+
+    async fn after<'a>(&'a self, cx: &'a Cx<G, R>) {
+        self.mw.after(cx).await;
+        self.action.after(cx).await;
+    }
+
+    fn run<'a>(
         &'a self,
         cx: &'a Cx<G, R>,
         input: Self::Input,
-    ) -> Result<Self::Output, Self::Error> {
-        self.mw.before(cx).await?;
-        let result = self.action.run(cx, input).await.map_err(Into::into);
-        self.mw.after(cx).await;
-        result
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send + 'a {
+        self.action.run(cx, input)
     }
 }
 
@@ -118,10 +126,20 @@ where
 {
     type Input = A::Input;
     type Item = A::Item;
-    type Error = Error;
+    type Error = A::Error;
 
     fn name(&self) -> &'static str {
         self.action.name()
+    }
+
+    async fn before<'a>(&'a self, cx: &'a Cx<G, R>) -> Result<(), Error> {
+        self.action.before(cx).await?;
+        self.mw.before(cx).await
+    }
+
+    async fn after<'a>(&'a self, cx: &'a Cx<G, R>) {
+        self.mw.after(cx).await;
+        self.action.after(cx).await;
     }
 
     fn run<'a>(
@@ -129,18 +147,6 @@ where
         cx: &'a Cx<G, R>,
         input: Self::Input,
     ) -> impl Stream<Item = Result<Self::Item, Self::Error>> + Send + 'a {
-        async_stream::stream! {
-            // guard runs once before the stream starts
-            if let Err(error) = self.mw.before(cx).await {
-                yield Err(error);
-                return;
-            }
-            let mut items = std::pin::pin!(self.action.run(cx, input));
-            while let Some(item) = items.next().await {
-                yield item.map_err(Into::into);
-            }
-            // runs once after the whole stream finishes (not per item)
-            self.mw.after(cx).await;
-        }
+        self.action.run(cx, input)
     }
 }

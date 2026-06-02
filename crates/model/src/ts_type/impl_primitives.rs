@@ -4,7 +4,7 @@ use crate::TSType;
 
 /// The unit type maps to TypeScript `null` (used for param-less actions).
 impl TSType for () {
-    fn to_ts() -> String {
+    fn ts_ref() -> String {
         String::from("null")
     }
 }
@@ -13,7 +13,7 @@ macro_rules! ts_scalar {
     ($($t:ty => $name:literal),* $(,)?) => {
         $(
             impl TSType for $t {
-                fn to_ts() -> String {
+                fn ts_ref() -> String {
                     String::from($name)
                 }
             }

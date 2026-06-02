@@ -5,7 +5,7 @@ use super::{BoxRow, Driver, Row, RowSink, TxConn};
 use crate::dialect::{Dialect, PostgresDialect};
 use crate::error::{Error, Result};
 use crate::sql::BindBuffer;
-use crate::value::{DateTime, NaiveDate, Utc, Uuid, Value, ValueKind};
+use crate::value::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc, Uuid, Value, ValueKind};
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use sqlx::postgres::{PgArguments, PgRow};
@@ -36,7 +36,12 @@ impl Row for PgRow {
             ValueKind::Timestamptz => {
                 read!(self, index, kind, DateTime<Utc>, Value::Timestamptz)
             }
+            ValueKind::NaiveDateTime => {
+                read!(self, index, kind, NaiveDateTime, Value::NaiveDateTime)
+            }
             ValueKind::Date => read!(self, index, kind, NaiveDate, Value::Date),
+            ValueKind::NaiveTime => read!(self, index, kind, NaiveTime, Value::NaiveTime),
+            ValueKind::Json => read!(self, index, kind, serde_json::Value, Value::Json),
         }
     }
 
@@ -195,7 +200,10 @@ fn bind_scalar(args: &mut PgArguments, value: Value) -> Result<()> {
         Value::Bytes(x) => args.add(x),
         Value::Uuid(x) => args.add(x),
         Value::Timestamptz(x) => args.add(x),
+        Value::NaiveDateTime(x) => args.add(x),
         Value::Date(x) => args.add(x),
+        Value::NaiveTime(x) => args.add(x),
+        Value::Json(x) => args.add(x),
         Value::Array(kind, values) => return bind_array(args, kind, values),
     };
     result.map_err(Error::Encode)
@@ -213,7 +221,10 @@ fn bind_null(args: &mut PgArguments, kind: ValueKind) -> Result<()> {
         ValueKind::Bytes => args.add(None::<Vec<u8>>),
         ValueKind::Uuid => args.add(None::<Uuid>),
         ValueKind::Timestamptz => args.add(None::<DateTime<Utc>>),
+        ValueKind::NaiveDateTime => args.add(None::<NaiveDateTime>),
         ValueKind::Date => args.add(None::<NaiveDate>),
+        ValueKind::NaiveTime => args.add(None::<NaiveTime>),
+        ValueKind::Json => args.add(None::<serde_json::Value>),
     };
     result.map_err(Error::Encode)
 }
@@ -244,7 +255,12 @@ fn bind_array(args: &mut PgArguments, kind: ValueKind, values: Vec<Value>) -> Re
         ValueKind::Bytes => collect_add!(Bytes),
         ValueKind::Uuid => collect_add!(Uuid),
         ValueKind::Timestamptz => collect_add!(Timestamptz),
+        ValueKind::NaiveDateTime => collect_add!(NaiveDateTime),
         ValueKind::Date => collect_add!(Date),
+        ValueKind::NaiveTime => collect_add!(NaiveTime),
+        ValueKind::Json => {
+            return Err(Error::Encode("json array binds are not supported".into()));
+        }
     };
     result.map_err(Error::Encode)
 }

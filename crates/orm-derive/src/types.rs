@@ -59,7 +59,9 @@ pub(crate) fn sql_type(ty: &Type) -> Option<&'static str> {
         "String" | "str" => "text",
         "Uuid" => "uuid",
         "DateTime" => "timestamptz",
+        "NaiveDateTime" => "timestamp",
         "NaiveDate" => "date",
+        "NaiveTime" => "time",
         "Value" => "jsonb",
         _ => return None,
     };

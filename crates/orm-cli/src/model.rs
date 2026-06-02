@@ -18,6 +18,7 @@ pub struct ForeignKey {
 
 /// One column.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // column flags (pk/unique/index/nullable)
 pub struct Column {
     /// Column name.
     pub name: String,
@@ -29,6 +30,9 @@ pub struct Column {
     pub pk: bool,
     /// Whether unique.
     pub unique: bool,
+    /// Whether a (non-unique) secondary index should be created on this column.
+    #[serde(default)]
+    pub index: bool,
     /// SQL `DEFAULT` expression, if any.
     pub default: Option<String>,
     /// Foreign-key reference, if any.
