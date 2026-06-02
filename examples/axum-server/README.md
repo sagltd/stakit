@@ -20,7 +20,7 @@ curl -s localhost:3007/rpc/greet -H 'content-type: application/json' -H 'x-admin
 
 # validation error (422)
 curl -s localhost:3007/rpc/greet -H 'content-type: application/json' -d '{"name":""}'
-# -> {"status":"error","error":{"code":422,"message":"validation failed","fields":{"name":[...]}}}
+# -> {"status":"error","error":{"code":422,"type":"validation","message":"validation failed","fields":{"name":[...]}}}
 
 # unknown action (404)
 curl -s localhost:3007/rpc/nope -H 'content-type: application/json' -d 'null'

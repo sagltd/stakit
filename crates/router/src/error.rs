@@ -16,9 +16,9 @@ use stakit_model::ValidationErrors;
 pub struct Error {
     /// Numeric status code (HTTP-aligned: 404, 400, 422, 500…).
     pub code: u16,
-    /// Stable, machine-readable error code (e.g. `"NOT_FOUND"`,
-    /// `"INVALID_CREDENTIALS"`). Serialized on the wire as `type`; defaults to
-    /// `"ERROR"`. Lets clients branch on a code instead of parsing `message`.
+    /// Stable, machine-readable error code (e.g. `"not_found"`,
+    /// `"invalid_credentials"`). Serialized on the wire as `type`; defaults to
+    /// `"error"`. Lets clients branch on a code instead of parsing `message`.
     pub kind: Cow<'static, str>,
     /// Client-facing message (safe to send over the wire).
     pub message: String,
@@ -158,11 +158,13 @@ impl fmt::Display for Error {
 /// ```ignore
 /// #[derive(Debug, thiserror::Error, stakit_router::ResponseError)]
 /// pub enum ActionError {
+///     // `code` defaults to the variant name in `snake_case` -> "user_not_found".
 ///     #[status(404)]
 ///     #[error("user not found")]
 ///     UserNotFound,
 ///
-///     #[status(401)] #[code("INVALID_CREDENTIALS")]
+///     // override the default code with `#[code("...")]`.
+///     #[status(401)] #[code("login_failed")]
 ///     #[error("invalid credentials")]
 ///     InvalidCredentials,
 ///
@@ -176,12 +178,13 @@ impl fmt::Display for Error {
 ///
 /// Any `ResponseError` is `Into<Error>`, so the router converts it
 /// automatically — preserving the declared status instead of collapsing every
-/// error to 500.
+/// error to 500. The set of codes is collected into the generated TypeScript
+/// `ErrorCode` union (see [`ErrorCodes`]).
 pub trait ResponseError: fmt::Display {
     /// HTTP-aligned status code for this error (404, 401, 422, 500…).
     fn status(&self) -> u16;
 
-    /// Stable, machine-readable code (e.g. `"NOT_FOUND"`). Defaults to `"ERROR"`.
+    /// Stable, machine-readable code (e.g. `"not_found"`). Defaults to `"error"`.
     fn code(&self) -> Cow<'static, str> {
         Cow::Borrowed("error")
     }

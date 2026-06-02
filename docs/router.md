@@ -59,7 +59,8 @@ async fn on_request(&self, req: R, action: &str, params: Value) -> Reply;       
 fn on_stream(&self, req: R, action: &str, params: Value) -> impl Stream<Item = Frame>; // SSE
 fn on_ws(&self, req: R) -> Session;                                                  // duplex + client_call
 ```
-`Reply = { status: "ok", data: Value } | { status: "error", error: { code, message, fields? } }`.
+`Reply = { status: "ok", data: Value } | { status: "error", error: { code, type?, message, fields? } }`
+(`type` is the machine-readable code, omitted when the default `"error"`).
 
 Dispatch: `Value → Input` (serde) → `Input.validate()` (stakit-model) → run →
 `Output → Value`. Validation failure → `Reply::error` with `field_errors()`.
@@ -90,11 +91,21 @@ WS/duplex framing is neutral and bridged by the user.
 
 ## Errors
 
-Actions return **their own** error type — anything `Into<Error>`. Any
-`std::error::Error` becomes a 500 via `?`; `err!(code, msg)` / `Error::new` set
-explicit codes. The wire envelope is uniform: `Reply = { status, data } |
-{ status, error: { code, message, fields? } }`. (`Error` deliberately does *not*
-implement `std::error::Error`, so the blanket `From` has no reflexive conflict.)
+Actions return **their own** error type — anything `Into<Error> + ErrorCodes`.
+The idiomatic path is `#[derive(ResponseError)]` alongside `thiserror::Error`:
+each variant declares `#[status(n)]`, an optional `#[code("...")]` (defaults to
+the variant name in `snake_case`), and an optional `#[message("...")]`. Foreign
+errors fold in via thiserror's `#[from]`, so `?` just works; `5xx` messages are
+genericized for the client with the real text kept in `Error::detail` (logged,
+never leaked). `err!(code, msg)` / `Error::new` / `Error::coded` build one ad hoc.
+
+The conversion is `impl<E: ResponseError> From<E> for Error` — bounded on *our*
+trait, not `std::error::Error`, so it preserves each error's status (no blanket
+500) and never conflicts with user-written `From` impls. The wire envelope is
+uniform: `Reply = { status, data } | { status, error: { code, type?, message,
+fields? } }`. TypeScript generation emits an `ErrorCode` string union (every
+action's codes + built-ins), a typed `ResponseError`, and an `isValidationError`
+guard.
 
 ## Build phasing
 

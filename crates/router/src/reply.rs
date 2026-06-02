@@ -83,6 +83,19 @@ impl ErrorBody {
         }
         Value::Object(object)
     }
+
+    /// The machine-readable error code (the wire `type`), e.g. `"not_found"`.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Whether this is a validation error — the Rust mirror of the generated
+    /// TypeScript `isValidationError` guard.
+    #[must_use]
+    pub fn is_validation(&self) -> bool {
+        self.kind == "validation"
+    }
 }
 
 /// One frame of a streaming response.

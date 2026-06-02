@@ -159,7 +159,9 @@ pub async fn save_image(cx: &Cx<App, Req>, params: SaveImage) -> Result<Saved, E
         return Err(Error::new(400, "no image in request body"));
     }
     let path = format!("/tmp/stakit-upload-{}", params.file_name);
-    std::fs::write(&path, &cx.req.image)?; // io::Error -> Error (500) via `?`
+    // A foreign std error no longer auto-converts; map it explicitly. `internal`
+    // -> 500 with a generic client message, real text kept in `detail` (logged).
+    std::fs::write(&path, &cx.req.image).map_err(Error::internal)?;
     Ok(Saved {
         bytes: cx.req.image.len() as u64,
         path,
