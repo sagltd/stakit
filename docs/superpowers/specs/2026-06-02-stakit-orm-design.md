@@ -532,12 +532,16 @@ fn select_builds_sql() {
 }
 ```
 
-### Layer 2 — integration against a real ephemeral pg
+### Layer 2 — integration tests against a real embedded pg
 
-Decode, FK cascade, `COPY`, transaction rollback, upsert cannot be faked — they
-need a real Postgres. **SQLite in-memory is rejected**: dialect differs hard
-(`uuid`, `gen_random_uuid()`, `timestamptz`, `on conflict`, `COPY BINARY`) — it
-would test the wrong SQL.
+Integration tests live in `crates/stakit-orm/tests/` and **always run against a
+real Postgres** via `postgresql_embedded` — no gating, no `#[ignore]`, part of the
+normal `cargo nextest run --workspace`. Decode, FK cascade, `COPY`, transaction
+rollback, and upsert cannot be faked; they must hit real pg.
+
+**SQLite in-memory is rejected**: dialect differs hard (`uuid`,
+`gen_random_uuid()`, `timestamptz`, `on conflict`, `COPY BINARY`) — it would test
+the wrong SQL.
 
 **Chosen: `postgresql_embedded`** (theseus-rs) — downloads + runs a real pg binary
 in a temp dir, no Docker, ephemeral per run. Rationale (crates.io, 2026-06):
@@ -548,13 +552,51 @@ in a temp dir, no Docker, ephemeral per run. Rationale (crates.io, 2026-06):
 | pg-embed | 1.0.0 | ~25k | no | ~40× less used |
 | testcontainers (+modules) | 0.27.3 | ~9.3M | yes | industry standard, but needs Docker |
 
-`postgresql_embedded` wins for a library's default test loop: most-used no-Docker
-option, maintained, real-dialect, and its `forbid(unsafe_code)` matches our
-workspace. `testcontainers` remains an optional CI path where Docker is preferred.
+`postgresql_embedded` wins: most-used no-Docker option, maintained, real-dialect,
+`forbid(unsafe_code)` matches our workspace. (`testcontainers` is an alternative
+where Docker is acceptable, but the default here is no-Docker embedded.)
 
-Layer-2 tests are feature-gated (or `#[ignore]` by default) so the standard
-`cargo nextest run --workspace` stays DB-free and fast; CI runs the gated set.
-Pin newest versions at implementation time (workspace rule: check crates.io).
+**Performance + isolation:** booting a pg server per test is too slow (seconds
+each). Boot **one embedded server per test binary**, shared via a `OnceCell`/
+`static`, then isolate each test. A `tests/common/mod.rs` harness exposes the
+setup:
+
+```rust
+// tests/common/mod.rs — shared embedded server, per-test isolated database
+static PG: OnceCell<PostgreSQL> = OnceCell::const_new();
+
+/// Boot the embedded server once, then hand each test its own fresh database
+/// (migrations applied) so tests are fully isolated and parallel-safe.
+pub async fn test_db() -> Db {
+    let pg = PG.get_or_init(|| async { /* PostgreSQL::default().setup().start() */ }).await;
+    let name = unique_db_name();          // per-test, unique
+    pg.create_database(&name).await;
+    let pool = PgPool::connect(&pg.url(&name)).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();   // apply generated migrations
+    Db::new(pool)
+}
+```
+
+```rust
+// tests/select.rs
+mod common;
+
+#[tokio::test]
+async fn select_one_returns_row() {
+    let db = common::test_db().await;
+    let id: Uuid = db.insert(User { .. }).returning(User::id).one().await.unwrap();
+    let got = db.select(User::all()).from::<User>()
+        .filter(eq(User::id, id)).one().await.unwrap();
+    assert_eq!(got.unwrap().id, id);
+}
+```
+
+Isolation options (decide at impl): **per-test fresh database** (clean, fully
+parallel) or **per-test transaction rolled back at end** (faster, no create/drop).
+Default to per-test database for clarity; revisit if boot/create cost hurts.
+
+First run downloads the pg binary (cached after). Pin newest versions at
+implementation time (workspace rule: check crates.io).
 
 ## 15. Phasing summary
 
