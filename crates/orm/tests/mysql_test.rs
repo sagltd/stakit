@@ -12,7 +12,7 @@
 
 use stakit_orm::prelude::*;
 
-#[derive(Table, Debug, PartialEq, Eq)]
+#[derive(Table, Debug, Clone, PartialEq, Eq)]
 #[table(name = "users")]
 struct User {
     #[column(pk)]
@@ -148,4 +148,82 @@ async fn mysql_migrations_run_out_of_box() {
     }];
     assert_eq!(db.migrate(&migrations).await.expect("migrate"), 1);
     assert_eq!(db.migrate(&migrations).await.expect("again"), 0);
+}
+
+// Dedicated tables (not the shared `users`) so this test is parallel-safe under
+// nextest's default concurrency.
+#[derive(Table, Debug, Clone)]
+#[table(name = "mt_authors")]
+#[allow(dead_code)]
+struct MtAuthor {
+    #[column(pk)]
+    id: i64,
+    name: String,
+}
+
+#[derive(Table, Debug)]
+#[table(name = "mt_posts")]
+#[allow(dead_code)]
+struct MtPost {
+    #[column(pk)]
+    id: i64,
+    author_id: i64,
+    title: String,
+}
+
+#[tokio::test]
+async fn mysql_relations() {
+    let Ok(url) = std::env::var("MYSQL_URL") else {
+        eprintln!("MYSQL_URL not set; skipping MySQL relations e2e");
+        return;
+    };
+    let db = Db::connect_mysql(&url).await.expect("connect");
+    db.raw("drop table if exists mt_posts").exec().await.ok();
+    db.raw("drop table if exists mt_authors").exec().await.ok();
+    db.raw("create table mt_authors (id bigint primary key, name varchar(255) not null)")
+        .exec()
+        .await
+        .expect("authors");
+    db.raw("create table mt_posts (id bigint primary key, author_id bigint not null, title varchar(255) not null)").exec().await.expect("posts");
+    db.insert(MtAuthorNew {
+        id: 1,
+        name: "Ann".to_owned(),
+    })
+    .exec()
+    .await
+    .unwrap();
+    db.insert_many(vec![
+        MtPostNew {
+            id: 1,
+            author_id: 1,
+            title: "p1".to_owned(),
+        },
+        MtPostNew {
+            id: 2,
+            author_id: 1,
+            title: "p2".to_owned(),
+        },
+    ])
+    .exec()
+    .await
+    .unwrap();
+
+    let authors = db.find::<MtAuthor>().all().await.unwrap();
+    let with_posts = db
+        .load_has_many::<MtAuthor, MtPost, i64>(
+            authors,
+            MtPost::author_id,
+            |a| a.id,
+            |p| p.author_id,
+        )
+        .await
+        .expect("has_many");
+    assert_eq!(with_posts[0].1.len(), 2);
+
+    let posts = db.find::<MtPost>().all().await.unwrap();
+    let with_author = db
+        .load_belongs_to::<MtPost, MtAuthor, i64>(posts, |p| p.author_id, MtAuthor::id, |a| a.id)
+        .await
+        .expect("belongs_to");
+    assert_eq!(with_author[0].1.as_ref().unwrap().name, "Ann");
 }

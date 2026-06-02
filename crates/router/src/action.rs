@@ -1,5 +1,8 @@
 //! The [`Action`] trait and its type-erased form.
 
+use std::future::Future;
+
+use futures::Stream;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -25,12 +28,13 @@ pub trait Action<G, R>: Send + Sync + 'static {
     /// The action's stable name (used for routing + TS).
     fn name(&self) -> &'static str;
 
-    /// Runs the action. Input is already validated.
+    /// Runs the action. Input is already validated. Returns a native future
+    /// (no boxing) — the router boxes once at its dynamic-dispatch boundary.
     fn run<'a>(
         &'a self,
         cx: &'a Cx<G, R>,
         input: Self::Input,
-    ) -> BoxFuture<'a, Result<Self::Output, Self::Error>>;
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send + 'a;
 }
 
 /// Object-safe erasure so the router can hold heterogeneous actions by name.
@@ -87,12 +91,13 @@ pub trait StreamAction<G, R>: Send + Sync + 'static {
     /// The action's stable name.
     fn name(&self) -> &'static str;
 
-    /// Produces the item stream. Input is already validated.
+    /// Produces the item stream. Input is already validated. Returns a native
+    /// stream (no boxing) — the router boxes once at its dispatch boundary.
     fn run<'a>(
         &'a self,
         cx: &'a Cx<G, R>,
         input: Self::Input,
-    ) -> BoxStream<'a, Result<Self::Item, Self::Error>>;
+    ) -> impl Stream<Item = Result<Self::Item, Self::Error>> + Send + 'a;
 }
 
 /// Object-safe erasure for streaming actions.

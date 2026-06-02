@@ -88,6 +88,48 @@ let session = router.session(req_ctx);
 See `examples/axum-server` for the full wiring (one `/app` route + `/stream` +
 `/ws`) and the matching Rust + TypeScript clients.
 
+## Middleware (guards)
+
+A `Middleware<G, R>` runs **before** an action (and optionally **after**). If
+`before` returns `Err`, the action body **never runs** and the error is the
+reply. Trait-based, plain `async fn`, no boxing in your code:
+
+```rust
+use stakit_router::{Middleware, Cx, Error, err, ActionExt as _};
+
+struct JwtAuth { secret: Arc<str> }
+
+impl Middleware<App, Req> for JwtAuth {
+    async fn before(&self, cx: &Cx<App, Req>) -> Result<(), Error> {
+        let token = cx.req.bearer.as_deref().ok_or_else(|| err!(401, "no token"))?;
+        let user = verify_jwt(token, &self.secret).await.map_err(|_| err!(401, "bad token"))?;
+        let _ = cx.req.user.set(user);   // inject — the action reads it (OnceLock)
+        Ok(())                            // Err here → action never runs
+    }
+    // `after` is optional (default no-op); runs once after the action completes.
+}
+```
+
+Attach per action with `.middleware(..)` (bring `ActionExt` / `StreamActionExt`
+into scope):
+
+```rust
+let router = Router::builder()
+    .ctx(App { /* … */ })
+    .register(me.middleware(JwtAuth { secret }))           // guarded unary
+    .register(public_ping)                                 // no guard
+    .register_stream(feed.middleware(JwtAuth { secret }))  // guarded stream
+    .build();
+```
+
+Notes:
+- `cx` is shared (`&`), so a guard enriches the request via interior mutability
+  (e.g. `req.user: OnceLock<User>`) — `before` validates the token *and* injects
+  the user; the action just reads `cx.req.user`.
+- The guard runs **after** input deserialize + validation (it's inside the
+  action's `run`); it short-circuits the action body, not the whole pipeline.
+- Works on streaming actions too — `before` runs once before the stream starts.
+
 ## Testing actions — no server needed
 
 This is the point: an action is a plain function over a context. Build a `Cx`

@@ -20,9 +20,8 @@
 
 use std::future::Future;
 
+use futures::Stream;
 use futures::StreamExt as _;
-use futures::future::BoxFuture;
-use futures::stream::BoxStream;
 
 use crate::{Action, Cx, Error, StreamAction};
 
@@ -38,7 +37,13 @@ pub trait Middleware<G, R>: Send + Sync + 'static {
         async { Ok(()) }
     }
 
-    /// Runs after the action completes (skipped if `before` short-circuited).
+    /// Runs after the action completes. Skipped if `before` short-circuited.
+    ///
+    /// Best-effort, not a cleanup guarantee: for a unary action it runs whether
+    /// the action returned `Ok` or `Err`; for a **stream** it runs only after the
+    /// stream finishes *normally* — if the consumer drops the stream early (e.g.
+    /// the client disconnects mid-stream) `after` does not run, because Rust has
+    /// no async drop. Use it for logging/metrics, not for must-run teardown.
     fn after(&self, _cx: &Cx<G, R>) -> impl Future<Output = ()> + Send {
         async {}
     }
@@ -85,20 +90,15 @@ where
         self.action.name()
     }
 
-    // Boxed because `Action::run` returns `BoxFuture` (the router's erasure layer)
-    // — the same single `Box::pin` every action already does; the `Middleware`
-    // trait itself is box-free.
-    fn run<'a>(
+    async fn run<'a>(
         &'a self,
         cx: &'a Cx<G, R>,
         input: Self::Input,
-    ) -> BoxFuture<'a, Result<Self::Output, Self::Error>> {
-        Box::pin(async move {
-            self.mw.before(cx).await?;
-            let result = self.action.run(cx, input).await.map_err(Into::into);
-            self.mw.after(cx).await;
-            result
-        })
+    ) -> Result<Self::Output, Self::Error> {
+        self.mw.before(cx).await?;
+        let result = self.action.run(cx, input).await.map_err(Into::into);
+        self.mw.after(cx).await;
+        result
     }
 }
 
@@ -128,19 +128,19 @@ where
         &'a self,
         cx: &'a Cx<G, R>,
         input: Self::Input,
-    ) -> BoxStream<'a, Result<Self::Item, Self::Error>> {
-        Box::pin(async_stream::stream! {
+    ) -> impl Stream<Item = Result<Self::Item, Self::Error>> + Send + 'a {
+        async_stream::stream! {
             // guard runs once before the stream starts
             if let Err(error) = self.mw.before(cx).await {
                 yield Err(error);
                 return;
             }
-            let mut items = self.action.run(cx, input);
+            let mut items = std::pin::pin!(self.action.run(cx, input));
             while let Some(item) = items.next().await {
                 yield item.map_err(Into::into);
             }
             // runs once after the whole stream finishes (not per item)
             self.mw.after(cx).await;
-        })
+        }
     }
 }

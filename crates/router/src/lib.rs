@@ -42,11 +42,10 @@ pub use stakit_model::{
 // module alias (macro vs module namespace).
 pub use stakit_model::model;
 
-/// Re-exports so `#[action]`-generated code can name the boxed future/stream types.
+/// Re-export so `#[action(stream)]`-generated code can name the `Stream` trait
+/// without the user crate needing a direct `futures` dependency.
 #[doc(hidden)]
-pub use futures::future::BoxFuture;
-#[doc(hidden)]
-pub use futures::stream::BoxStream;
+pub use futures::Stream;
 
 /// The `#[action]` attribute macro.
 pub use stakit_router_derive::action;

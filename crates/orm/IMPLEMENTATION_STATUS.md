@@ -106,11 +106,13 @@ The crate is being made backend-neutral. Phases (build stays green each step):
    and `any_of` → one array bind on Postgres but `IN (?, …)` (empty → `1 = 0`) on
    SQLite/MySQL/Turso. (Per-backend migration type-map is still Postgres-only; CLI
    is Postgres-targeted.)
-5. **E2E per backend** — DONE for in-process backends: embedded Postgres, in-memory
-   SQLite, and in-memory Turso/libSQL each run the *same* builder end-to-end
-   (`tests/{postgres,sqlite,turso}_test.rs`). MySQL has no in-process mode, so
-   `tests/mysql_test.rs` is gated on `MYSQL_URL` (skips when unset; run it against a
-   throwaway MySQL, e.g. a CI service).
+5. **E2E per backend — DONE and verified LIVE on all four.** Embedded Postgres,
+   in-memory SQLite, in-memory Turso/libSQL, and **MySQL run live against a real
+   MariaDB** (`tests/{postgres,sqlite,turso,mysql}_test.rs`) — all 121 tests pass with
+   the *same* builder. MySQL has no in-process mode, so its suite is gated on
+   `MYSQL_URL`; it was verified here by `brew install mariadb`, initializing a throwaway
+   datadir, and running with `MYSQL_URL=mysql://root@127.0.0.1:3310/stakit_test`. The
+   MySQL tests use disjoint tables so they pass under nextest's default parallelism.
 
 ## Review loop — round 1 (4 sub-agents: correctness/DX, safety, perf, tests)
 
@@ -172,8 +174,9 @@ Findings fixed:
   each issue **one** batched `... WHERE fk IN (keys)` query (via `any_of`, which works on
   every driver) then group in memory. Fully typed — `Col<C, K>` forces the FK type to
   match the parent key. This is Drizzle's relational-load pattern (the efficient
-  two-query form, not N+1). E2e verified on `SQLite` and the non-sqlx Turso backend.
-- Gate: 120 tests green (all-features), 0 clippy issues, doctest green.
+  two-query form, not N+1). E2e verified on **Postgres (live, embedded), `SQLite`, and
+  the non-sqlx Turso** backend; gated e2e added for `MySQL`.
+- Gate: 121 tests green (all-features), 0 clippy issues, doctest green.
 
 Genuinely remaining (not quick fixes): the CLI `gen` schema-diff DDL generator is still
 Postgres-specific (the *runtime* migration apply is universal); a typed-decode fast-path

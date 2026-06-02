@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
-#[derive(Table, Debug, PartialEq, Eq)]
+#[derive(Table, Debug, Clone, PartialEq, Eq)]
 #[table(name = "users")]
 struct User {
     #[column(pk)]
@@ -314,6 +314,35 @@ async fn end_to_end_against_real_postgres() {
     assert!(
         dave_missing.is_none(),
         "rolled-back insert must not persist"
+    );
+
+    // Relations on Postgres: has_many (user -> posts) and belongs_to (post -> user),
+    // each one batched IN query. `erin` authored one post (`post_id`) above.
+    let users = db.select(User::all()).from::<User>().all().await.unwrap();
+    let with_posts = db
+        .load_has_many::<User, Post, Uuid>(users, Post::author_id, |u| u.id, |p| p.author_id)
+        .await
+        .expect("has_many");
+    let erin_posts = with_posts
+        .iter()
+        .find(|(u, _)| u.id == erin_id)
+        .map(|(_, posts)| posts.len())
+        .expect("erin present");
+    assert_eq!(erin_posts, 1, "erin should have exactly one post");
+
+    let posts = db.select(Post::all()).from::<Post>().all().await.unwrap();
+    let with_author = db
+        .load_belongs_to::<Post, User, Uuid>(posts, |p| p.author_id, User::id, |u| u.id)
+        .await
+        .expect("belongs_to");
+    let (_, author) = with_author
+        .iter()
+        .find(|(p, _)| p.id == post_id)
+        .expect("post present");
+    assert_eq!(
+        author.as_ref().expect("author resolved").id,
+        erin_id,
+        "post must belong to erin"
     );
 
     postgres.stop().await.ok();

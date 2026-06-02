@@ -92,10 +92,9 @@ fn expand(func: &ItemFn, is_stream: bool) -> syn::Result<proc_macro2::TokenStrea
                     &'a self,
                     #cx_bind: #cx_param_ty,
                     #params_bind: Self::Input,
-                ) -> ::stakit_router::BoxStream<'a, ::core::result::Result<Self::Item, Self::Error>>
-                {
-                    ::std::boxed::Box::pin(#block)
-                }
+                ) -> impl ::stakit_router::Stream<Item = ::core::result::Result<Self::Item, Self::Error>>
+                + ::core::marker::Send + 'a
+                #block
             }
 
             impl ::stakit_router::Endpoint for #name {
@@ -125,14 +124,12 @@ fn expand(func: &ItemFn, is_stream: bool) -> syn::Result<proc_macro2::TokenStrea
 
                 fn name(&self) -> &'static str { #name_str }
 
-                fn run<'a>(
+                async fn run<'a>(
                     &'a self,
                     #cx_bind: #cx_param_ty,
                     #params_bind: Self::Input,
-                ) -> ::stakit_router::BoxFuture<'a, ::core::result::Result<Self::Output, Self::Error>>
-                {
-                    ::std::boxed::Box::pin(async move #block)
-                }
+                ) -> ::core::result::Result<Self::Output, Self::Error>
+                #block
             }
 
             impl ::stakit_router::Endpoint for #name {
