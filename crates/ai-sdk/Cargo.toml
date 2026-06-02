@@ -18,7 +18,7 @@ async-stream.workspace = true
 bytes.workspace = true
 indexmap.workspace = true
 hashbrown = { workspace = true, features = ["serde"] }
-tokio = { workspace = true, features = ["rt", "sync", "time", "fs"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "fs", "macros"] }
 reqwest = { workspace = true, optional = true }
 stakit-model = { workspace = true, features = ["schema"] }
 stakit-ai-sdk-derive.workspace = true
