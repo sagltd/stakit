@@ -511,7 +511,52 @@ match db.insert(user).exec().await {
   function `schema → SQL`; unit-testable with fixtures, no DB.
 - Error mapper — `sqlx::Error` → `Error`. Pure; unit-testable per SQLSTATE.
 
-## 14. Phasing summary
+## 14. Testing strategy
+
+**Postgres has no in-memory mode** (unlike SQLite `:memory:`). Two layers:
+
+### Layer 1 — pure unit tests, no DB (primary)
+
+The builder, `Projection`, migration generator, and error mapper are pure
+functions: `input → SQL string` and `sqlx::Error → Error`. Assert the generated
+SQL + bind params. No DB, no infra, runs in the default `cargo nextest` loop and
+`code-check.sh` everywhere. Covers the bulk of correctness.
+
+```rust
+#[test]
+fn select_builds_sql() {
+    let (sql, _binds) = db.select((User::id, User::email))
+        .from::<User>().filter(eq(User::id, uid)).to_sql();
+    assert_eq!(sql,
+        r#"select "users"."id", "users"."email" from "users" where "users"."id" = $1"#);
+}
+```
+
+### Layer 2 — integration against a real ephemeral pg
+
+Decode, FK cascade, `COPY`, transaction rollback, upsert cannot be faked — they
+need a real Postgres. **SQLite in-memory is rejected**: dialect differs hard
+(`uuid`, `gen_random_uuid()`, `timestamptz`, `on conflict`, `COPY BINARY`) — it
+would test the wrong SQL.
+
+**Chosen: `postgresql_embedded`** (theseus-rs) — downloads + runs a real pg binary
+in a temp dir, no Docker, ephemeral per run. Rationale (crates.io, 2026-06):
+
+| Crate | Latest | Recent dl | Docker | Note |
+|---|---|---|---|---|
+| **postgresql_embedded** | 0.20.2 | ~971k | no | real pg binary on demand, `forbid(unsafe_code)` (matches workspace lint) |
+| pg-embed | 1.0.0 | ~25k | no | ~40× less used |
+| testcontainers (+modules) | 0.27.3 | ~9.3M | yes | industry standard, but needs Docker |
+
+`postgresql_embedded` wins for a library's default test loop: most-used no-Docker
+option, maintained, real-dialect, and its `forbid(unsafe_code)` matches our
+workspace. `testcontainers` remains an optional CI path where Docker is preferred.
+
+Layer-2 tests are feature-gated (or `#[ignore]` by default) so the standard
+`cargo nextest run --workspace` stays DB-free and fast; CI runs the gated set.
+Pin newest versions at implementation time (workspace rule: check crates.io).
+
+## 15. Phasing summary
 
 | Version | Scope |
 |---|---|
@@ -519,7 +564,7 @@ match db.insert(user).exec().await {
 | **v2** | relational API 2 (one-level `.with()`); migration diff alter/drop |
 | **v3** | nested `.with()`; CTEs; subqueries; broader aggregates; possible second backend behind the executor trait |
 
-## 15. Open questions / risks
+## 16. Open questions / risks
 
 - **`row!` field-type checking** happens at decode, not select, for non-`sql!`
   fields (the proc-macro pre-typecheck limitation). Acceptable; derive Row (B)
