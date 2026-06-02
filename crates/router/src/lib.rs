@@ -35,6 +35,10 @@ pub use stakit_model as model;
 pub use stakit_model::{
     Model, TSType, Validate, ValidationError, ValidationErrors, generate_typescript,
 };
+// The `#[model]` attribute macro (and `Model` derive, via the line above), so a
+// `stakit-router` import is enough to declare models. Coexists with the `model`
+// module alias (macro vs module namespace).
+pub use stakit_model::model;
 
 /// Re-exports so `#[action]`-generated code can name the boxed future/stream types.
 #[doc(hidden)]

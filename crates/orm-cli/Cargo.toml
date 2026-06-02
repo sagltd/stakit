@@ -1,0 +1,23 @@
+[package]
+name = "stakit-orm-cli"
+description = "Migration generator for stakit-orm: diff Rust #[derive(Table)] schema against a snapshot and emit sqlx migrations."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "stakit-orm"
+path = "src/main.rs"
+
+[dependencies]
+syn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

@@ -34,7 +34,17 @@ quote = "1.0"
 proc-macro2 = "1.0"
 # Benchmarking
 divan = "0.1"
+# Database (stakit-orm)
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "uuid", "chrono", "json", "macros", "migrate"] }
+smallvec = { version = "1.15.1", features = ["union", "const_generics"] }
+getrandom = "0.4.2"
+tracing = "0.1.44"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+postgresql_embedded = "0.20.2"
 # Internal crates
+stakit-orm = { path = "crates/orm", version = "0.1.0" }
+stakit-orm-derive = { path = "crates/orm-derive", version = "0.1.0" }
 stakit-model = { path = "crates/model", version = "0.1.0" }
 stakit-model-derive = { path = "crates/model-derive", version = "0.1.0" }
 stakit-router = { path = "crates/router", version = "0.1.0" }

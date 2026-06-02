@@ -1,0 +1,20 @@
+[package]
+name = "stakit-orm-derive"
+description = "Derive macros for stakit-orm — `#[derive(Table)]`, `#[derive(Row)]`."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true
+
+[lints]
+workspace = true

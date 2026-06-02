@@ -24,8 +24,10 @@ use axum::routing::{get, post};
 use futures::{SinkExt as _, StreamExt as _};
 use serde::Deserialize;
 use serde_json::Value;
-use stakit_model::model;
-use stakit_router::{ClientAction, Cx, Error, Router, action};
+// One dependency for the whole API surface: traits, types, the `#[model]` /
+// `#[action]` macros, and the router itself all come from `stakit-router`.
+// (`stakit-model` is still a Cargo dependency — the macros expand to its paths.)
+use stakit_router::{ClientAction, Cx, Error, Router, action, model};
 
 // ---- global context ----
 /// Shared application state.
