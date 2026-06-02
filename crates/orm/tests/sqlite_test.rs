@@ -628,3 +628,62 @@ async fn relations_has_many_and_belongs_to() {
     assert_eq!(with_author[0].1.as_ref().unwrap().name, "Ann");
     assert_eq!(with_author[2].1.as_ref().unwrap().name, "Bo");
 }
+
+// ----- Custom column type via the ToValue/FromValue extension point -----
+// Proves a user-defined type (the same mechanism pgvector/postgis would use:
+// map to an existing Value variant) round-trips through a real column.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Tags(Vec<String>);
+
+impl stakit_orm::ToValue for Tags {
+    fn to_value(self) -> stakit_orm::Value {
+        stakit_orm::Value::Text(self.0.join(","))
+    }
+}
+impl stakit_orm::FromValue for Tags {
+    const KIND: stakit_orm::ValueKind = stakit_orm::ValueKind::Text;
+    fn from_value(value: stakit_orm::Value) -> stakit_orm::Result<Self> {
+        match value {
+            stakit_orm::Value::Text(s) if s.is_empty() => Ok(Self(Vec::new())),
+            stakit_orm::Value::Text(s) => Ok(Self(s.split(',').map(String::from).collect())),
+            other => Err(stakit_orm::Error::Decode(
+                format!("expected text for Tags, got {other:?}").into(),
+            )),
+        }
+    }
+}
+
+#[derive(Table, Debug, PartialEq, Eq)]
+#[table(name = "docs")]
+struct Doc {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    tags: Tags,
+}
+
+#[tokio::test]
+async fn custom_column_type_round_trips() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    db.raw("create table docs (id integer primary key, tags text not null)")
+        .exec()
+        .await
+        .unwrap();
+
+    db.insert(DocNew {
+        id: 1,
+        tags: Tags(vec!["red".into(), "blue".into()]),
+    })
+    .exec()
+    .await
+    .expect("insert custom type");
+
+    let got = db.find::<Doc>().one().await.unwrap().unwrap();
+    assert_eq!(got.tags, Tags(vec!["red".into(), "blue".into()]));
+}

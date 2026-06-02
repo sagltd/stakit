@@ -292,6 +292,55 @@ Variants include `Unique`, `ForeignKey`, `NotNull`, `Check`, `NotFound`,
 `TooManyRows`, `Unsupported`, plus the concrete backend errors
 `Database(sqlx::Error)` and (with `turso`) `Turso(libsql::Error)` — not boxed.
 
+## Custom column types & extensions (pgvector, PostGIS, …)
+
+Any type that implements `ToValue` + `FromValue` is usable as a column type — map it
+to an existing `Value` variant (`Text`/`Bytes`/`I64`/…):
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Tags(Vec<String>);
+
+impl stakit_orm::ToValue for Tags {
+    fn to_value(self) -> stakit_orm::Value {
+        stakit_orm::Value::Text(self.0.join(","))
+    }
+}
+impl stakit_orm::FromValue for Tags {
+    const KIND: stakit_orm::ValueKind = stakit_orm::ValueKind::Text;
+    fn from_value(v: stakit_orm::Value) -> stakit_orm::Result<Self> {
+        match v {
+            stakit_orm::Value::Text(s) => Ok(Self(s.split(',').map(String::from).collect())),
+            other => Err(stakit_orm::Error::Decode(format!("bad Tags: {other:?}").into())),
+        }
+    }
+}
+
+#[derive(Table)]
+#[table(name = "docs")]
+struct Doc {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    tags: Tags,
+}
+```
+
+This is the extension point for DB extensions like **pgvector** and **PostGIS**:
+represent the value as text/bytes and round-trip it. Caveats today:
+
+- **Reading** works directly (`vector`/`geometry` columns have text output → parse in
+  `FromValue`).
+- **Writing** to a native `vector`/`geometry` column usually needs an explicit cast —
+  the typed `insert` binds a plain param and does not add `::vector`. Use
+  `db.raw("insert … values ($1::vector)")` for the cast.
+- **Operators** (`<->` KNN, `ST_DWithin`, …) aren't modeled by the typed builder — use
+  `sql_expr::<T>("…")` in projections and `raw_pred("…")` / `db.raw(…)` in filters.
+
+So custom scalar types are first-class and tested; full native vector/geo support is
+reachable via the raw/`sql_expr` escape hatches (first-class binary + operators are
+tracked as future work).
+
 ## Custom backends
 
 Implement `Driver` (`fetch` via a `RowSink`, `execute`, `stream`, `begin`,

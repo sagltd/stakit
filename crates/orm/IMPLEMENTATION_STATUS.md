@@ -114,6 +114,33 @@ The crate is being made backend-neutral. Phases (build stays green each step):
    datadir, and running with `MYSQL_URL=mysql://root@127.0.0.1:3310/stakit_test`. The
    MySQL tests use disjoint tables so they pass under nextest's default parallelism.
 
+## Extensions / custom column types (pgvector, PostGIS, sqlite-vec)
+
+**Mechanism: DONE and e2e-verified.** Any Rust type that implements `ToValue` +
+`FromValue` is usable as a column type — `#[derive(Table)]` decodes/binds it through
+`from_row_at`/`boxed_bind`. A custom `Tags(Vec<String>)` type round-trips through a
+real SQLite column in `tests/sqlite_test.rs::custom_column_type_round_trips`. This is
+the single extension point: map the custom type to an existing `Value` variant
+(`Text`/`Bytes`/`I64`/`F64`/array…).
+
+**pgvector / PostGIS / sqlite-vec specifically: usable via the mechanism, but NOT
+first-class and NOT e2e-verified** (the embedded Postgres / bundled SQLite in the test
+env don't ship those extensions, so a live test can't `create extension vector`).
+Concretely:
+- *Reading* works cleanly: a `vector`/`geometry` column has a text output, so a custom
+  type with `FromValue` parsing `Value::Text` decodes it. (pgvector emits `[1,2,3]`;
+  PostGIS can emit WKT.)
+- *Writing* needs an explicit cast — the typed `insert` builder binds a `$N` text/blob
+  param and does **not** add `::vector`/`::geometry`. Use `db.raw("insert … values
+  ($1::vector)")` for the cast, or store the canonical text form in a column the
+  extension implicitly accepts.
+- *Operators* (`<->`/`<=>` KNN, `ST_DWithin`, …) are not modeled by the typed builder;
+  use `sql_expr::<T>("…")` in projections and `raw_pred("…")` / `db.raw(…)` in filters.
+- Bottom line: custom scalar types are first-class and verified; native vector/geo
+  binary protocol + operators are reachable only through the raw/`sql_expr` escape
+  hatches today. A `Value::Custom` variant + per-column bind-cast would make them
+  first-class — tracked as future work, untestable here without the DB extensions.
+
 ## Review loop — round 1 (4 sub-agents: correctness/DX, safety, perf, tests)
 
 Findings fixed:
