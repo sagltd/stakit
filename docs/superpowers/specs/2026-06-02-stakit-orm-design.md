@@ -103,6 +103,23 @@ pub struct Post {
     #[has_many(Comment, fk = post_id)]
     pub comments: Rel<Vec<Comment>>,
 }
+
+#[derive(Table)]
+#[table(name = "comments")]
+pub struct Comment {
+    #[column(pk, default = "gen_random_uuid()")]
+    pub id: Uuid,
+    #[column(references = Post::id, on_delete = "cascade")]
+    pub post_id: Uuid,
+    #[column(references = User::id, on_delete = "cascade")]
+    pub author_id: Uuid,
+    pub body: String,
+
+    #[belongs_to(Post, fk = post_id)]
+    pub post: Rel<Post>,
+    #[belongs_to(User, fk = author_id)]
+    pub author: Rel<User>,
+}
 ```
 
 `#[derive(Table)]` emits (zero runtime cost):
@@ -120,6 +137,12 @@ pub struct Post {
   `#[allow]` on generated code is contained and conventional.)
 - **Relation tokens**: `User::posts: Relation<User, Post, Many>`.
 - sqlx `FromRow` (delegated).
+- **Insert companion type** `UserNew` (Drizzle-style): same columns, but any
+  column with a `#[column(default = …)]` (or `pk` with a default) is `Option<T>`
+  — `None` omits it from the INSERT list so the **DB default fires**; relation
+  (`Rel<_>`) fields are absent. `db.insert`/`insert_many` take `UserNew`, so DB
+  defaults are reachable (the full `User` struct, with required `id`/`created_at`,
+  is the *read* shape). `UserNew::from(User)` exists for convenience.
 
 ### Compile-time checks (what rustc verifies)
 
@@ -288,11 +311,12 @@ let users = db.select(User::all())
 // one whole row -> Option<User>   (uid: Uuid, matches User::id's Uuid)
 let u = db.select(User::all()).from::<User>().filter(eq(User::id, uid)).one().await?;
 
-// join -> output type inferred: inner => (Post, Comment), left => (Post, Option<Comment>)
-let rows = db.select((Post::all(), Comment::all()))
+// join -> inner: project T::all(); LEFT/RIGHT outer side MUST be .nullable()
+// so unmatched (all-NULL) rows decode to None instead of failing.
+let rows = db.select((Post::all(), Comment::all().nullable()))   // (Post, Option<Comment>)
     .from::<Post>()
-    .left_join::<Comment>(eq(Post::id, Comment::post_id))   // col=col, both Uuid
-    .filter(eq(Post::id, pid))                              // pid: Uuid
+    .left_join::<Comment>(eq(Post::id, Comment::post_id))        // col=col, both Uuid
+    .filter(eq(Post::id, pid))                                   // pid: Uuid
     .all().await?;
 
 // IN list -> rendered as `= ANY($1)` with ONE array bind (see note below)
@@ -396,6 +420,7 @@ static wrappers simply ignore `&self`. Decode strategies are provided by
 | `count()` / `count(Post::id)` | `Count` | `i64` | `try_get(0)` |
 | `sum(Col<_,T>)` / `avg(_)` | `Sum<T>` / `Avg` | `T` / `f64` | `try_get(0)` |
 | `User::all()` | `All<User>` | `User` | `User::from_row` (sqlx `FromRow`) |
+| `User::all().nullable()` | `All<User, Nullable>` | `Option<User>` | `None` when the row's columns are all NULL (outer-join side), else `User::from_row` |
 | `UserStat::project()` (derive Row) | `RowProj<UserStat>` | `UserStat` | derived |
 | `row! { .. }` | macro-generated local | anonymous named struct | per-field, see below |
 
@@ -602,13 +627,15 @@ SQL text is the caller's responsibility; values must still go through `.bind()`/
 ## 10. Inserts + batching
 
 ```rust
-// single
-let id: Uuid = db.insert(User { .. }).returning(User::id).one().await?;
-db.insert(user).exec().await?;                       // -> rows affected
+// single — UserNew lets defaulted columns (id, created_at) be omitted (None) so
+// the DB default fires; required columns are plain fields.
+let id: Uuid = db.insert(UserNew { email, name, ..Default::default() })
+    .returning(User::id).one().await?;
+db.insert(new_user).exec().await?;                   // -> rows affected
 
-// many -> multi-row VALUES, auto-chunked
-let n = db.insert_many(users).exec().await?;
-let ids: Vec<Uuid> = db.insert_many(users).returning(User::id).all().await?;
+// many -> INSERT … SELECT * FROM UNNEST($1::T[], …), one array per column, one statement
+let n = db.insert_many(new_users).exec().await?;
+let ids: Vec<Uuid> = db.insert_many(new_users).returning(User::id).all().await?;
 
 // upsert
 db.insert(user).on_conflict(User::email).do_update().exec().await?;
@@ -638,11 +665,13 @@ column** (column-count params total, not rows×cols). Consequences:
 - **65535 param cap is unreachable** (you'd need 65535 *columns*). The old
   `rows_per_stmt` chunk math is gone; a normal `insert_many` is **one round-trip**.
 - Array binds are binary-encoded (extended binary protocol, §16).
-- Caveats: `on_conflict … do_update` works (EXCLUDED mechanics differ slightly from
-  VALUES); columns relying on DB `DEFAULT` per-row are omitted from the INSERT list
-  (UNNEST supplies a value for every listed column). For very large arrays the
-  planner can misestimate cardinality — that is exactly the point where the docs
-  steer to `copy_into`.
+- DB defaults: a column left `None` in `UserNew` (§4) is **dropped from the INSERT
+  column list** so its DB default applies; UNNEST then supplies arrays only for the
+  included columns. (Per-call the included-column set is fixed, so the statement is
+  still stable for that set.) Caveat: `on_conflict … do_update` works (EXCLUDED
+  mechanics differ slightly from VALUES). For very large arrays the planner can
+  misestimate cardinality — that is exactly the point where the docs steer to
+  `copy_into`.
 
 **Transaction tradeoff:** the single UNNEST insert is naturally atomic. The only
 reason to split is array size; for that, `insert_many` accepts `.commit_per_chunk()`
@@ -1190,9 +1219,10 @@ Highest-risk items to prototype first (de-risk before committing the full v1):
   aliases/re-exports — accepted and documented.
 - **Relational result type (§8)** — one fixed `UserWith` per table for v2 to avoid
   combinatorial codegen; nested `.with()` and `columns`+`with` deferred to v3.
-- **Statement-cache discipline (§6/§10/§16)** — `= ANY($1)` everywhere + chunk
-  bucketing; `bench_statement_cache_hitrate` is the guard. A regression here is a
-  silent perf cliff.
+- **Statement-cache discipline (§6/§10/§16)** — `= ANY($1)` for IN lists + UNNEST
+  for `insert_many` + bound `LIMIT`/`OFFSET`; `bench_statement_cache_hitrate` is the
+  guard. The residual axis is builder-shape cardinality vs the 256-entry LRU cap. A
+  regression here is a silent perf cliff.
 - **Migration diff** for type changes / renames is ambiguous (rename vs drop+add);
   v1 covers additive changes, surfaces the rest for hand-editing.
 
