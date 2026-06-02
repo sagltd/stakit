@@ -164,6 +164,20 @@ pub enum Predicate {
         /// The search query text.
         query: String,
     },
+    /// A PostGIS spatial predicate: `<func>("table"."name", $N::geometry[, $M])`,
+    /// e.g. `ST_DWithin(...)` / `ST_Intersects(...)`. See [`crate::geo`].
+    Spatial {
+        /// Lowercase function name (e.g. `st_dwithin`).
+        func: &'static str,
+        /// Column table.
+        table: &'static str,
+        /// Column name.
+        name: &'static str,
+        /// The bound geometry value (rendered `$N::geometry`).
+        geom: Value,
+        /// An optional trailing bound distance argument (for `ST_DWithin`).
+        distance: Option<f64>,
+    },
     /// A raw SQL fragment (developer-trusted `&'static str`) — e.g. an aggregate
     /// `HAVING` like `count(*) > 5` that the typed builder can't model.
     Raw(&'static str),
@@ -223,6 +237,13 @@ impl Predicate {
                 Ok(())
             }
             Self::Match { table, name, query } => write_match(writer, table, name, query),
+            Self::Spatial {
+                func,
+                table,
+                name,
+                geom,
+                distance,
+            } => write_spatial(writer, func, table, name, geom, distance),
             Self::Raw(fragment) => {
                 writer.push(fragment);
                 Ok(())
@@ -258,6 +279,30 @@ fn write_match(
             writer.push(")");
         }
     }
+    Ok(())
+}
+
+/// Render a PostGIS spatial predicate: `<func>("table"."name", $N::geometry)`,
+/// plus a trailing bound distance (`, $M`) for `ST_DWithin`. The geometry and
+/// distance are always parameter-bound — values never reach the SQL text.
+fn write_spatial(
+    writer: &mut SqlWriter,
+    func: &'static str,
+    table: &'static str,
+    name: &'static str,
+    geom: Value,
+    distance: Option<f64>,
+) -> Result<(), IdentError> {
+    writer.push(func);
+    writer.push("(");
+    writer.push_qualified(table, name)?;
+    writer.push(", ");
+    writer.push_bind(geom);
+    if let Some(distance) = distance {
+        writer.push(", ");
+        writer.push_bind(Value::F64(distance));
+    }
+    writer.push(")");
     Ok(())
 }
 
@@ -400,7 +445,12 @@ where
     Predicate::AnyOf {
         table: column.table,
         name: column.name,
-        values: values.to_vec().to_value(),
+        // Build the array Value directly from the slice — one allocation
+        // instead of `to_vec()` (clone) + `to_value()` (second collect).
+        values: crate::value::Value::Array(
+            <Ty as crate::value::FromValue>::KIND,
+            values.iter().cloned().map(ToValue::to_value).collect(),
+        ),
     }
 }
 

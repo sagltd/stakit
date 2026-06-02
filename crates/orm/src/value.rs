@@ -49,6 +49,16 @@ pub enum Value {
     /// backend's vector literal (`$N::vector` on pgvector, `vector32($N)` on Turso,
     /// JSON text on `sqlite-vec`); see [`crate::vector`].
     Vector(Vec<f32>),
+    /// A PostGIS geometry/geography: bare WKT (e.g. `POINT(1 2)`, **no** SRID
+    /// prefix) plus an optional SRID as a first-class field. Bound as
+    /// `$N::geometry` (or `ST_SetSRID($N::geometry, srid)` when `srid` is set) on
+    /// Postgres, and read back via `ST_AsText`; see [`crate::geo`].
+    Geo {
+        /// Bare geometry well-known-text (no `SRID=..;` prefix).
+        wkt: String,
+        /// Spatial reference id, applied at bind time when present.
+        srid: Option<i32>,
+    },
     /// A homogeneous array of scalar values (for `= ANY($1)` / `IN`), carrying
     /// the element kind so an empty array still binds with a concrete type.
     Array(ValueKind, Vec<Self>),
@@ -88,6 +98,8 @@ pub enum ValueKind {
     Json,
     /// An embedding vector for vector search.
     Vector,
+    /// A PostGIS geometry/geography (carried as (E)WKT text).
+    Geo,
 }
 
 fn mismatch(expected: &str, got: &Value) -> Error {

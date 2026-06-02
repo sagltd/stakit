@@ -43,6 +43,7 @@ impl Row for PgRow {
             ValueKind::NaiveTime => read!(self, index, kind, NaiveTime, Value::NaiveTime),
             ValueKind::Json => read!(self, index, kind, serde_json::Value, Value::Json),
             ValueKind::Vector => read_vector(self, index),
+            ValueKind::Geo => read_geo(self, index),
         }
     }
 
@@ -207,6 +208,9 @@ fn bind_scalar(args: &mut PgArguments, value: Value) -> Result<()> {
         Value::Json(x) => args.add(x),
         // Bound as the text literal `[..]`; the SQL writer adds the `::vector` cast.
         Value::Vector(x) => args.add(crate::vector::to_literal(&x)),
+        // Bound as bare WKT text; the SQL writer adds the `::geometry` cast (and
+        // wraps it in `ST_SetSRID(.., srid)` when a SRID is attached).
+        Value::Geo { wkt, .. } => args.add(wkt),
         Value::Array(kind, values) => return bind_array(args, kind, values),
     };
     result.map_err(Error::Encode)
@@ -220,8 +224,8 @@ fn bind_null(args: &mut PgArguments, kind: ValueKind) -> Result<()> {
         ValueKind::F32 => args.add(None::<f32>),
         ValueKind::F64 => args.add(None::<f64>),
         ValueKind::Bool => args.add(None::<bool>),
-        // Vector binds as its `[..]` text literal, so its null is a text null too.
-        ValueKind::Text | ValueKind::Vector => args.add(None::<String>),
+        // Vector and geometry bind as text literals, so their nulls are text nulls too.
+        ValueKind::Text | ValueKind::Vector | ValueKind::Geo => args.add(None::<String>),
         ValueKind::Bytes => args.add(None::<Vec<u8>>),
         ValueKind::Uuid => args.add(None::<Uuid>),
         ValueKind::Timestamptz => args.add(None::<DateTime<Utc>>),
@@ -241,6 +245,16 @@ fn read_vector(row: &PgRow, index: usize) -> Result<Value> {
         Some(text) => Ok(Value::Vector(crate::vector::parse_literal(&text)?)),
         None => Ok(Value::Null(ValueKind::Vector)),
     }
+}
+
+/// Read a PostGIS geometry into a [`Value::Geo`]. The query must select it as text
+/// (e.g. `ST_AsText(location)`), which yields the bare WKT body without an SRID.
+fn read_geo(row: &PgRow, index: usize) -> Result<Value> {
+    let cell: Option<String> = row.try_get(index).map_err(into_decode)?;
+    Ok(cell.map_or(Value::Null(ValueKind::Geo), |wkt| Value::Geo {
+        wkt,
+        srid: None,
+    }))
 }
 
 /// Collect homogeneous scalar `values` of `kind` into a typed `Vec` and bind it
@@ -277,6 +291,9 @@ fn bind_array(args: &mut PgArguments, kind: ValueKind, values: Vec<Value>) -> Re
         }
         ValueKind::Vector => {
             return Err(Error::Encode("vector array binds are not supported".into()));
+        }
+        ValueKind::Geo => {
+            return Err(Error::Encode("geometry array binds are not supported".into()));
         }
     };
     result.map_err(Error::Encode)

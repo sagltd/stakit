@@ -22,6 +22,9 @@ impl Dialect for PostgresDialect {
     fn vector_bind(&self) -> (&'static str, &'static str) {
         ("", "::vector")
     }
+    fn geo_bind(&self) -> (&'static str, &'static str) {
+        ("", "::geometry")
+    }
     fn vector_distance(&self, metric: crate::vector::Distance) -> crate::vector::DistanceSql {
         use crate::vector::{Distance, DistanceSql::Operator};
         match metric {

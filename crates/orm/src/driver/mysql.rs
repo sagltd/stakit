@@ -46,6 +46,7 @@ impl Row for MySqlRow {
             ValueKind::NaiveTime => read!(self, index, kind, NaiveTime, Value::NaiveTime),
             ValueKind::Json => read!(self, index, kind, serde_json::Value, Value::Json),
             ValueKind::Vector => Err(Error::Decode("MySQL has no vector type".into())),
+            ValueKind::Geo => Err(Error::Decode("PostGIS geometry is Postgres-only".into())),
         }
     }
 
@@ -210,6 +211,9 @@ fn bind_scalar(args: &mut MySqlArguments, value: Value) -> Result<()> {
         Value::Vector(..) => {
             return Err(Error::Encode("MySQL has no vector type".into()));
         }
+        Value::Geo { .. } => {
+            return Err(Error::Encode("PostGIS geometry is Postgres-only".into()));
+        }
         Value::Array(..) => {
             return Err(Error::Encode("MySQL does not support array binds".into()));
         }
@@ -234,6 +238,7 @@ fn bind_null(args: &mut MySqlArguments, kind: ValueKind) -> Result<()> {
         ValueKind::NaiveTime => args.add(None::<NaiveTime>),
         ValueKind::Json => args.add(None::<serde_json::Value>),
         ValueKind::Vector => return Err(Error::Encode("MySQL has no vector type".into())),
+        ValueKind::Geo => return Err(Error::Encode("PostGIS geometry is Postgres-only".into())),
     };
     result.map_err(Error::Encode)
 }

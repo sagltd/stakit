@@ -318,6 +318,7 @@ struct ColumnModel {
     is_pk: bool,
     is_unique: bool,
     is_index: bool,
+    index_method: Option<String>,
     is_nullable: bool,
     default: Option<String>,
     references: Option<(Path, String)>,
@@ -525,6 +526,7 @@ fn parse_column(ident: &Ident, field: &syn::Field) -> syn::Result<ColumnModel> {
         is_pk: false,
         is_unique: false,
         is_index: false,
+        index_method: None,
         is_nullable: unwrap_generic(&field.ty, "Option").is_some(),
         default: None,
         references: None,
@@ -542,6 +544,11 @@ fn parse_column(ident: &Ident, field: &syn::Field) -> syn::Result<ColumnModel> {
                 model.is_unique = true;
             } else if meta.path.is_ident("index") {
                 model.is_index = true;
+                // `#[column(index)]` is the bare B-tree form; `#[column(index = "gist")]`
+                // requests an explicit access method (e.g. GiST for PostGIS columns).
+                if let Ok(value) = meta.value() {
+                    model.index_method = Some(value.parse::<LitStr>()?.value());
+                }
             } else if meta.path.is_ident("nullable") {
                 model.is_nullable = true;
             } else if meta.path.is_ident("name") {
@@ -652,6 +659,10 @@ fn column_literal(column: &ColumnModel) -> proc_macro2::TokenStream {
     let is_pk = column.is_pk;
     let is_unique = column.is_unique;
     let is_index = column.is_index;
+    let index_method = column.index_method.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |method| quote! { ::core::option::Option::Some(#method) },
+    );
     let is_nullable = column.is_nullable;
     let default = column.default.as_ref().map_or_else(
         || quote! { ::core::option::Option::None },
@@ -677,6 +688,7 @@ fn column_literal(column: &ColumnModel) -> proc_macro2::TokenStream {
             is_pk: #is_pk,
             is_unique: #is_unique,
             is_index: #is_index,
+            index_method: #index_method,
             is_nullable: #is_nullable,
             default: #default,
             references: #references,

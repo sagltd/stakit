@@ -55,12 +55,53 @@ pub struct Column {
     pub is_unique: bool,
     /// Whether a (non-unique) secondary index should be created on this column.
     pub is_index: bool,
+    /// The index access method, when one was requested explicitly (e.g. `"gist"`
+    /// for a PostGIS geometry column via `#[column(index = "gist")]`). `None` uses
+    /// the backend default (B-tree). Only meaningful when [`is_index`](Self::is_index).
+    pub index_method: Option<&'static str>,
     /// Whether the column is nullable.
     pub is_nullable: bool,
     /// Verbatim SQL `DEFAULT` expression, if any.
     pub default: Option<&'static str>,
     /// Foreign-key reference, if any.
     pub references: Option<ForeignKey>,
+}
+
+impl Column {
+    /// Render the `CREATE INDEX` DDL for this column on `table`, or `None` when the
+    /// column has no secondary index ([`is_index`](Self::is_index) is `false`).
+    ///
+    /// Emits `create index "idx_<table>_<name>" on "<table>" using <method> ("<name>")`
+    /// when an [`index_method`](Self::index_method) is set (e.g. `gist` for a PostGIS
+    /// geometry column), or the same without the `using` clause for the default
+    /// B-tree. Identifiers are quoted; the method is a developer-supplied
+    /// `&'static str` written verbatim.
+    ///
+    /// ```
+    /// # use stakit_orm::Column;
+    /// let geo = Column {
+    ///     name: "location", sql_type: "geometry(Point,4326)", is_pk: false,
+    ///     is_unique: false, is_index: true, index_method: Some("gist"),
+    ///     is_nullable: false, default: None, references: None,
+    /// };
+    /// assert_eq!(
+    ///     geo.create_index_sql("places").as_deref(),
+    ///     Some(r#"create index "idx_places_location" on "places" using gist ("location")"#),
+    /// );
+    /// ```
+    #[must_use]
+    pub fn create_index_sql(&self, table: &str) -> Option<String> {
+        if !self.is_index {
+            return None;
+        }
+        let using = self
+            .index_method
+            .map_or_else(String::new, |method| format!(" using {method}"));
+        Some(format!(
+            r#"create index "idx_{table}_{name}" on "{table}"{using} ("{name}")"#,
+            name = self.name,
+        ))
+    }
 }
 
 /// A table mapped from a Rust struct. Implemented by `#[derive(Table)]`.

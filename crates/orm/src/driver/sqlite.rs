@@ -59,6 +59,11 @@ impl Row for SqliteRow {
                     None => Ok(Value::Null(kind)),
                 }
             }
+            // SQLite has no PostGIS; the WKT round-trips as plain text.
+            ValueKind::Geo => {
+                let cell: Option<String> = self.try_get(index).map_err(into_decode)?;
+                Ok(cell.map_or(Value::Null(kind), |wkt| Value::Geo { wkt, srid: None }))
+            }
         }
     }
 
@@ -221,6 +226,8 @@ fn bind_scalar(args: &mut SqliteArguments, value: Value) -> Result<()> {
         Value::NaiveTime(x) => args.add(x),
         Value::Json(x) => args.add(x),
         Value::Vector(x) => args.add(crate::vector::to_literal(&x)),
+        // No PostGIS on SQLite; bind the WKT as plain text.
+        Value::Geo { wkt, .. } => args.add(wkt),
         // Arrays never reach SQLite: the dialect has `supports_any_array() == false`,
         // so list membership is rendered as `IN (?, …)` with scalar binds.
         Value::Array(..) => {
@@ -237,8 +244,8 @@ fn bind_null(args: &mut SqliteArguments, kind: ValueKind) -> Result<()> {
         ValueKind::I64 => args.add(None::<i64>),
         ValueKind::F32 | ValueKind::F64 => args.add(None::<f64>),
         ValueKind::Bool => args.add(None::<bool>),
-        // Vector binds as its `[..]` text literal, so its null is a text null too.
-        ValueKind::Text | ValueKind::Vector => args.add(None::<String>),
+        // Vector/geometry bind as text literals, so their nulls are text nulls too.
+        ValueKind::Text | ValueKind::Vector | ValueKind::Geo => args.add(None::<String>),
         ValueKind::Bytes => args.add(None::<Vec<u8>>),
         ValueKind::Uuid => args.add(None::<Uuid>),
         ValueKind::Timestamptz => args.add(None::<DateTime<Utc>>),

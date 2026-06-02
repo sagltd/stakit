@@ -28,6 +28,7 @@ pub struct SqlWriter {
     quote_char: char,
     supports_any_array: bool,
     vector_bind: (&'static str, &'static str),
+    geo_bind: (&'static str, &'static str),
     // Kept for the rare vector-distance path (metric-dependent, can't be a flag).
     dialect: &'static dyn crate::dialect::Dialect,
 }
@@ -57,6 +58,7 @@ impl SqlWriter {
             quote_char: dialect.quote_char(),
             supports_any_array: dialect.supports_any_array(),
             vector_bind: dialect.vector_bind(),
+            geo_bind: dialect.geo_bind(),
             dialect,
         }
     }
@@ -100,22 +102,57 @@ impl SqlWriter {
     /// Queue a bind value and write its positional placeholder (`$N` for
     /// Postgres, `?N` for SQLite/libSQL).
     pub fn push_bind(&mut self, value: Value) {
-        // Vector binds are wrapped so the backend reads the placeholder as a vector
+        // PostGIS geometries get the most involved treatment: a `::geometry` cast,
+        // wrapped in `ST_SetSRID(.., srid)` when a SRID is attached. Other backends
+        // return `("", "")` from `geo_bind`, so the WKT just binds as plain text.
+        if let Value::Geo { srid, .. } = &value {
+            let srid = *srid;
+            self.push_geo_bind(value, srid);
+            return;
+        }
+        // Vectors are wrapped so the backend reads the placeholder as a vector
         // (`$N::vector` / `vector32($N)` / plain), both on insert and in queries.
-        let vector = matches!(value, Value::Vector(_));
+        let wrap = if matches!(value, Value::Vector(_)) {
+            self.vector_bind
+        } else {
+            ("", "")
+        };
         self.binds.push(value);
         let position = self.binds.len();
-        if vector {
-            self.sql.push_str(self.vector_bind.0);
+        self.sql.push_str(wrap.0);
+        self.push_placeholder(position);
+        self.sql.push_str(wrap.1);
+    }
+
+    /// Render a PostGIS geometry bind: `<pre>$N<suf>`, optionally wrapped in
+    /// `ST_SetSRID(.., srid)` so a tagged SRID survives. The `(pre, suf)` cast comes
+    /// from the dialect (`("", "::geometry")` on Postgres; `("", "")` elsewhere).
+    fn push_geo_bind(&mut self, value: Value, srid: Option<i32>) {
+        let (pre, suf) = self.geo_bind;
+        // Only wrap in ST_SetSRID when the backend actually casts to geometry; on
+        // plain-text backends the value is just the WKT string.
+        let set_srid = srid.filter(|_| !pre.is_empty() || !suf.is_empty());
+        self.binds.push(value);
+        let position = self.binds.len();
+        if set_srid.is_some() {
+            self.sql.push_str("ST_SetSRID(");
         }
+        self.sql.push_str(pre);
+        self.push_placeholder(position);
+        self.sql.push_str(suf);
+        if let Some(srid) = set_srid {
+            use core::fmt::Write as _;
+            let _ = write!(self.sql, ", {srid})");
+        }
+    }
+
+    /// Write the placeholder for a bind at 1-based `position` (`$N` / `?N` / `?`).
+    fn push_placeholder(&mut self, position: usize) {
         self.sql.push(self.placeholder_prefix);
         if self.numbered_placeholders {
             // Avoid `format!` allocation in the hot path.
             let mut buffer = itoa_buffer();
             self.sql.push_str(itoa(position, &mut buffer));
-        }
-        if vector {
-            self.sql.push_str(self.vector_bind.1);
         }
     }
 

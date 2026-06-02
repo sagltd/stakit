@@ -60,12 +60,19 @@ pub(crate) fn write_quoted_with(
     quote: char,
 ) -> Result<(), IdentError> {
     validate(name)?;
+    out.reserve(name.len() + 2);
     out.push(quote);
-    for ch in name.chars() {
-        if ch == quote {
-            out.push(quote);
+    // Fast path: real schema identifiers never contain the quote char, so copy
+    // the whole name in one `push_str` instead of char-by-char.
+    if name.contains(quote) {
+        for ch in name.chars() {
+            if ch == quote {
+                out.push(quote);
+            }
+            out.push(ch);
         }
-        out.push(ch);
+    } else {
+        out.push_str(name);
     }
     out.push(quote);
     Ok(())

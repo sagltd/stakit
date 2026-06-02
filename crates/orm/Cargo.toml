@@ -45,5 +45,15 @@ futures.workspace = true
 name = "build"
 harness = false
 
+[[bench]]
+name = "db_sqlite"
+harness = false
+required-features = ["sqlite"]
+
+[[bench]]
+name = "db_postgres"
+harness = false
+required-features = ["postgres"]
+
 [lints]
 workspace = true

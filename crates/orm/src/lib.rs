@@ -33,6 +33,7 @@ pub mod driver;
 pub mod error;
 mod exec;
 pub mod expr;
+pub mod geo;
 mod ident;
 pub mod insert;
 pub mod json;
@@ -61,6 +62,10 @@ pub use driver::SqliteDriver;
 pub use driver::TursoDriver;
 pub use driver::{Driver, Row, RowSink, TxConn};
 pub use error::{Error, Result};
+pub use geo::{
+    DistanceUnit, Dms, GeoPoint, Geography, Geometry, st_contains, st_distance, st_dwithin,
+    st_intersects, st_within,
+};
 pub use ident::IdentError;
 pub use insert::{Insert, InsertReturning, Insertable, OptionalPresent};
 pub use json::Json;
@@ -103,6 +108,10 @@ pub mod prelude {
     };
     pub use crate::projection::{
         All, Count, Projection, avg, count, count_col, max, min, sql_expr, sum,
+    };
+    pub use crate::geo::{
+        DistanceUnit, GeoPoint, Geography, Geometry, st_contains, st_distance, st_dwithin,
+        st_intersects, st_within,
     };
     pub use crate::schema::{Col, Rel, Table as TableTrait};
     pub use crate::vector::{Distance, Vector, distance};

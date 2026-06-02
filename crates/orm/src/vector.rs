@@ -175,14 +175,16 @@ pub enum DistanceSql {
 /// pgvector (`::vector`), Turso (`vector32`), and `sqlite-vec` (JSON).
 #[must_use]
 pub fn to_literal(components: &[f32]) -> String {
+    use core::fmt::Write as _;
     let mut out = String::with_capacity(components.len() * 8 + 2);
     out.push('[');
     for (index, value) in components.iter().enumerate() {
         if index > 0 {
             out.push(',');
         }
+        // Write straight into `out` — no per-component throwaway String.
         // `{}` on f32 is round-trippable and avoids locale issues.
-        out.push_str(&value.to_string());
+        let _ = write!(out, "{value}");
     }
     out.push(']');
     out

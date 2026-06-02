@@ -59,6 +59,13 @@ pub trait Dialect: Send + Sync {
         }
     }
 
+    /// Text wrapped around a bound PostGIS (E)WKT placeholder so the backend reads
+    /// it as a geometry: `("", "::geometry")` on Postgres/PostGIS, no wrapping
+    /// elsewhere (where the (E)WKT is just bound as plain text). See [`crate::geo`].
+    fn geo_bind(&self) -> (&'static str, &'static str) {
+        ("", "")
+    }
+
     /// How this backend renders a full-text `matches(column, query)` predicate.
     /// Default is `SQLite`/Turso FTS5 (`column MATCH ?`).
     fn full_text(&self) -> FullText {

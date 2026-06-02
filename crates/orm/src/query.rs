@@ -27,6 +27,13 @@ struct NearestOrder {
     metric: Distance,
 }
 
+/// A PostGIS KNN ordering: `ORDER BY "table"."name" <-> $N::geometry`.
+struct NearestGeo {
+    table: &'static str,
+    name: &'static str,
+    geom: Value,
+}
+
 /// A `SELECT` query under construction.
 pub struct Select<P> {
     projection: P,
@@ -38,6 +45,7 @@ pub struct Select<P> {
     having: Option<Predicate>,
     order: SmallVec<[Order; 4]>,
     nearest: Option<NearestOrder>,
+    nearest_geo: Option<NearestGeo>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -57,6 +65,7 @@ impl<P: Projection> Select<P> {
             having: None,
             order: SmallVec::new(),
             nearest: None,
+            nearest_geo: None,
             limit: None,
             offset: None,
         }
@@ -159,6 +168,23 @@ impl<P: Projection> Select<P> {
         self
     }
 
+    /// Order by PostGIS distance to `geom` (KNN nearest-neighbour search): appends
+    /// `ORDER BY "table"."name" <-> $N::geometry`, which PostGIS answers from a
+    /// GiST index. Combine with `.limit(k)` for top-k. See [`crate::geo`].
+    #[must_use]
+    pub fn nearest_geo<T, Ty>(
+        mut self,
+        column: crate::schema::Col<T, Ty>,
+        geom: impl crate::geo::IntoGeo,
+    ) -> Self {
+        self.nearest_geo = Some(NearestGeo {
+            table: column.table,
+            name: column.name,
+            geom: geom.into_geo_value(),
+        });
+        self
+    }
+
     /// Set `LIMIT` (bound as a parameter).
     #[must_use]
     pub const fn limit(mut self, limit: i64) -> Self {
@@ -190,6 +216,7 @@ impl<P: Projection> Select<P> {
             having,
             order,
             nearest,
+            nearest_geo,
             limit,
             offset,
             exec: _,
@@ -242,6 +269,15 @@ impl<P: Projection> Select<P> {
                     writer.push(")");
                 }
             }
+            writer.push(" asc");
+            order_started = true;
+        }
+        if let Some(geo) = nearest_geo {
+            writer.push(if order_started { ", " } else { " order by " });
+            // PostGIS KNN: `<col> <-> $N::geometry` (the cast is added by push_bind).
+            writer.push_qualified(geo.table, geo.name)?;
+            writer.push(" <-> ");
+            writer.push_bind(geo.geom);
             writer.push(" asc");
         }
         if let Some(limit) = limit {
@@ -335,9 +371,14 @@ impl<P: Projection> Select<P> {
         self.offset = None;
         self.order.clear();
         self.nearest = None;
+        self.nearest_geo = None;
         let exec = self.take_exec()?;
         let (_projection, inner, arguments) = self.into_sql()?;
-        let sql = format!("select count(*) from ({inner}) as __count");
+        // Pre-size + push instead of `format!` to avoid a second full-length copy.
+        let mut sql = String::with_capacity(inner.len() + 32);
+        sql.push_str("select count(*) from (");
+        sql.push_str(&inner);
+        sql.push_str(") as __count");
         let mut value = 0_i64;
         exec.for_each_row(sql, arguments, |row| {
             value = crate::driver::decode_cell(row, 0)?;
@@ -357,9 +398,13 @@ impl<P: Projection> Select<P> {
         self.offset = None;
         self.order.clear();
         self.nearest = None;
+        self.nearest_geo = None;
         let exec = self.take_exec()?;
         let (_projection, inner, arguments) = self.into_sql()?;
-        let sql = format!("select exists({inner})");
+        let mut sql = String::with_capacity(inner.len() + 16);
+        sql.push_str("select exists(");
+        sql.push_str(&inner);
+        sql.push(')');
         let mut value = false;
         exec.for_each_row(sql, arguments, |row| {
             value = crate::driver::decode_cell(row, 0)?;
