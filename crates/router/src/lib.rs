@@ -25,6 +25,17 @@ pub use reply::{ErrorBody, Frame, Reply};
 pub use router::{Builder, Router};
 pub use session::Session;
 
+// Convenience re-exports from `stakit-model` so a single `stakit-router`
+// dependency gives you the validation + TypeScript traits/types too. Note: the
+// `#[derive(Model)]` / `#[action]` macros expand to `::stakit_model` /
+// `::stakit_router` paths, so a crate that *uses the macros* must still depend on
+// `stakit-model` directly (see `examples/axum-server`).
+#[doc(inline)]
+pub use stakit_model as model;
+pub use stakit_model::{
+    Model, TSType, Validate, ValidationError, ValidationErrors, generate_typescript,
+};
+
 /// Re-exports so `#[action]`-generated code can name the boxed future/stream types.
 #[doc(hidden)]
 pub use futures::future::BoxFuture;

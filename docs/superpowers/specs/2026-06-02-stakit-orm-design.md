@@ -35,10 +35,16 @@ migration SQL from the Rust schema (sqlx does not do schema diffing — confirme
 from sqlx-cli docs; migrations there are hand-written).
 
 Honest limits of "zero-copy" on sqlx: query *building* is allocation-light (ZST
-column tokens + `smallvec` buffers, SQL string built once at the terminal). Row
-*decode* into owned structs copies (sqlx `PgRow` owns its buffer); borrowed
-`&str`/`&[u8]` reads within row lifetime are possible but `FromRow` into owned
-types copies. Accepted tradeoff vs. hand-rolling the pg wire protocol.
+column tokens + `smallvec` metadata buffers). The final SQL `String` and the
+`PgArguments` bind buffer **are heap allocations** — "zero-alloc" applies only to
+the column/predicate metadata buffers, never to the produced SQL/args (see §15
+for the precise allocation budget). Row *decode* into owned structs copies (sqlx
+`PgRow` owns its buffer). **v1 exposes no borrowed/zero-copy row API** — all
+terminals return owned values; a borrowing API is out of scope (not claimed,
+not benchmarked). sqlx uses the extended query protocol with **binary** result
+format by default, which we rely on for fast decode (no text parsing of
+ints/uuids/timestamps) — see §16. Accepted tradeoff vs. hand-rolling the pg wire
+protocol.
 
 ## 3. Crate layout
 
@@ -100,25 +106,44 @@ pub struct Post {
 
 - `impl Table for User` — table name, `&'static [Column]` const (name, sql type,
   pk/unique/nullable/default/fk), associated `PkTy`.
-- **Column tokens**: `User::id: Col<User, Uuid>`, `User::email: Col<User, String>`
-  — typed, ZST-ish. Used everywhere in queries.
+- **Column tokens**: associated **consts** in an inherent `impl User` —
+  `User::id: Col<User, Uuid>`, `User::email: Col<User, String>` — typed, ZST.
+  These live in the path namespace, so they do **not** collide with the struct's
+  fields (`instance.id` is field access; `User::id` is the const). The const
+  names are lowercase (mirroring columns), which trips clippy's
+  `non_upper_case_globals` under our `-D warnings` gate, so the generated `impl`
+  carries `#[allow(non_upper_case_globals)]`. (Alternative considered: a
+  `user::id` lowercase module of consts — rejected as more verbose; the
+  `#[allow]` on generated code is contained and conventional.)
 - **Relation tokens**: `User::posts: Relation<User, Post, Many>`.
 - sqlx `FromRow` (delegated).
 
 ### Compile-time checks (what rustc verifies)
+
+The cross-struct checks work because the derive emits **paths/type-level code**
+that rustc resolves *after* expansion — not because the macro reads another
+struct's fields (it cannot). Type-equality is enforced with a **`PhantomData`
+witness function** (a `const fn assert_same<T>(_: PhantomData<T>, _: PhantomData<T>)`
+called with both types), not a value-level `const assert!` (which cannot compare
+types).
 
 | Check | When | Mechanism |
 |---|---|---|
 | `User`/`Post` type exists | compile | path resolution after macro expand |
 | `User::id` column exists | compile | `User::id` is a real associated const |
 | FK target column exists (`references = User::id`) | compile | path resolves |
-| FK type == referenced PK type | compile | emitted const assert via `<User as Table>::PkTy` |
-| `has_many(Post, fk = author_id)` — `Post` + `Post::author_id` exist, fk type matches User PK | compile | emitted const referencing `Post::author_id` |
+| FK type == referenced PK type | compile | `assert_same(PhantomData::<author_id Ty>, PhantomData::<<User as Table>::PkTy>)` |
+| `has_many(Post, fk = author_id)` — `Post` + `Post::author_id` exist, fk type matches User PK | compile | emitted code references `Post::author_id` + `assert_same` witness |
+| `on_delete = "set null"` requires the FK column be nullable (`Option<_>`) | compile (macro) | macro errors if `set null` on a non-`Option` column |
 | `on_delete = "cascade"` is a valid keyword | compile (macro) | match against allowed set (`cascade`/`restrict`/`set null`/`no action`) |
 | FK target is actually pk/unique; DB has the constraint | migration gen / apply | snapshot diff / runtime |
 
-Semantic/DB-truth checks that a proc-macro cannot see from another struct's site
-are deferred to migration generation, not the build.
+`#[column(default = "...")]` and `#[table(name = "...")]`/`#[column(name = "...")]`
+take **string literals only** — they are trusted developer input emitted verbatim
+into DDL/identifiers, never accept a runtime `String`. Defaults are emitted into
+`create table ... default <literal>` as-is (see §5 + §17 for the safety
+boundary). Semantic/DB-truth checks that a proc-macro cannot see from another
+struct's site are deferred to migration generation, not the build.
 
 ## 5. Migrations — generated, sqlx-applied
 
@@ -127,17 +152,38 @@ Schema lives in a parseable file (default `src/schema.rs`). The CLI generates SQ
 
 ### Generation approach (Option 3 — syn parse)
 
-1. `syn`-parse `src/schema.rs` → current schema model (tables, columns, FKs).
-2. Read `migrations/.snapshot.json` → last-known schema (empty on first run).
-3. Diff → changes (new table, add/drop/alter column, FK change).
-4. Write sqlx-format files into `migrations/`:
-   - `migrations/<ts>_<name>.up.sql`
-   - `migrations/<ts>_<name>.down.sql`
-5. Update `migrations/.snapshot.json`.
+**Two-pass resolver** (a path like `references = User::id` cannot be resolved in
+one pass):
+
+1. **Pass 1 — collect:** `syn`-parse the schema fileset → a symbol table of every
+   `#[derive(Table)]` struct, its `#[table(name)]`, and each column's
+   field-name → `#[column(name)]` mapping.
+2. **Pass 2 — resolve:** resolve every `references = User::id` / `has_many(Post,
+   fk = author_id)` path against the symbol table to a concrete `(table, column)`,
+   honoring `#[column(name = "...")]` renames. The last path segment that is not a
+   known table/column → hard error (no guessing).
+3. Read `migrations/.snapshot.json` → last-known schema (empty on first run).
+4. Diff → changes (new table, add column, FK change; alter/drop in v2, see below).
+5. Write sqlx-format files into `migrations/` (`<ts>_<name>.up.sql` +
+   `.down.sql`), then update `migrations/.snapshot.json`.
+
+**Rust type → SQL type is by canonical spelling, and is fragile by nature** — syn
+sees only the token text (`Uuid`, `DateTime<Utc>`, `Option<String>`), with no type
+resolution. Rules:
+
+- A fixed, **documented allowlist** of canonical spellings maps to SQL types
+  (`Uuid → uuid`, `DateTime<Utc> → timestamptz`, `String → text`, …).
+- `Vec<u8>` is **special-cased to `bytea` before** the generic `Vec<T> → T[]` rule
+  (they otherwise overlap).
+- **Type aliases, re-exports, and fully-qualified spellings are unsupported** —
+  `type Id = Uuid` or `uuid::Uuid` will not be recognized.
+- Any unknown spelling is a **hard error**, never a silent guess. The escape
+  hatch is `#[column(sql_type = "...")]` to state the SQL type explicitly (and is
+  required for custom/feature-gated types like `Decimal`).
 
 Rationale: no compile, no DB, no app boot; reuses `syn` (already a workspace
-dep). Constraint: schema must live in known parseable file(s), not be generated
-behind other macros. Accepted.
+dep). Constraint: schema must live in known parseable file(s) in the configured
+fileset, not be generated behind other macros. Accepted.
 
 (Alternatives considered: `inventory`/`linkme` compile-time registry — needs a
 build; proc-macro writing JSON to `OUT_DIR` — macro file IO is smelly/stale-prone.
@@ -185,6 +231,23 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 MIGRATOR.run(&pool).await?;   // sqlx applies pending, tracks _sqlx_migrations
 ```
 
+### Migration safety + correctness
+
+- **Concurrent boot:** `Migrator::run` takes a Postgres **advisory lock** by
+  default, serializing concurrent `run()` across instances. We rely on it and
+  never disable locking. Caveat: advisory locks break under PgBouncer
+  *transaction* pooling — migrations must run on a direct (session) connection,
+  documented for operators.
+- **Snapshot integrity:** `.snapshot.json` is the diff source of truth and is a
+  repo file (merge-conflict-prone). It MUST be committed atomically with its
+  generated migration. `cargo stakit-orm status` cross-checks the snapshot's
+  table/migration count against `_sqlx_migrations`; divergence is a hard error,
+  not a silent wrong diff.
+- **Destructive `down`:** generated `down.sql` for additive diffs contains
+  `drop table`/`drop column` — data-destructive. `cargo stakit-orm down` requires
+  `--force` (or an interactive confirm) when the down step contains any `drop`.
+  The §17 "review before apply" gate covers `gen`; this covers revert.
+
 Diff scope phasing: v1 = create table + add column + new table; alter-type / drop
 detection in a later pass (flagged to user, hand-edit allowed meanwhile).
 
@@ -196,68 +259,112 @@ keyword → the method is **`.filter()`**.
 
 ```rust
 use stakit_orm::prelude::*;
-use stakit_orm::expr::{eq, and, gt, desc, count};
+use stakit_orm::expr::{eq, and, gt, desc, count, any_of};
 
 let db = Db::new(pool);   // thin wrap over sqlx PgPool
 
 // whole rows, many -> Vec<User>  (inferred, no annotation)
+// NOTE: every comparison is type-matched. `created_at` is DateTime<Utc>, so it is
+// compared to a DateTime value, never an integer literal.
 let users = db.select(User::all())
     .from::<User>()
-    .filter(and(eq(User::name, "Dan"), gt(User::id, 5)))
+    .filter(and(eq(User::name, "Dan"), gt(User::created_at, since)))  // since: DateTime<Utc>
     .order_by(desc(User::created_at))
     .limit(10).offset(20)
     .all().await?;
 
-// one whole row -> Option<User>
+// one whole row -> Option<User>   (uid: Uuid, matches User::id's Uuid)
 let u = db.select(User::all()).from::<User>().filter(eq(User::id, uid)).one().await?;
 
 // join -> output type inferred: inner => (Post, Comment), left => (Post, Option<Comment>)
 let rows = db.select((Post::all(), Comment::all()))
     .from::<Post>()
-    .left_join::<Comment>(eq(Post::id, Comment::post_id))
-    .filter(eq(Post::id, 10))
+    .left_join::<Comment>(eq(Post::id, Comment::post_id))   // col=col, both Uuid
+    .filter(eq(Post::id, pid))                              // pid: Uuid
+    .all().await?;
+
+// IN list -> rendered as `= ANY($1)` with ONE array bind (see note below)
+let some = db.select(User::all()).from::<User>()
+    .filter(any_of(User::id, &ids))                         // ids: &[Uuid]
     .all().await?;
 ```
 
-`eq` is generic on both sides: `eq(Post::id, Comment::post_id)` (col=col, joins)
-and `eq(Post::id, 10)` (col=value). Type-checked — `eq(User::id, "str")` fails to
-compile (id is `Uuid`). Values are bound as positional `$N` params (injection-safe).
+`eq` (and friends) is generic via an `IntoExpr<Ty>` bound: `fn eq<L: ColExpr, R:
+IntoExpr<L::Ty>>(l: L, r: R)`. This makes `eq(Post::id, Comment::post_id)`
+(col=col, both `Ty = Uuid`) and `eq(Post::id, pid)` (col=value, `pid: Uuid`) both
+type-check, while `eq(User::id, 5)` or `eq(User::id, "str")` **fail to compile**
+(`i32`/`&str` do not satisfy `IntoExpr<Uuid>`). Values are bound as positional
+`$N` params (injection-safe).
+
+**IN lists use `= ANY($1)`, never `in ($1,$2,…)`.** A literal IN list makes the
+SQL text vary with the element count → a new prepared statement per length →
+statement-cache thrash, and it consumes one bind param per element (hitting the
+65535 cap). `col = ANY($1::T[])` is a **single** array bind: one stable statement
+regardless of length, one param, no cap issue. This rule applies everywhere an IN
+list would appear, including relational loading (§8). (Very large arrays should
+still be chunked for planner sanity.)
 
 ### Terminals
 
+Terminals are split by builder kind — a `Select` builder has no `.exec()`, and
+mutation builders have no `.one()/.all()`. `count`/`exists` are **projections**
+(§7) consumed by `.one()`, plus the shortcut methods below for the bare case.
+
+**`Select<P>` (query):**
+
 | Method | Returns | Use |
 |---|---|---|
-| `.all()` | `Vec<Output>` | select many |
-| `.one()` | `Option<Output>` | select one (LIMIT 1) |
-| `.one_or_err()` | `Output` | one, `Error::NotFound` if absent |
-| `.exact_one()` | `Output` | err if 0 (`NotFound`) or >1 (`TooManyRows`) |
-| `.stream()` | `impl Stream<Item = Result<Output>>` | large result, unbuffered |
-| `.count()` | `i64` | shortcut `select count(*)` |
-| `.exists()` | `bool` | shortcut `select exists(...)` |
-| `.exec()` | `u64` | insert/update/delete rows affected |
+| `.all()` | `Vec<P::Output>` | select many |
+| `.one()` | `Option<P::Output>` | select one (LIMIT 1) |
+| `.one_or_err()` | `P::Output` | one, `Error::NotFound` if absent |
+| `.exact_one()` | `P::Output` | err if 0 (`NotFound`) or >1 (`TooManyRows`) |
+| `.stream()` | `impl Stream<Item = Result<P::Output>>` | large result, incremental (holds a connection; see §16) |
+| `.count()` | `i64` | shortcut: rewrites to `select count(*)` (ignores `P`) |
+| `.exists()` | `bool` | shortcut: rewrites to `select exists(...)` (ignores `P`) |
+
+**`Insert`/`Update`/`Delete` (mutation):**
+
+| Method | Returns | Use |
+|---|---|---|
+| `.exec()` | `u64` | rows affected |
+| `.returning(proj).all()` | `Vec<Output>` | `RETURNING` many |
+| `.returning(proj).one()` | `Output` | `RETURNING` from a known-single row (non-`Option`; row just written) |
 
 ## 7. Select projections — the `Projection` trait
 
-`select()` takes anything implementing `Projection { type Output; }`. The argument
-decides the return type — **no annotation needed**, inference flows from
-`Projection::Output` through the terminal (`.all()` → `Vec<Output>`, etc.).
+`select()` takes anything implementing `Projection`. The argument decides the
+return type — **no annotation needed**, inference flows from `Projection::Output`
+through the terminal (`.all()` → `Vec<Output>`, etc.).
 
 ```rust
 pub trait Projection {
     type Output;
+    /// SQL select-list fragments, in order.
     fn columns(&self) -> SmallVec<[SqlExpr; 8]>;
+    /// Decode one row. Column ordinals are 0..N in `columns()` order, so this
+    /// reads positionally (`row.try_get(0)`, …) — ordinals are fixed at build
+    /// time, NOT looked up by name per row.
+    fn decode(row: &PgRow) -> Result<Self::Output>;
 }
 ```
 
-| `select(...)` argument | `Output` |
-|---|---|
-| `User::id` (single `Col`) | `Uuid` |
-| `(User::id, User::name)` (tuple) | `(Uuid, String)` |
-| `count()` / `count(Post::id)` | `i64` |
-| `sum(Col<_,T>)` | `T` ; `avg(_)` → `f64` |
-| `User::all()` | `User` |
-| `UserStat::project()` (derive Row) | `UserStat` |
-| `row! { .. }` | anonymous named struct |
+The trait carries a **`decode`** method (the earlier draft omitted it — without it
+the terminal cannot turn a `PgRow` into `Output`). Three decode strategies are
+provided by **distinct, non-overlapping wrapper types** (no coherence conflict):
+
+| `select(...)` argument | wrapper type | `Output` | decode |
+|---|---|---|---|
+| `User::id` (single `Col`) | `Col<User, Uuid>` | `Uuid` | `try_get(0)` |
+| `(User::id, User::name)` | tuple impl (macro, arity 1..=12) | `(Uuid, String)` | positional |
+| `count()` / `count(Post::id)` | `Count` | `i64` | `try_get(0)` |
+| `sum(Col<_,T>)` / `avg(_)` | `Sum<T>` / `Avg` | `T` / `f64` | `try_get(0)` |
+| `User::all()` | `All<User>` | `User` | `User::from_row` (sqlx `FromRow`) |
+| `UserStat::project()` (derive Row) | `RowProj<UserStat>` | `UserStat` | derived |
+| `row! { .. }` | macro-generated local | anonymous named struct | per-field, see below |
+
+Tuple impls are generated for arities 1..=12; `(User::id,)` and bare `User::id`
+decode identically. Each wrapper is a concrete newtype, so the blanket impls
+(`Col`, `Count`, `Sum<T>`, `All<T>`, the tuple macro) cannot overlap.
 
 ### A) Tuple — quick, positional, inferred
 
@@ -309,33 +416,52 @@ let rows = db.select(row! {
 rows[0].post_count;   // i64, named, no predeclare
 ```
 
-**`row!` mechanics** (proc-macro runs pre-typecheck, so it can't name field types
-directly — uses a generic local struct + decode closure; inference fills types):
+**`row!` mechanics.** The proc-macro runs pre-typecheck, so it cannot *name* a
+plain column's type (e.g. that `User::email` is `String`). The earlier "generic
+struct + `r.get(0)`" sketch does **not** work: `r.get(N)` is generic in its target
+type and a bare generic struct field provides nothing to anchor inference →
+"type annotations needed". The fix is to drive each field's type from the
+**column token's own associated type** (`Col<T, Ty>::Ty`), not from `r.get`:
 
 ```rust
 {
-    struct Row<A, B, C, ..> { email: A, user_id: B, post_count: C, .. }
-    Projection::named(
-        [expr(User::email), expr(User::id), expr(count(Post::id)), ..],
-        |r| Row { email: r.get(0), user_id: r.get(1), post_count: r.get(2), .. },
+    // Each field's type comes from its expr's associated Output type, which the
+    // EXPR carries (the macro doesn't need to spell it). sql! fields carry an
+    // explicit type (1st arg). Result is a local struct, fully concrete.
+    struct Row<E, U, P, Y> { email: E, user_id: U, post_count: P, year: Y }
+    RowProjection::build(
+        // (sql fragment, typed extractor) per field; extractor type fixes the generic
+        field(User::email,        |r, i| r.try_get(i)),   // E = <Col as Expr>::Out = String
+        field(User::id,           |r, i| r.try_get(i)),   // U = Uuid
+        field(count(Post::id),    |r, i| r.try_get(i)),   // P = i64
+        field_sql::<i32>("extract(year from {})", Post::created_at),  // Y = i32 (explicit)
     )
 }
-// Output = Row<String, Uuid, i64, ..>
+// Output = Row<String, Uuid, i64, i32>
 ```
+
+`field(expr, extractor)` ties the extractor's return type to `<expr as Expr>::Out`
+via a bound, so the local struct's generics resolve from the **expression types**,
+which are known to the type system even though the macro can't write them. `sql!`
+fields supply the type explicitly. Ordinals are assigned in declaration order.
 
 **`sql!` rules** (raw SQL fragment, typed):
 
-- 1st arg = output Rust type → field gets that concrete type (closes the
-  inference gap; raw `sql!` fields are explicitly typed).
-- `{}` placeholder = **column token** (`Col`) → rendered as quoted identifier
-  (`"posts"."created_at"`); compile-checked (column must exist).
-- `?` placeholder = **value bind** → positional `$N` param (injection-safe,
-  never string-spliced).
+- 1st arg = output Rust type → field gets that concrete type.
+- `{}` placeholder = **column token** (`Col`) → rendered as a properly quoted
+  identifier (`"posts"."created_at"`; embedded `"` doubled, see §17);
+  compile-checked (column must exist).
+- `?` placeholder = **value bind** → a param collected into the query's single
+  ordered bind buffer; `$N` is assigned **once at terminal assembly** across the
+  whole statement (select-list, then from/join, then where, …), so `sql!` binds in
+  the select list never collide with `filter` binds. Never string-spliced.
 
-Tradeoffs: tuple = fully checked at select but positional. Derive Row = named +
-checked at select. `row!` = best ergonomics, but non-`sql!` field types are
-checked at decode rather than select, and the local struct can't cross a function
-boundary (fine for query-and-consume).
+Tradeoffs: tuple = fully checked at select, positional. Derive Row (B) = named +
+checked at select. `row!` (C) = best ergonomics; plain-column field types are
+resolved from the column token (so they ARE type-driven, but the field-name↔type
+binding is verified at build of the local struct rather than against a declared
+struct), and the local struct can't cross a function boundary (fine for
+query-and-consume).
 
 Phasing: **A + B + C all in v1** (user wants C). `sql!` ships with C.
 
@@ -365,16 +491,28 @@ let slim = db.query::<Post>().columns((Post::id, Post::title)).find_many().await
 ```
 
 **Loading strategy:** batched, not N+1, not one giant join. One query per relation
-level (`... where fk in (...)`), stitched in Rust via `hashbrown` map (Drizzle's
-default behavior).
+level using **`... where fk = ANY($1)`** (the array-bind rule from §6 — stable
+statement, no 65535 cap on parent-key count), stitched in Rust via `hashbrown`
+map (Drizzle's default behavior). **Latency = sum of round-trips** (one per
+relation level), issued sequentially; not pipelined in v2.
 
-**The hard part (honest):** API 1 maps cleanly to Rust. API 2's nested typed
-result needs codegen — Drizzle leans on TS structural typing, Rust has none. The
-`#[has_many]`/`#[belongs_to]` derive generates a `UserWith` result type with
-loaded relation fields. Arbitrary-depth nesting is real codegen complexity.
+**The hard part (honest):** API 1 maps cleanly to Rust. API 2's typed result needs
+codegen — Drizzle leans on TS structural typing, Rust has none. Result-type
+strategy for **v2**:
 
-Phasing: **v2** = relational, one level of `.with()`. **v3** = nested `.with()`,
-CTEs, subqueries, broader aggregates.
+- The `#[has_many]`/`#[belongs_to]` derive generates **one fixed `UserWith` type
+  per table** with a field for **every** declared relation (`Vec<Post>` for
+  has-many, `Option<Author>` for belongs-to), populated only for relations named
+  in `.with(...)` and empty otherwise. This avoids the combinatorial explosion of
+  one type per `.with()` combination.
+- **v2 restrictions (stated, not hidden):** `.with()` is **one level deep**;
+  nested `.with(rel, |c| c.with(...))` and combining `.columns(...)` *with*
+  `.with(...)` are **v3**. The nested/`columns`+`with` examples above are the v3
+  target API, shown for direction.
+
+Phasing: **v2** = relational, one fixed `UserWith`, one level of `.with()`,
+`= ANY($1)` batched load. **v3** = nested `.with()`, `columns`+`with` combined,
+CTEs, subqueries, broader aggregates, optional concurrent per-subtree loading.
 
 ## 9. Raw escape hatch
 
@@ -390,6 +528,13 @@ let users: Vec<User> = db.raw("select * from users where created_at > $1")
 let n: i64 = sqlx::query_scalar("select count(*) from users")
     .fetch_one(db.pool()).await?;
 ```
+
+`db.raw` takes `&str` (not `&'static str` — that adds no safety: `Box::leak` of a
+runtime string is `&'static`, and it would block legitimate dynamically-built
+SQL). **The raw path and `db.pool()` are an unaudited surface, by design:** the
+SQL text is the caller's responsibility; values must still go through `.bind()`/
+`$N`, never string interpolation. The builder APIs (§6–§8) are the safe default;
+`raw` is the explicit opt-out. This honesty is restated in §17.
 
 ## 10. Inserts + batching
 
@@ -415,24 +560,53 @@ let n = db.copy_into::<User>(users).await?;
 | Rows | API | Mechanism |
 |---|---|---|
 | 1 | `insert` | single `INSERT` |
-| 2 – ~1k | `insert_many` | one `INSERT ... VALUES (...),(...),...`, one round-trip |
-| huge | `copy_into` | `COPY ... FROM STDIN (FORMAT BINARY)` via sqlx `PgCopyIn` — no per-row parse/plan/bind |
+| 2 – ~tens of thousands | `insert_many` | multi-row `INSERT ... VALUES (...),…`, one round-trip **per chunk** |
+| huge (10k+) | `copy_into` | `COPY ... FROM STDIN` via sqlx `PgCopyIn` — single stream, no per-row parse/plan/bind |
 
-**Param-limit trap:** Postgres caps bind params at 65535 per statement.
-`insert_many` computes `rows_per_statement = 65535 / column_count`, chunks
-accordingly, and wraps all chunks in one transaction — the caller never hits the
-limit. `copy_into` has no param limit and no per-row planning (fastest for big
-loads).
+**Param-limit + round-trips:** Postgres caps bind params at 65535 per statement.
+`insert_many` computes `rows_per_stmt = (65535 − reserved) / column_count`, where
+`reserved` accounts for non-VALUES binds (e.g. `on_conflict … do_update set x =
+$n`). Round-trips = `ceil(rows / rows_per_stmt)` — **not** "one round-trip" for
+large inputs (a 1M-row, 10-col insert ≈ 153 serialized statements). Above ~tens
+of thousands, use `copy_into`.
+
+**Statement-cache cardinality:** a varying final-chunk size would mint a new
+prepared statement per distinct row count. `insert_many` **buckets** chunk sizes
+to powers of two (padding the last chunk's statement shape, not the data) so the
+number of distinct insert statements stays small and the cache doesn't thrash.
+
+**Transaction tradeoff:** by default all chunks run in one transaction
+(all-or-nothing, no partial writes). For very large loads this is one long
+transaction holding locks and growing WAL — so `insert_many` accepts a
+`.commit_per_chunk()` opt-out for bulk loads that don't need global atomicity, and
+the docs steer large loads to `copy_into`.
+
+**`copy_into` is single-stream** (one logical round-trip). On any error mid-stream
+it calls `PgCopyIn::abort` before returning, so the connection is never returned
+to the pool stuck in COPY protocol state. **Binary-format caveat:** `COPY … (FORMAT
+BINARY)` requires a binary encoder for every column type; types in §16 without a
+binary COPY encoder fall back to text COPY (still fast, less than binary). The
+"≥5× `insert_many`" figure (§15) is a *measured* result, not a guaranteed target —
+the multiple depends on row width and network.
 
 Recommended defaults: `insert_many` for normal app writes; `copy_into` for
 seed/import/ETL.
 
 ## 11. Transactions
 
-Real pg transactions via sqlx. **Auto-rollback** on `Err` return, panic, or drop
-without commit. Every query method is generic over the executor, so the same
-`db.select/insert/update/...` API works on a pool (`&Db`) or a transaction
-(`&mut Tx`).
+Real pg transactions via sqlx. The **closure form is the supported path** and
+performs an explicit, awaited `ROLLBACK` in its error/cancel arm. The manual form
+relies on sqlx's drop behavior, which is **best-effort, not a guarantee** (see
+caveat below).
+
+**Executor abstraction:** we define our **own** `Executor` trait (not sqlx's
+directly), with `async fn run(&mut self, …)`, implemented for `Db` (pool) and
+`Tx`. This is required because sqlx's `Executor::fetch*` consumes `self` by value;
+for `&mut Transaction` each call must reborrow (`&mut *tx`). Our trait takes
+`&mut self` and reborrows internally, so the same `select/insert/update/...` API
+works on both a pool and a transaction, and sequential `tx.insert(..); tx.insert(..)`
+calls compile. The closure-transaction signature uses the standard HRTB form
+(`for<'c> FnOnce(&'c mut Tx) -> impl Future + 'c`).
 
 ### Closure style (recommended — cannot forget rollback)
 
@@ -456,7 +630,26 @@ tx.commit().await?;          // explicit; drop/early-return without commit -> RO
 ```
 
 Business-logic rollback (not just DB errors) by returning `Err`. Nested
-transactions map to pg `SAVEPOINT` / `ROLLBACK TO` via `tx.transaction(|sp| ...)`.
+transactions map to pg `SAVEPOINT` / `ROLLBACK TO` via `tx.transaction(|sp| ...)`;
+**savepoint names are internally generated counters** (`_sp_1`, …), never derived
+from any input string.
+
+### Drop-rollback caveat (do not over-trust)
+
+sqlx cannot issue an awaited `ROLLBACK` from `Drop` (Drop is sync). It marks the
+connection so rollback happens when the connection is next used / returned to the
+pool — **best-effort**: under runtime shutdown, task abort, or a cancelled
+in-flight query on the transaction's connection, the rollback may not run before
+reuse, and a cancelled mid-query connection may need to be **closed** rather than
+rolled back. Therefore:
+
+- Prefer the **closure form** (`db.transaction(|tx| …)`) — it rolls back
+  explicitly with `.await` on the error/cancel arm.
+- The manual `begin()` + drop form is best-effort; callers SHOULD `commit()` or
+  `rollback()` explicitly rather than relying on drop.
+- Per-query timeouts (§16) that drop an in-flight tx query may force the
+  connection closed; this is acceptable (correctness over connection reuse) and
+  documented.
 
 ## 12. Error handling
 
@@ -485,6 +678,15 @@ pub enum Error {
 }
 pub type Result<T> = core::result::Result<T, Error>;
 ```
+
+**Value-leak boundary:** the mapper populates `constraint`/`column` **only** from
+the pg error's `constraint()`/`column()`/`code()` accessors — never from
+`message()`/`detail()`, because Postgres's unique-violation `DETAIL` embeds the
+offending value (`Key (email)=(a@b.com) already exists`). Caveat: the
+`#[error(transparent)]` `Database`/`Decode` fallback wraps the raw sqlx error,
+whose `Display` *can* include that pg message (values included). So
+`Error::Display` MUST NOT be echoed to untrusted clients; log it server-side only.
+This is restated in §17.
 
 Ergonomic helpers: `Error::is_unique()`, `is_foreign_key()`, `is_not_found()` plus
 the `constraint`/`column` fields for targeted handling.
@@ -611,43 +813,77 @@ is a bug.
 The ORM's overhead is **everything between the user's call and sqlx's
 `fetch`/`execute`**. That overhead must be near-zero versus hand-written sqlx.
 
-| Bench | Measures | Target (relative to raw sqlx) |
-|---|---|---|
-| `bench_select_build` | build SQL string + binds for a typical select (3 cols, 2 predicates, 1 order) | < 200 ns; **0 heap allocations** (smallvec stays on stack) |
-| `bench_select_build_join` | same with a 2-table join | < 400 ns; ≤ 1 alloc |
-| `bench_projection_tuple` | `Projection` → column list for a 3-tuple | 0 alloc |
-| `bench_row_macro` | `row!{}` expansion cost (compile-time; measured via generated-code path at runtime) | within 5% of `#[derive(Row)]` |
-| `bench_insert_chunk_calc` | `insert_many` chunk planning for 10k rows | < 1 µs; 0 alloc beyond the chunk vec |
-| `bench_predicate_compose` | `and(eq, or(gt, lt))` tree build | 0 alloc (smallvec) |
-| `bench_error_map` | `sqlx::Error` → `Error` SQLSTATE mapping | < 100 ns |
-| `bench_decode_row` (integration) | decode N rows into `User` vs sqlx `query_as` | within 3% of raw sqlx |
-| `bench_insert_throughput` (integration) | rows/sec: `insert` vs `insert_many` vs `copy_into` at 1/1k/100k | `copy_into` ≥ 5× `insert_many` at 100k |
+**Allocation budget, stated precisely.** Building a query is **not** zero-alloc —
+the SQL `String` and the `PgArguments` bind buffer are necessarily heap. "Zero
+alloc" applies only to the **metadata buffers** (columns/predicates) when they fit
+the smallvec inline capacity. So the honest budget for a typical select build is
+**1 String + 1 args alloc + 0 metadata allocs**. Benches assert exactly that, not
+a false "0 allocations".
 
-Pure-build benches (no DB) run in the default loop. Integration throughput benches
-use the embedded pg from §14 and run in CI.
+| Bench (pure, no DB) | Measures | Target |
+|---|---|---|
+| `bench_select_build` | build SQL+args, typical select (3 cols, 2 preds, 1 order) | < 200 ns; **1 String + 1 args alloc; 0 metadata allocs** |
+| `bench_select_build_wide` | `All<User>` on a **12+ column** table (exceeds inline cap) | metadata buffer **spills** — measured + accepted, not claimed zero |
+| `bench_select_build_join` | 2-table join | < 400 ns; metadata allocs only if cols > inline cap |
+| `bench_projection_tuple` | `Projection::columns()` for a 3-tuple, **derive-generated** types | 0 metadata alloc |
+| `bench_bind_encode` | encode N typed values → `PgArguments` | report allocs honestly (args buffer grows) |
+| `bench_predicate_compose` | `and(eq, or(gt, lt))` tree build | 0 metadata alloc (within inline cap) |
+| `bench_builder_step_alloc` | each chained `.filter()/.order_by()` does **0 allocs** until terminal (guards invariant 1) | 0 alloc per step |
+| `bench_insert_chunk_calc` | `insert_many` chunk+bucket planning, 10k rows | < 1 µs; 0 alloc beyond the chunk vec |
+| `bench_projection_row_macro` | `row!`-generated decode path vs `#[derive(Row)]` path | **0 delta** (shared impl by construction) |
+| `bench_error_map` | `sqlx::Error` → `Error` SQLSTATE mapping | < 100 ns |
+| `size_of` checks | `size_of::<SqlExpr>()`, builder struct size, inline smallvec footprint | recorded; guards stack-frame bloat |
+
+| Bench (integration, embedded pg, CI) | Measures | Target |
+|---|---|---|
+| `bench_decode_row` | decode N rows into `User` via sqlx `FromRow` vs raw `query_as` | informational, ±20% (CI noise floor) |
+| `bench_decode_row_macro` | `row!` decode (precomputed ordinals) vs derive | informational, ±20% |
+| `bench_relation_stitch` | `with()` hashbrown stitch, N parents × M children: map build + assign, allocs, peak mem | informational; bounded-memory asserted |
+| `bench_with_roundtrips` | 1-level `.with()` vs manual join vs N+1 | `.with()` ≪ N+1 |
+| `bench_statement_cache_hitrate` | re-parse rate across varying IN/`insert_many` sizes | **near-100% hit** (guards the `= ANY($1)` + bucketing rules) |
+| `bench_stream_memory` | peak RSS over a 1M-row `.stream()` | bounded (does not buffer full set) |
+| `bench_insert_throughput` | rows/sec: `insert` vs `insert_many` vs `copy_into` at 1/1k/100k | informational; `copy_into` measured multiple reported, not gated |
+
+Pure benches run in the default loop and carry **strict** ns/alloc gates
+(reproducible). Integration benches run against the embedded pg from §14 and are
+**informational with wide tolerance** — an embedded pg on a contended CI runner
+has variance far above a 3% delta, so tight numeric gates there would be flaky.
 
 ### Methodology
 
-- Measure **allocations**, not just time — the zero-copy/zero-alloc claims in §2
-  and §7 are verified with an allocation-counting global allocator in the bench
-  harness (or `divan`'s alloc profiling). A claim of "0 heap allocations" that
-  isn't asserted is treated as false.
+- Measure **allocations** via **`divan`'s built-in alloc profiling** — *not* a
+  custom `GlobalAlloc` (implementing `GlobalAlloc` needs `unsafe`, which the
+  workspace forbids; see §16/§17). A "0 allocations" claim that isn't asserted is
+  treated as false.
 - `std::hint::black_box` all inputs/outputs to defeat const-folding.
-- Track regressions: bench results recorded; a tracked metric regressing > 10% is
-  a release blocker.
-- Compare against a **raw-sqlx baseline** in the same bench file so overhead is
-  always expressed as a delta, not an absolute that drifts with hardware.
+- Benches exercise **derive-generated** `Table`/`Row`/`row!` types (not
+  hand-rolled stand-ins) so they protect the real codegen; a `cargo expand`
+  snapshot test guards against codegen-quality regressions.
+- Compile-time cost of macros is tracked separately via `cargo build --timings`
+  (divan cannot measure compile time) — the "expansion cost at runtime" idea is
+  dropped as incoherent.
+- Track regressions: a tracked **pure-bench** metric regressing > 10% is a release
+  blocker; integration benches are trend-tracked (median over many runs), not hard
+  gates.
+- Compare against a **raw-sqlx baseline** in the same bench file so overhead is a
+  delta, not a hardware-drifting absolute.
 
 ### Performance design invariants (what the benches protect)
 
-1. SQL string built **once** at the terminal, never per builder step.
-2. Column/predicate buffers are `smallvec` sized so the common case (≤ 8) never
-   heap-allocates.
+1. SQL string built **once** at the terminal, never per builder step
+   (`bench_builder_step_alloc`).
+2. Metadata buffers are `smallvec`-sized for the common case; **wide projections
+   (`All<T>` on >inline-cap columns) spill and that is accepted** — not claimed
+   zero (`bench_select_build_wide`). Inline cap chosen against a realistic p95,
+   balanced against stack-frame size (`size_of` checks).
 3. Column/relation tokens are zero-sized; no per-query allocation for schema info.
-4. `insert_many` issues one multi-row statement per chunk (one round-trip), not N.
-5. Prepared-statement reuse is on (see §16) so repeated queries skip re-parse.
-6. No `format!`-per-row in any hot path; SQL assembled into a single reused
-   `String` with computed capacity.
+4. `insert_many` issues one statement **per chunk**; round-trips grow with size
+   (§10) — not "one round-trip" for large inputs.
+5. All generated queries go through sqlx's **prepared, extended (binary) protocol**
+   path — no simple-protocol fallback. IN lists use `= ANY($1)` and `insert_many`
+   buckets chunk sizes so the statement cache stays hot (`bench_statement_cache_hitrate`).
+6. No `format!`-per-row in any hot path; SQL assembled into one `String` with
+   computed capacity (that String is the 1 unavoidable alloc, per the budget above).
 
 ## 16. Production readiness
 
