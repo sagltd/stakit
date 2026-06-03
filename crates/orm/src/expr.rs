@@ -163,8 +163,21 @@ pub enum Predicate {
         name: &'static str,
         /// The search query text.
         query: String,
+        /// Postgres text-search config (e.g. `"simple"`, `"spanish"`); `None`
+        /// uses the dialect default. Ignored by FTS5.
+        config: Option<&'static str>,
     },
-    /// A PostGIS spatial predicate: `<func>("table"."name", $N::geometry[, $M])`,
+    /// `"table"."name" LIKE $N ESCAPE '\'` with `%`/`_`/`\` escaped in the bound
+    /// value — a literal substring match (see [`contains`]).
+    Like {
+        /// Column table.
+        table: &'static str,
+        /// Column name.
+        name: &'static str,
+        /// The (escaped, `%…%`-wrapped) bound pattern.
+        pattern: Value,
+    },
+    /// A `PostGIS` spatial predicate: `<func>("table"."name", $N::geometry[, $M])`,
     /// e.g. `ST_DWithin(...)` / `ST_Intersects(...)`. See [`crate::geo`].
     Spatial {
         /// Lowercase function name (e.g. `st_dwithin`).
@@ -236,7 +249,17 @@ impl Predicate {
                 writer.push(")");
                 Ok(())
             }
-            Self::Match { table, name, query } => write_match(writer, table, name, query),
+            Self::Match {
+                table,
+                name,
+                query,
+                config,
+            } => write_match(writer, table, name, query, config),
+            Self::Like {
+                table,
+                name,
+                pattern,
+            } => write_like(writer, table, name, pattern),
             Self::Spatial {
                 func,
                 table,
@@ -255,11 +278,15 @@ impl Predicate {
 /// Render a full-text match per dialect: FTS5 `col MATCH ?`, or Postgres
 /// `to_tsvector('<cfg>', col) @@ plainto_tsquery('<cfg>', $1)`. `cfg` is a fixed
 /// `&'static` config name (no injection); the query text is always bound.
+///
+/// An explicit `config` (e.g. `"spanish"`) overrides the dialect default for the
+/// Postgres `TsQuery` path; it is ignored by FTS5.
 fn write_match(
     writer: &mut SqlWriter,
     table: &'static str,
     name: &'static str,
     query: String,
+    config: Option<&'static str>,
 ) -> Result<(), IdentError> {
     match writer.full_text() {
         crate::dialect::FullText::Fts5Match => {
@@ -267,7 +294,8 @@ fn write_match(
             writer.push(" match ");
             writer.push_bind(Value::Text(query));
         }
-        crate::dialect::FullText::TsQuery(config) => {
+        crate::dialect::FullText::TsQuery(default_config) => {
+            let config = config.unwrap_or(default_config);
             writer.push("to_tsvector('");
             writer.push(config);
             writer.push("', ");
@@ -282,7 +310,23 @@ fn write_match(
     Ok(())
 }
 
-/// Render a PostGIS spatial predicate: `<func>("table"."name", $N::geometry)`,
+/// Render a literal-substring `LIKE`: `"table"."name" like $N escape '\'`. The
+/// pattern (already `%`/`_`/`\`-escaped and `%…%`-wrapped by [`contains`]) is
+/// always parameter-bound; the `escape '\'` clause makes the escaping effective.
+fn write_like(
+    writer: &mut SqlWriter,
+    table: &'static str,
+    name: &'static str,
+    pattern: Value,
+) -> Result<(), IdentError> {
+    writer.push_qualified(table, name)?;
+    writer.push(" like ");
+    writer.push_bind(pattern);
+    writer.push(" escape '\\'");
+    Ok(())
+}
+
+/// Render a `PostGIS` spatial predicate: `<func>("table"."name", $N::geometry)`,
 /// plus a trailing bound distance (`, $M`) for `ST_DWithin`. The geometry and
 /// distance are always parameter-bound — values never reach the SQL text.
 fn write_spatial(
@@ -293,6 +337,11 @@ fn write_spatial(
     geom: Value,
     distance: Option<f64>,
 ) -> Result<(), IdentError> {
+    // `ST_*` only exists on Postgres/PostGIS; on other backends flag it so the
+    // terminal returns `Error::Unsupported` rather than emitting SQL the DB rejects.
+    if !writer.supports_spatial() {
+        writer.mark_unsupported("PostGIS");
+    }
     writer.push(func);
     writer.push("(");
     writer.push_qualified(table, name)?;
@@ -491,7 +540,59 @@ pub fn matches<T, Ty>(column: crate::schema::Col<T, Ty>, query: impl Into<String
         table: column.table,
         name: column.name,
         query: query.into(),
+        config: None,
     }
+}
+
+/// Full-text search on `column` with an explicit Postgres text-search `config`
+/// (e.g. `"simple"`, `"spanish"`, `"english"`).
+///
+/// `config` overrides the dialect default for the Postgres
+/// `to_tsvector`/`plainto_tsquery` path; it is ignored by `SQLite`/Turso FTS5,
+/// which has no per-query configuration. `config` is a developer-trusted
+/// `&'static str` (never user input) and is never parameter-bound.
+#[must_use]
+pub fn matches_in<T, Ty>(
+    column: crate::schema::Col<T, Ty>,
+    query: impl Into<String>,
+    config: &'static str,
+) -> Predicate {
+    Predicate::Match {
+        table: column.table,
+        name: column.name,
+        query: query.into(),
+        config: Some(config),
+    }
+}
+
+/// Case-sensitive literal-substring match: `column LIKE '%<needle>%'`.
+///
+/// The needle's `LIKE` metacharacters (`%`, `_`, `\`) are escaped so it matches
+/// literally (no wildcard injection), then wrapped in `%…%` and bound as a single
+/// parameter rendered with `escape '\'`. Use for "contains this text" filters; for
+/// full-text ranking use [`matches`].
+#[must_use]
+pub fn contains<T, Ty>(column: crate::schema::Col<T, Ty>, needle: impl AsRef<str>) -> Predicate {
+    let escaped = escape_like(needle.as_ref());
+    Predicate::Like {
+        table: column.table,
+        name: column.name,
+        pattern: Value::Text(format!("%{escaped}%")),
+    }
+}
+
+/// Escape `LIKE` metacharacters (`\`, `%`, `_`) in `input` so it matches
+/// literally under `escape '\'`. The backslash is escaped first so the escapes
+/// introduced for `%`/`_` are not themselves double-escaped.
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Sort direction.
@@ -549,16 +650,27 @@ pub const fn desc<T, Ty>(column: Col<T, Ty>) -> Order {
 #[cfg(test)]
 mod tests {
     use super::{
-        Predicate, and, any_of, asc, desc, eq, gt, gte, is_null, like, lt, lte, ne, or, raw_pred,
+        Predicate, and, any_of, asc, contains, desc, eq, gt, gte, is_null, like, lt, lte, matches,
+        matches_in, ne, or, raw_pred,
     };
+    use crate::dialect::{Dialect, SqliteDialect};
     use crate::schema::Col;
     use crate::sql::SqlWriter;
+    use crate::value::Value;
 
     /// Render a predicate to its SQL string (binds discarded).
     fn render(predicate: Predicate) -> String {
         let mut writer = SqlWriter::new();
         predicate.write(&mut writer).unwrap();
         writer.sql().to_owned()
+    }
+
+    /// Render a predicate against an explicit dialect, returning SQL + binds.
+    fn render_with(dialect: &'static dyn Dialect, predicate: Predicate) -> (String, Vec<Value>) {
+        let mut writer = SqlWriter::with_dialect(dialect);
+        predicate.write(&mut writer).unwrap();
+        let (sql, binds) = writer.into_parts();
+        (sql, binds.into_iter().collect())
     }
 
     const ID: Col<(), i32> = Col::new("t", "id");
@@ -652,5 +764,52 @@ mod tests {
         let mut writer = SqlWriter::new();
         desc(NAME).write(&mut writer).unwrap();
         assert_eq!(writer.sql(), r#""t"."name" desc"#);
+    }
+
+    #[test]
+    fn contains_renders_like_with_escape_clause() {
+        assert_eq!(
+            render(contains(NAME, "abc")),
+            r#""t"."name" like $1 escape '\'"#
+        );
+    }
+
+    #[test]
+    fn contains_escapes_like_metacharacters_in_bound_value() {
+        // Backslash escaped first, then `%`/`_`, wrapped in `%…%`.
+        let (sql, binds) = render_with(crate::dialect::default_dialect(), contains(NAME, r"50%_\x"));
+        assert_eq!(sql, r#""t"."name" like $1 escape '\'"#);
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0], Value::Text(r"%50\%\_\\x%".to_owned()));
+    }
+
+    #[test]
+    fn matches_default_config_on_postgres() {
+        assert_eq!(
+            render(matches(NAME, "hello")),
+            r#"to_tsvector('english', "t"."name") @@ plainto_tsquery('english', $1)"#
+        );
+    }
+
+    #[test]
+    fn matches_in_overrides_config_on_postgres() {
+        assert_eq!(
+            render(matches_in(NAME, "hola", "spanish")),
+            r#"to_tsvector('spanish', "t"."name") @@ plainto_tsquery('spanish', $1)"#
+        );
+    }
+
+    #[test]
+    fn matches_renders_fts5_on_sqlite() {
+        let (sql, binds) = render_with(&SqliteDialect, matches(NAME, "hello"));
+        assert_eq!(sql, r#""t"."name" match ?1"#);
+        assert_eq!(binds, vec![Value::Text("hello".to_owned())]);
+    }
+
+    #[test]
+    fn matches_in_config_ignored_by_fts5() {
+        // FTS5 has no per-query config; `matches_in` renders identically to `matches`.
+        let (sql, _) = render_with(&SqliteDialect, matches_in(NAME, "hello", "spanish"));
+        assert_eq!(sql, r#""t"."name" match ?1"#);
     }
 }

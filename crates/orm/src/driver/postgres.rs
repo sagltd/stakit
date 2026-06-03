@@ -247,7 +247,7 @@ fn read_vector(row: &PgRow, index: usize) -> Result<Value> {
     }
 }
 
-/// Read a PostGIS geometry into a [`Value::Geo`]. The query must select it as text
+/// Read a `PostGIS` geometry into a [`Value::Geo`]. The query must select it as text
 /// (e.g. `ST_AsText(location)`), which yields the bare WKT body without an SRID.
 fn read_geo(row: &PgRow, index: usize) -> Result<Value> {
     let cell: Option<String> = row.try_get(index).map_err(into_decode)?;
@@ -262,13 +262,22 @@ fn read_geo(row: &PgRow, index: usize) -> Result<Value> {
 fn bind_array(args: &mut PgArguments, kind: ValueKind, values: Vec<Value>) -> Result<()> {
     macro_rules! collect_add {
         ($variant:ident) => {{
+            // Error on any element whose variant disagrees with `kind` rather than
+            // silently dropping it (which would bind a short array). `any_of` always
+            // builds homogeneous arrays, so this only fires on a constructed mismatch.
             let typed: Vec<_> = values
                 .into_iter()
-                .filter_map(|value| match value {
-                    Value::$variant(inner) => Some(inner),
-                    _ => None,
+                .map(|value| match value {
+                    Value::$variant(inner) => Ok(inner),
+                    other => Err(Error::Encode(
+                        format!(
+                            "heterogeneous array bind: expected {} element, got {other:?}",
+                            stringify!($variant)
+                        )
+                        .into(),
+                    )),
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             args.add(typed)
         }};
     }
@@ -293,7 +302,9 @@ fn bind_array(args: &mut PgArguments, kind: ValueKind, values: Vec<Value>) -> Re
             return Err(Error::Encode("vector array binds are not supported".into()));
         }
         ValueKind::Geo => {
-            return Err(Error::Encode("geometry array binds are not supported".into()));
+            return Err(Error::Encode(
+                "geometry array binds are not supported".into(),
+            ));
         }
     };
     result.map_err(Error::Encode)

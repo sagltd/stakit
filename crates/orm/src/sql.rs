@@ -27,8 +27,13 @@ pub struct SqlWriter {
     numbered_placeholders: bool,
     quote_char: char,
     supports_any_array: bool,
+    supports_spatial: bool,
     vector_bind: (&'static str, &'static str),
     geo_bind: (&'static str, &'static str),
+    // Set when a clause needs a backend feature this dialect lacks (e.g. PostGIS
+    // `ST_*` / `<->` on a non-Postgres backend); the terminal turns it into an
+    // early `Error::Unsupported` instead of emitting SQL that only fails at the DB.
+    unsupported: Option<&'static str>,
     // Kept for the rare vector-distance path (metric-dependent, can't be a flag).
     dialect: &'static dyn crate::dialect::Dialect,
 }
@@ -57,10 +62,33 @@ impl SqlWriter {
             numbered_placeholders: dialect.numbered_placeholders(),
             quote_char: dialect.quote_char(),
             supports_any_array: dialect.supports_any_array(),
+            supports_spatial: dialect.supports_spatial(),
             vector_bind: dialect.vector_bind(),
             geo_bind: dialect.geo_bind(),
+            unsupported: None,
             dialect,
         }
+    }
+
+    /// Whether this backend supports `PostGIS` spatial SQL (`ST_*` functions and
+    /// the `<->` KNN operator). Only Postgres (with the extension) does.
+    #[must_use]
+    pub const fn supports_spatial(&self) -> bool {
+        self.supports_spatial
+    }
+
+    /// Record that a clause requires a backend feature this dialect lacks. The
+    /// first such marker wins; the terminal surfaces it as [`crate::Error::Unsupported`].
+    pub const fn mark_unsupported(&mut self, feature: &'static str) {
+        if self.unsupported.is_none() {
+            self.unsupported = Some(feature);
+        }
+    }
+
+    /// The unsupported-feature marker, if any clause set one.
+    #[must_use]
+    pub const fn unsupported(&self) -> Option<&'static str> {
+        self.unsupported
     }
 
     /// How this backend renders a vector distance (for nearest-neighbour ordering).
@@ -73,6 +101,12 @@ impl SqlWriter {
     #[must_use]
     pub fn full_text(&self) -> crate::dialect::FullText {
         self.dialect.full_text()
+    }
+
+    /// Whether this backend uses `MySQL`'s `ON DUPLICATE KEY UPDATE` upsert syntax.
+    #[must_use]
+    pub fn upsert_on_duplicate_key(&self) -> bool {
+        self.dialect.upsert_on_duplicate_key()
     }
 
     /// Append raw SQL text (keywords, punctuation — never user values).
@@ -102,7 +136,7 @@ impl SqlWriter {
     /// Queue a bind value and write its positional placeholder (`$N` for
     /// Postgres, `?N` for SQLite/libSQL).
     pub fn push_bind(&mut self, value: Value) {
-        // PostGIS geometries get the most involved treatment: a `::geometry` cast,
+        // `PostGIS` geometries get the most involved treatment: a `::geometry` cast,
         // wrapped in `ST_SetSRID(.., srid)` when a SRID is attached. Other backends
         // return `("", "")` from `geo_bind`, so the WKT just binds as plain text.
         if let Value::Geo { srid, .. } = &value {
@@ -124,7 +158,7 @@ impl SqlWriter {
         self.sql.push_str(wrap.1);
     }
 
-    /// Render a PostGIS geometry bind: `<pre>$N<suf>`, optionally wrapped in
+    /// Render a `PostGIS` geometry bind: `<pre>$N<suf>`, optionally wrapped in
     /// `ST_SetSRID(.., srid)` so a tagged SRID survives. The `(pre, suf)` cast comes
     /// from the dialect (`("", "::geometry")` on Postgres; `("", "")` elsewhere).
     fn push_geo_bind(&mut self, value: Value, srid: Option<i32>) {

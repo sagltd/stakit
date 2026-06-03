@@ -1,6 +1,6 @@
-//! First-class PostGIS (geospatial) support for the Postgres backend.
+//! First-class `PostGIS` (geospatial) support for the Postgres backend.
 //!
-//! PostGIS is a Postgres extension, so these types and functions target Postgres
+//! `PostGIS` is a Postgres extension, so these types and functions target Postgres
 //! only. Geometry values travel as their **(E)WKT text** (`POINT(1 2)`,
 //! `SRID=4326;POINT(1 2)`) — no extra dependency — bound with a `::geometry` cast
 //! and read back via `ST_AsText`, exactly mirroring how [`crate::vector`] uses
@@ -43,7 +43,7 @@ use crate::value::{FromValue, ToValue, Value, ValueKind};
 /// Mean Earth radius in metres — the conventional spherical haversine constant.
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
 
-/// A PostGIS geometry given as raw **(E)WKT** text and an optional SRID.
+/// A `PostGIS` geometry given as raw **(E)WKT** text and an optional SRID.
 ///
 /// The general escape hatch for any shape (polygons, linestrings, …). For points
 /// prefer the typed [`GeoPoint`]. Bound as `$N::geometry`; read back via
@@ -56,7 +56,7 @@ pub struct Geometry {
     pub srid: Option<i32>,
 }
 
-/// A PostGIS geography given as raw **(E)WKT** text and an optional SRID.
+/// A `PostGIS` geography given as raw **(E)WKT** text and an optional SRID.
 ///
 /// Same wire form as [`Geometry`] (it binds via the geometry path); use it to
 /// document intent when a column is declared `geography(...)`.
@@ -268,7 +268,7 @@ impl GeoPoint {
         (self.lng, self.lat)
     }
 
-    /// A GeoJSON `Point`: `{"type":"Point","coordinates":[lng,lat]}` (GeoJSON
+    /// A `GeoJSON` `Point`: `{"type":"Point","coordinates":[lng,lat]}` (`GeoJSON`
     /// coordinates are `[longitude, latitude]`).
     #[must_use]
     pub fn to_geojson(&self) -> serde_json::Value {
@@ -278,12 +278,12 @@ impl GeoPoint {
         })
     }
 
-    /// Parse a GeoJSON `Point` (`{"type":"Point","coordinates":[lng,lat]}`).
+    /// Parse a `GeoJSON` `Point` (`{"type":"Point","coordinates":[lng,lat]}`).
     ///
     /// # Errors
-    /// Returns [`Error::Decode`] if `value` is not a 2-element GeoJSON `Point`.
+    /// Returns [`Error::Decode`] if `value` is not a 2-element `GeoJSON` `Point`.
     pub fn from_geojson(value: &serde_json::Value) -> Result<Self> {
-        let invalid = || Error::Decode(format!("invalid GeoJSON point: {value}").into());
+        let invalid = || Error::Decode(format!("invalid `GeoJSON` point: {value}").into());
         if value.get("type").and_then(serde_json::Value::as_str) != Some("Point") {
             return Err(invalid());
         }
@@ -335,7 +335,11 @@ impl GeoPoint {
         let (d_lat, d_lng) = (lat2 - lat1, lng2 - lng1);
         let half_lat = (d_lat / 2.0).sin().powi(2);
         let half_lng = (d_lng / 2.0).sin().powi(2);
-        let a = (lat1.cos() * lat2.cos()).mul_add(half_lng, half_lat);
+        // Clamp into `asin`'s domain: floating-point error can nudge `a` just past
+        // 1.0 for near-antipodal points, which would yield `NaN` without the guard.
+        let a = (lat1.cos() * lat2.cos())
+            .mul_add(half_lng, half_lat)
+            .clamp(0.0, 1.0);
         2.0 * EARTH_RADIUS_M * a.sqrt().asin()
     }
 
@@ -359,7 +363,8 @@ impl GeoPoint {
     }
 
     /// The point reached by travelling `distance` (in `unit`) along `bearing_deg`
-    /// (compass degrees) from here. SRID is inherited.
+    /// (compass degrees) from here. The great-circle math assumes WGS 84 lat/lng
+    /// degrees; the result simply carries `self`'s SRID tag (not reprojected).
     #[must_use]
     pub fn destination(&self, bearing_deg: f64, distance: f64, unit: DistanceUnit) -> Self {
         let angular = unit.to_meters(distance) / EARTH_RADIUS_M;
@@ -379,8 +384,9 @@ impl GeoPoint {
         }
     }
 
-    /// The geographic midpoint between this point and `other`. SRID is inherited
-    /// from `self`.
+    /// The geographic midpoint between this point and `other`. The great-circle
+    /// math assumes WGS 84 lat/lng degrees; the result carries `self`'s SRID tag
+    /// (not reprojected).
     #[must_use]
     pub fn midpoint(&self, other: &Self) -> Self {
         let lat1 = self.lat.to_radians();
@@ -498,11 +504,11 @@ impl Dms {
     /// Recombine into a signed decimal degree (negative for `S`/`W`).
     #[must_use]
     pub fn to_decimal(&self) -> f64 {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "degrees/minutes are small whole numbers; f64 represents them exactly"
-        )]
-        let magnitude = f64::from(self.degrees) + f64::from(self.minutes) / 60.0 + self.seconds / 3600.0;
+        // degrees + minutes/60 + seconds/3600, as nested fused multiply-adds.
+        let magnitude = self.seconds.mul_add(
+            1.0 / 3600.0,
+            f64::from(self.minutes).mul_add(1.0 / 60.0, f64::from(self.degrees)),
+        );
         if matches!(self.hemisphere, 'S' | 'W' | 's' | 'w') {
             -magnitude
         } else {
@@ -520,7 +526,10 @@ fn with_srid_prefix(wkt: &str, srid: Option<i32>) -> String {
 /// `(srid, body)`.
 fn split_srid(text: &str) -> (Option<i32>, &str) {
     let trimmed = text.trim();
-    if let Some(rest) = trimmed.strip_prefix("SRID=").or_else(|| trimmed.strip_prefix("srid=")) {
+    if let Some(rest) = trimmed
+        .strip_prefix("SRID=")
+        .or_else(|| trimmed.strip_prefix("srid="))
+    {
         if let Some((digits, body)) = rest.split_once(';') {
             if let Ok(srid) = digits.trim().parse::<i32>() {
                 return (Some(srid), body.trim());
@@ -737,6 +746,11 @@ impl Projection for GeoDistance {
         1
     }
     fn write_columns(&self, out: &mut SqlWriter) -> Result<()> {
+        // `ST_Distance` is Postgres/PostGIS-only — flag non-Postgres so the terminal
+        // errors early, matching `write_spatial`/`nearest_geo`.
+        if !out.supports_spatial() {
+            out.mark_unsupported("PostGIS");
+        }
         out.push("st_distance(");
         out.push_qualified(self.table, self.name)?;
         out.push(", ");
@@ -759,13 +773,16 @@ mod tests {
         // Paris: lat 48.85, lng 2.35. WKT must be POINT(lng lat) — longitude first.
         let paris = GeoPoint::new(48.85, 2.35);
         assert_eq!(paris.wkt(), "POINT(2.35 48.85)");
-        assert_eq!(paris.lat(), 48.85);
-        assert_eq!(paris.lng(), 2.35);
+        assert!((paris.lat() - 48.85).abs() < 1e-12);
+        assert!((paris.lng() - 2.35).abs() < 1e-12);
     }
 
     #[test]
     fn from_lng_lat_uses_xy_order() {
-        assert_eq!(GeoPoint::from_lng_lat(2.35, 48.85).wkt(), "POINT(2.35 48.85)");
+        assert_eq!(
+            GeoPoint::from_lng_lat(2.35, 48.85).wkt(),
+            "POINT(2.35 48.85)"
+        );
     }
 
     #[test]
@@ -810,8 +827,10 @@ mod tests {
     #[test]
     fn lat_lng_and_lng_lat_accessors() {
         let p = GeoPoint::new(48.85, 2.35);
-        assert_eq!(p.as_lat_lng(), (48.85, 2.35));
-        assert_eq!(p.as_lng_lat(), (2.35, 48.85));
+        let (lat, lng) = p.as_lat_lng();
+        assert!((lat - 48.85).abs() < 1e-12 && (lng - 2.35).abs() < 1e-12);
+        let (lng2, lat2) = p.as_lng_lat();
+        assert!((lng2 - 2.35).abs() < 1e-12 && (lat2 - 48.85).abs() < 1e-12);
     }
 
     #[test]
@@ -845,8 +864,18 @@ mod tests {
         let p = GeoPoint::new(48.8566, 2.3522);
         let (lat, lng) = p.to_dms();
         let back = GeoPoint::from_dms(lat, lng);
-        assert!((back.lat - p.lat).abs() < 1e-9, "lat {} vs {}", back.lat, p.lat);
-        assert!((back.lng - p.lng).abs() < 1e-9, "lng {} vs {}", back.lng, p.lng);
+        assert!(
+            (back.lat - p.lat).abs() < 1e-9,
+            "lat {} vs {}",
+            back.lat,
+            p.lat
+        );
+        assert!(
+            (back.lng - p.lng).abs() < 1e-9,
+            "lng {} vs {}",
+            back.lng,
+            p.lng
+        );
     }
 
     #[test]
@@ -891,7 +920,11 @@ mod tests {
         let origin = GeoPoint::new(0.0, 0.0);
         let north = GeoPoint::new(1.0, 0.0);
         let east = GeoPoint::new(0.0, 1.0);
-        assert!(origin.bearing(&north).abs() < 0.5, "{}", origin.bearing(&north));
+        assert!(
+            origin.bearing(&north).abs() < 0.5,
+            "{}",
+            origin.bearing(&north)
+        );
         assert!(
             (origin.bearing(&east) - 90.0).abs() < 0.5,
             "{}",
@@ -946,9 +979,10 @@ mod tests {
     #[test]
     fn tuple_conversions_use_lat_lng() {
         let p = GeoPoint::from((48.85, 2.35));
-        assert_eq!(p.as_lat_lng(), (48.85, 2.35));
-        let (lat, lng): (f64, f64) = p.into();
-        assert_eq!((lat, lng), (48.85, 2.35));
+        let (lat, lng) = p.as_lat_lng();
+        assert!((lat - 48.85).abs() < 1e-12 && (lng - 2.35).abs() < 1e-12);
+        let (lat2, lng2): (f64, f64) = p.into();
+        assert!((lat2 - 48.85).abs() < 1e-12 && (lng2 - 2.35).abs() < 1e-12);
     }
 
     #[test]
@@ -978,7 +1012,10 @@ mod tests {
 
     #[test]
     fn srid_prefix_splits() {
-        assert_eq!(split_srid("SRID=4326;POINT(1 2)"), (Some(4326), "POINT(1 2)"));
+        assert_eq!(
+            split_srid("SRID=4326;POINT(1 2)"),
+            (Some(4326), "POINT(1 2)")
+        );
         assert_eq!(split_srid("POINT(1 2)"), (None, "POINT(1 2)"));
     }
 
@@ -986,5 +1023,38 @@ mod tests {
     fn malformed_point_is_error() {
         assert!(parse_point("NOTAPOINT").is_err());
         assert!(parse_point("POINT(1)").is_err());
+    }
+
+    #[test]
+    fn spatial_predicate_marks_unsupported_off_postgres() {
+        use crate::dialect::{PostgresDialect, SqliteDialect};
+        use crate::schema::Col;
+        use crate::sql::SqlWriter;
+
+        const LOC: Col<(), GeoPoint> = Col::new("places", "location");
+
+        // Postgres supports `ST_*`: the writer is not flagged.
+        let mut pg = SqlWriter::with_dialect(&PostgresDialect);
+        super::st_dwithin(LOC, GeoPoint::with_srid(48.8566, 2.3522, 4326), 1000.0)
+            .write(&mut pg)
+            .unwrap();
+        assert_eq!(pg.unsupported(), None);
+
+        // SQLite does not: `write_spatial` flags it so the terminal errors early.
+        let mut lite = SqlWriter::with_dialect(&SqliteDialect);
+        super::st_dwithin(LOC, GeoPoint::with_srid(48.8566, 2.3522, 4326), 1000.0)
+            .write(&mut lite)
+            .unwrap();
+        assert_eq!(lite.unsupported(), Some("PostGIS"));
+    }
+
+    #[test]
+    fn haversine_is_finite_for_antipodal_points() {
+        // Near-antipodal inputs are the case where FP error could push `asin`'s
+        // argument past 1.0 → NaN without the clamp.
+        let p = GeoPoint::new(0.0, 0.0);
+        let antipode = GeoPoint::new(0.0, 180.0);
+        let d = p.haversine_meters(&antipode);
+        assert!(d.is_finite(), "antipodal distance must be finite, got {d}");
     }
 }

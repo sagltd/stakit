@@ -592,6 +592,106 @@ fn on_conflict_do_update_with_only_target_falls_back_to_do_nothing() {
 }
 
 #[test]
+fn on_conflict_composite_key_selective_set_and_coalesce() {
+    use stakit_orm::Insert;
+    // Composite conflict key + explicit per-column updates: `price` overwritten,
+    // `id` kept when the incoming value is NULL (coalesce keeps the stored one).
+    let sql = Insert::new(vec![WidgetNew {
+        id: Some(uid()),
+        sku: "abc".to_owned(),
+        name: "Gadget".to_owned(),
+        price: 10,
+    }])
+    .on_conflict((Widget::sku, Widget::name))
+    .set(Widget::price)
+    .set_coalesce(Widget::id)
+    .to_sql()
+    .unwrap();
+    assert_eq!(
+        sql,
+        r#"insert into "widgets" ("sku", "name", "price", "id") values ($1, $2, $3, $4) on conflict ("sku", "name") do update set "price" = excluded."price", "id" = coalesce(excluded."id", "widgets"."id")"#
+    );
+}
+
+#[test]
+fn on_conflict_builder_do_nothing_renders_composite_target() {
+    use stakit_orm::Insert;
+    let sql = Insert::new(vec![WidgetNew {
+        id: Some(uid()),
+        sku: "abc".to_owned(),
+        name: "Gadget".to_owned(),
+        price: 10,
+    }])
+    .on_conflict((Widget::sku, Widget::name))
+    .do_nothing()
+    .to_sql()
+    .unwrap();
+    assert!(
+        sql.ends_with(r#"on conflict ("sku", "name") do nothing"#),
+        "got {sql}"
+    );
+}
+
+#[test]
+fn on_conflict_do_update_all_via_builder() {
+    use stakit_orm::Insert;
+    // `do_update_all()` overwrites every non-key inserted column with excluded.<col>.
+    let sql = Insert::new(vec![WidgetNew {
+        id: Some(uid()),
+        sku: "abc".to_owned(),
+        name: "Gadget".to_owned(),
+        price: 10,
+    }])
+    .on_conflict(Widget::sku)
+    .do_update_all()
+    .to_sql()
+    .unwrap();
+    assert_eq!(
+        sql,
+        r#"insert into "widgets" ("sku", "name", "price", "id") values ($1, $2, $3, $4) on conflict ("sku") do update set "name" = excluded."name", "price" = excluded."price", "id" = excluded."id""#
+    );
+}
+
+#[test]
+fn on_conflict_do_update_all_except_via_builder() {
+    use stakit_orm::Insert;
+    // `do_update_all_except(name)` overwrites all non-key columns but leaves `name`.
+    let sql = Insert::new(vec![WidgetNew {
+        id: Some(uid()),
+        sku: "abc".to_owned(),
+        name: "Gadget".to_owned(),
+        price: 10,
+    }])
+    .on_conflict(Widget::sku)
+    .do_update_all_except(Widget::name)
+    .to_sql()
+    .unwrap();
+    assert_eq!(
+        sql,
+        r#"insert into "widgets" ("sku", "name", "price", "id") values ($1, $2, $3, $4) on conflict ("sku") do update set "price" = excluded."price", "id" = excluded."id""#
+    );
+}
+
+#[test]
+fn on_conflict_builder_with_no_set_defaults_to_do_nothing() {
+    use stakit_orm::Insert;
+    // `on_conflict(key)` with no `set`/`set_coalesce` -> DO NOTHING (no empty SET).
+    let sql = Insert::new(vec![WidgetNew {
+        id: Some(uid()),
+        sku: "abc".to_owned(),
+        name: "Gadget".to_owned(),
+        price: 10,
+    }])
+    .on_conflict(Widget::sku)
+    .to_sql()
+    .unwrap();
+    assert!(
+        sql.ends_with(r#"on conflict ("sku") do nothing"#),
+        "got {sql}"
+    );
+}
+
+#[test]
 fn count_terminal_wraps_subquery() {
     // Count drops paging/order but keeps the filter; verify the inner SQL the
     // wrapper is built from renders the filter correctly.

@@ -42,6 +42,13 @@ pub trait Dialect: Send + Sync {
         true
     }
 
+    /// Whether upserts use `MySQL`'s `ON DUPLICATE KEY UPDATE col = VALUES(col)`
+    /// syntax instead of the standard `ON CONFLICT (target) DO …` (Postgres /
+    /// `SQLite` / Turso). `MySQL` overrides this to `true`.
+    fn upsert_on_duplicate_key(&self) -> bool {
+        false
+    }
+
     /// Text wrapped around a bound vector placeholder so the backend reads it as a
     /// vector: `("", "::vector")` on pgvector, `("vector32(", ")")` on Turso, `("",
     /// "")` (plain JSON text) on `sqlite-vec`. Default is no wrapping.
@@ -59,8 +66,8 @@ pub trait Dialect: Send + Sync {
         }
     }
 
-    /// Text wrapped around a bound PostGIS (E)WKT placeholder so the backend reads
-    /// it as a geometry: `("", "::geometry")` on Postgres/PostGIS, no wrapping
+    /// Text wrapped around a bound `PostGIS` (E)WKT placeholder so the backend reads
+    /// it as a geometry: `("", "::geometry")` on Postgres/`PostGIS`, no wrapping
     /// elsewhere (where the (E)WKT is just bound as plain text). See [`crate::geo`].
     fn geo_bind(&self) -> (&'static str, &'static str) {
         ("", "")
@@ -70,6 +77,16 @@ pub trait Dialect: Send + Sync {
     /// Default is `SQLite`/Turso FTS5 (`column MATCH ?`).
     fn full_text(&self) -> FullText {
         FullText::Fts5Match
+    }
+
+    /// Whether this backend supports `PostGIS` spatial SQL — the `ST_*` predicate
+    /// functions ([`crate::st_dwithin`] etc.) and the `<->` KNN operator
+    /// ([`crate::Select::nearest_geo`]). Only Postgres overrides this to `true`;
+    /// everywhere else those builders error early with `Error::Unsupported`.
+    /// (The [`crate::GeoPoint`] column type itself works on every backend — it
+    /// stores as plain WKT text — this only gates the spatial *operators*.)
+    fn supports_spatial(&self) -> bool {
+        false
     }
 }
 

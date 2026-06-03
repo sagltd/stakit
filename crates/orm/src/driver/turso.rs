@@ -237,7 +237,7 @@ fn to_libsql(value: Value) -> Result<LibsqlValue> {
         }
         // Bound as the text literal `[..]`; the SQL writer wraps it in `vector32(..)`.
         Value::Vector(x) => LibsqlValue::Text(crate::vector::to_literal(&x)),
-        // No PostGIS on Turso; bind the WKT as plain text.
+        // No `PostGIS` on Turso; bind the WKT as plain text.
         Value::Geo { wkt, .. } => LibsqlValue::Text(wkt),
         Value::Array(..) => {
             return Err(Error::Encode("Turso does not support array binds".into()));
@@ -312,7 +312,7 @@ fn cell_to_value(cell: LibsqlValue, kind: ValueKind) -> Result<Value> {
             LibsqlValue::Text(text) => Value::Vector(crate::vector::parse_literal(&text)?),
             _ => return Err(type_error("vector (blob or text)")),
         },
-        // No PostGIS on Turso; the WKT round-trips as plain text.
+        // No `PostGIS` on Turso; the WKT round-trips as plain text.
         ValueKind::Geo => Value::Geo {
             wkt: as_text(cell)?,
             srid: None,

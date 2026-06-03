@@ -492,3 +492,233 @@ struct PgArticle {
     id: i64,
     body: String,
 }
+
+// ----- PostGIS SQL rendering (no extension needed; checks the generated SQL) -----
+//
+// The embedded Postgres has no PostGIS, so these are render-only tests: they
+// assert the generated SQL string, the `::geometry` cast, the `ST_*` functions,
+// and the `$1`/`$2` placeholders — mirroring the pgvector render test.
+
+#[derive(Table, Debug)]
+#[table(name = "places")]
+#[allow(dead_code)]
+struct Place {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "geometry(Point,4326)", index = "gist")]
+    location: stakit_orm::GeoPoint,
+}
+
+/// A `GeoPoint` literal binds with the `::geometry` cast and a `$1` placeholder,
+/// and (when a SRID is set) is wrapped in `ST_SetSRID(.., srid)`.
+#[test]
+fn postgis_geopoint_literal_renders_geometry_cast_and_setsrid() {
+    use stakit_orm::GeoPoint;
+    let here = GeoPoint::with_srid(52.52, 13.405, 4326);
+    let sql = stakit_orm::Select::new(Place::all())
+        .from::<Place>()
+        .filter(eq(Place::location, here))
+        .to_sql()
+        .unwrap();
+    assert!(
+        sql.contains(r#""places"."location" = ST_SetSRID($1::geometry, 4326)"#),
+        "got: {sql}"
+    );
+}
+
+/// `st_dwithin(col, geom, distance)` renders `ST_DWithin("t"."col", $1::geometry, $2)`.
+#[test]
+fn postgis_st_dwithin_renders_function_cast_and_placeholders() {
+    use stakit_orm::{GeoPoint, st_dwithin};
+    // No SRID here so the bare `$1::geometry` cast is asserted exactly.
+    let center = GeoPoint::from_lng_lat(13.405, 52.52);
+    let sql = stakit_orm::Select::new(Place::all())
+        .from::<Place>()
+        .filter(st_dwithin(Place::location, center, 1000.0))
+        .to_sql()
+        .unwrap();
+    assert!(
+        sql.contains(r#"st_dwithin("places"."location", $1::geometry, $2)"#),
+        "got: {sql}"
+    );
+}
+
+/// `st_intersects(col, geom)` renders `ST_Intersects("t"."col", $1::geometry)`.
+#[test]
+fn postgis_st_intersects_renders_function_and_cast() {
+    use stakit_orm::{Geometry, st_intersects};
+    let poly = Geometry::new("POLYGON((0 0,1 0,1 1,0 1,0 0))");
+    let sql = stakit_orm::Select::new(Place::all())
+        .from::<Place>()
+        .filter(st_intersects(Place::location, poly))
+        .to_sql()
+        .unwrap();
+    assert!(
+        sql.contains(r#"st_intersects("places"."location", $1::geometry)"#),
+        "got: {sql}"
+    );
+}
+
+/// The selectable `st_distance(col, geom)` projection renders in the SELECT list.
+#[test]
+fn postgis_st_distance_projection_renders_in_select_list() {
+    use stakit_orm::{GeoPoint, st_distance};
+    let here = GeoPoint::from_lng_lat(13.405, 52.52);
+    let sql = stakit_orm::Select::new((Place::id, st_distance(Place::location, here)))
+        .from::<Place>()
+        .to_sql()
+        .unwrap();
+    assert!(
+        sql.contains(r#"st_distance("places"."location", $1::geometry)"#),
+        "got: {sql}"
+    );
+}
+
+/// KNN ordering via `nearest_geo` renders `"t"."col" <-> $1::geometry`.
+#[test]
+fn postgis_nearest_geo_renders_knn_operator_and_cast() {
+    use stakit_orm::GeoPoint;
+    let here = GeoPoint::from_lng_lat(13.405, 52.52);
+    let sql = stakit_orm::Select::new(Place::all())
+        .from::<Place>()
+        .nearest_geo(Place::location, here)
+        .limit(5)
+        .to_sql()
+        .unwrap();
+    assert!(
+        sql.contains(r#""places"."location" <-> $1::geometry"#),
+        "got: {sql}"
+    );
+    assert!(sql.contains("order by"), "got: {sql}");
+    assert!(sql.trim_end().ends_with("limit $2"), "got: {sql}");
+}
+
+/// The `#[column(index = "gist")]` flows to a `CREATE INDEX ... USING gist` DDL.
+#[test]
+fn postgis_gist_index_ddl_renders_using_gist() {
+    let location = <Place as stakit_orm::Table>::COLUMNS
+        .iter()
+        .find(|c| c.name == "location")
+        .expect("location column");
+    assert!(location.is_index);
+    assert_eq!(location.index_method, Some("gist"));
+    assert_eq!(
+        location.create_index_sql("places").as_deref(),
+        Some(r#"create index "idx_places_location" on "places" using gist ("location")"#),
+    );
+    // The arbitrary sql_type string flows through to the column metadata for DDL.
+    assert_eq!(location.sql_type, "geometry(Point,4326)");
+}
+
+// ----- composite-key upsert against real Postgres (the goal scenario) -----
+//
+// One atomic `INSERT … ON CONFLICT (user_id, device_id) DO UPDATE SET …` keeps one
+// row per device, refreshes chosen columns, and `set_coalesce(location)` preserves a
+// previously-learned location when a later login's location is still NULL.
+
+#[derive(Table, Debug)]
+#[table(name = "pg_login_devices")]
+#[allow(dead_code)]
+struct PgLoginDevice {
+    #[column(pk)]
+    id: i64,
+    user_id: i64,
+    device_id: String,
+    platform: String,
+    #[column(nullable)]
+    location: Option<String>,
+}
+
+#[tokio::test]
+async fn upsert_composite_key_coalesce_remembers_device_on_postgres() {
+    async fn remember(db: &Db, row: PgLoginDeviceNew) -> stakit_orm::Result<u64> {
+        db.insert(row)
+            .on_conflict((PgLoginDevice::user_id, PgLoginDevice::device_id))
+            .set(PgLoginDevice::platform)
+            .set_coalesce(PgLoginDevice::location)
+            .exec()
+            .await
+    }
+
+    let (postgres, db) = setup().await;
+    db.raw(
+        "create table pg_login_devices (id bigint primary key, user_id bigint not null, \
+         device_id text not null, platform text not null, location text, \
+         unique(user_id, device_id))",
+    )
+    .exec()
+    .await
+    .expect("create pg_login_devices");
+
+    // Mon: first login, location NULL.
+    remember(
+        &db,
+        PgLoginDeviceNew {
+            id: 1,
+            user_id: 7,
+            device_id: "phone".to_owned(),
+            platform: "ios-16".to_owned(),
+            location: None,
+        },
+    )
+    .await
+    .unwrap();
+    db.raw("update pg_login_devices set location = 'Berlin' where id = 1")
+        .exec()
+        .await
+        .unwrap();
+
+    // Tue: same device, platform refreshed, location still NULL -> Berlin preserved.
+    remember(
+        &db,
+        PgLoginDeviceNew {
+            id: 2,
+            user_id: 7,
+            device_id: "phone".to_owned(),
+            platform: "ios-17".to_owned(),
+            location: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let rows = db
+        .find::<PgLoginDevice>()
+        .order_by(asc(PgLoginDevice::id))
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "one row per (user, device)");
+    assert_eq!(rows[0].id, 1, "existing row updated in place");
+    assert_eq!(rows[0].platform, "ios-17", "platform refreshed");
+    assert_eq!(
+        rows[0].location.as_deref(),
+        Some("Berlin"),
+        "coalesce kept the learned location"
+    );
+
+    // Wed: a resolved location overwrites.
+    remember(
+        &db,
+        PgLoginDeviceNew {
+            id: 3,
+            user_id: 7,
+            device_id: "phone".to_owned(),
+            platform: "ios-17".to_owned(),
+            location: Some("Munich".to_owned()),
+        },
+    )
+    .await
+    .unwrap();
+    let one = db
+        .find::<PgLoginDevice>()
+        .filter(eq(PgLoginDevice::id, 1_i64))
+        .one()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(one.location.as_deref(), Some("Munich"));
+    assert_eq!(db.find::<PgLoginDevice>().count().await.unwrap(), 1);
+
+    postgres.stop().await.ok();
+}

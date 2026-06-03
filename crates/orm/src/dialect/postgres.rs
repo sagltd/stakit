@@ -36,6 +36,9 @@ impl Dialect for PostgresDialect {
     fn full_text(&self) -> super::FullText {
         super::FullText::TsQuery("english")
     }
+    fn supports_spatial(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

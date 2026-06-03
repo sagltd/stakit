@@ -1,5 +1,5 @@
 //! Raw `sqlx` vs `stakit-orm` — latency **and allocations** on real (embedded)
-//! Postgres. Same three shapes as the SQLite bench: insert, simple point-select,
+//! Postgres. Same three shapes as the `SQLite` bench: insert, simple point-select,
 //! medium filtered/ordered/limited select. Reads run against a fixed 1000-row
 //! table; inserts use a separate table.
 //!
@@ -105,7 +105,7 @@ fn ctx() -> &'static Ctx {
 // --- insert ---------------------------------------------------------------
 
 #[divan::bench]
-fn raw_insert(bencher: divan::Bencher) {
+fn raw_insert(bencher: divan::Bencher<'_, '_>) {
     let c = ctx();
     bencher.bench(|| {
         c.rt.block_on(async {
@@ -121,7 +121,7 @@ fn raw_insert(bencher: divan::Bencher) {
 }
 
 #[divan::bench]
-fn orm_insert(bencher: divan::Bencher) {
+fn orm_insert(bencher: divan::Bencher<'_, '_>) {
     let c = ctx();
     bencher.bench(|| {
         c.rt.block_on(async {
@@ -137,7 +137,7 @@ fn orm_insert(bencher: divan::Bencher) {
 // --- simple point-select (by primary key) ---------------------------------
 
 #[divan::bench]
-fn raw_simple(bencher: divan::Bencher) {
+fn raw_simple(bencher: divan::Bencher<'_, '_>) {
     let c = ctx();
     bencher.bench(|| {
         c.rt.block_on(async {
@@ -153,18 +153,17 @@ fn raw_simple(bencher: divan::Bencher) {
 }
 
 #[divan::bench]
-fn orm_simple(bencher: divan::Bencher) {
+fn orm_simple(bencher: divan::Bencher<'_, '_>) {
     let c = ctx();
     bencher.bench(|| {
         c.rt.block_on(async {
-            let row = c
-                .db
-                .select(User::all())
-                .from::<User>()
-                .filter(eq(User::id, 500_i64))
-                .one()
-                .await
-                .expect("orm simple");
+            let row =
+                c.db.select(User::all())
+                    .from::<User>()
+                    .filter(eq(User::id, 500_i64))
+                    .one()
+                    .await
+                    .expect("orm simple");
             divan::black_box(row)
         })
     });
@@ -173,7 +172,7 @@ fn orm_simple(bencher: divan::Bencher) {
 // --- medium: filter + order + limit ---------------------------------------
 
 #[divan::bench]
-fn raw_medium(bencher: divan::Bencher) {
+fn raw_medium(bencher: divan::Bencher<'_, '_>) {
     let c = ctx();
     bencher.bench(|| {
         c.rt.block_on(async {
@@ -190,19 +189,18 @@ fn raw_medium(bencher: divan::Bencher) {
 }
 
 #[divan::bench]
-fn orm_medium(bencher: divan::Bencher) {
+fn orm_medium(bencher: divan::Bencher<'_, '_>) {
     let c = ctx();
     bencher.bench(|| {
         c.rt.block_on(async {
-            let rows = c
-                .db
-                .find::<User>()
-                .filter(gt(User::age, 40))
-                .order_by(desc(User::age))
-                .limit(10)
-                .all()
-                .await
-                .expect("orm medium");
+            let rows =
+                c.db.find::<User>()
+                    .filter(gt(User::age, 40))
+                    .order_by(desc(User::age))
+                    .limit(10)
+                    .all()
+                    .await
+                    .expect("orm medium");
             divan::black_box(rows)
         })
     });

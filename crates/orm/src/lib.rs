@@ -67,7 +67,7 @@ pub use geo::{
     st_intersects, st_within,
 };
 pub use ident::IdentError;
-pub use insert::{Insert, InsertReturning, Insertable, OptionalPresent};
+pub use insert::{ConflictKey, Insert, InsertReturning, Insertable, OptionalPresent, Upsert};
 pub use json::Json;
 pub use mutation::{Delete, Update};
 pub use nanoid::{nanoid, nanoid_custom, nanoid_sized};
@@ -103,15 +103,16 @@ pub mod prelude {
     pub use crate::Table;
     pub use crate::error::{Error, Result};
     pub use crate::expr::{
-        ColExpr, Direction, IntoExpr, Order, Predicate, and, any_of, asc, desc, eq, gt, gte,
-        is_null, like, lt, lte, matches, ne, not, or, raw_pred,
-    };
-    pub use crate::projection::{
-        All, Count, Projection, avg, count, count_col, max, min, sql_expr, sum,
+        ColExpr, Direction, IntoExpr, Order, Predicate, and, any_of, asc, contains, desc, eq, gt,
+        gte, is_null, like, lt, lte, matches, matches_in, ne, not, or, raw_pred,
     };
     pub use crate::geo::{
         DistanceUnit, GeoPoint, Geography, Geometry, st_contains, st_distance, st_dwithin,
         st_intersects, st_within,
+    };
+    pub use crate::insert::Upsert;
+    pub use crate::projection::{
+        All, Count, Projection, avg, count, count_col, max, min, sql_expr, sum,
     };
     pub use crate::schema::{Col, Rel, Table as TableTrait};
     pub use crate::vector::{Distance, Vector, distance};

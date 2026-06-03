@@ -1326,3 +1326,247 @@ async fn sqlite_fts5_match() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].title, "Rust");
 }
+
+// ----- GeoPoint round-trips through plain TEXT (no PostGIS, any backend) -----
+//
+// GeoPoint stores as plain WKT text on backends without PostGIS: SQLite binds the
+// `POINT(lng lat)` string and reads it back as text into a GeoPoint. No extension,
+// no `::geometry` cast. This proves GeoPoint works with zero PostGIS.
+
+#[derive(Table, Debug)]
+#[table(name = "geo_places")]
+#[allow(dead_code)]
+struct GeoPlace {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    loc: stakit_orm::GeoPoint,
+}
+
+#[tokio::test]
+async fn geopoint_round_trips_as_plain_text_on_sqlite() {
+    use stakit_orm::GeoPoint;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    db.raw("create table geo_places (id integer primary key, loc text not null)")
+        .exec()
+        .await
+        .unwrap();
+
+    // Paris, in human (lat, lng) order; WKT stored is POINT(lng lat).
+    let paris = GeoPoint::new(48.8566, 2.3522);
+    db.insert(GeoPlaceNew { id: 1, loc: paris })
+        .exec()
+        .await
+        .expect("insert geopoint");
+
+    let got = db.get::<GeoPlace>(1).one().await.unwrap().unwrap();
+    // Round-trips lat/lng through plain text (SRID is None on read, as documented).
+    assert!(
+        (got.loc.lat() - 48.8566).abs() < 1e-9,
+        "lat {}",
+        got.loc.lat()
+    );
+    assert!(
+        (got.loc.lng() - 2.3522).abs() < 1e-9,
+        "lng {}",
+        got.loc.lng()
+    );
+
+    // The stored cell is exactly the bare WKT (no SRID prefix, no cast): read the
+    // same table back through a String-typed column to inspect the raw text.
+    let raw = db
+        .raw("select id, loc from geo_places where id = 1")
+        .all::<RawGeo>()
+        .await
+        .unwrap();
+    assert_eq!(raw[0].loc, "POINT(2.3522 48.8566)");
+}
+
+// PostGIS spatial *operators* (`ST_*`, `<->`) are Postgres-only; on SQLite the
+// builder errors early with `Error::Unsupported("PostGIS")` instead of emitting SQL
+// the DB rejects. (The `GeoPoint` column type itself still works — see above.)
+#[tokio::test]
+async fn spatial_ops_error_unsupported_on_sqlite() {
+    use stakit_orm::{Error, GeoPoint, st_dwithin};
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+
+    // `ST_DWithin` in a WHERE filter.
+    let here = GeoPoint::new(48.8566, 2.3522);
+    let err = db
+        .find::<GeoPlace>()
+        .filter(st_dwithin(GeoPlace::loc, here, 1000.0))
+        .to_sql();
+    assert!(matches!(err, Err(Error::Unsupported("PostGIS"))), "got {err:?}");
+
+    // `nearest_geo` — the `<->` KNN ordering operator.
+    let err = db
+        .find::<GeoPlace>()
+        .nearest_geo(GeoPlace::loc, GeoPoint::new(0.0, 0.0))
+        .to_sql();
+    assert!(matches!(err, Err(Error::Unsupported("PostGIS"))), "got {err:?}");
+
+    // `st_distance` as a selectable projection.
+    let err = db
+        .select((GeoPlace::id, stakit_orm::st_distance(GeoPlace::loc, here)))
+        .from::<GeoPlace>()
+        .to_sql();
+    assert!(matches!(err, Err(Error::Unsupported("PostGIS"))), "got {err:?}");
+}
+
+/// The same `geo_places` table viewed with a plain `String` location column —
+/// proves the geometry cell is stored as bare WKT text.
+#[derive(Table, Debug)]
+#[table(name = "geo_places")]
+#[allow(dead_code)]
+struct RawGeo {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    loc: String,
+}
+
+// ----- composite-key upsert: "remember this device" (the goal scenario) -----
+//
+// One row per (user_id, device_id). First login inserts; later logins update only
+// the chosen columns. `set_coalesce(location)` keeps the stored location when a
+// later login's location is still NULL (async geolocation not yet resolved), so a
+// previously-learned location is never wiped — all in ONE atomic statement.
+
+#[derive(Table, Debug)]
+#[table(name = "login_devices")]
+#[allow(dead_code)]
+struct LoginDevice {
+    #[column(pk)]
+    id: i64,
+    user_id: i64,
+    #[column(sql_type = "text")]
+    device_id: String,
+    platform: String,
+    #[column(nullable)]
+    location: Option<String>,
+}
+
+#[tokio::test]
+async fn upsert_composite_key_coalesce_remembers_device() {
+    // The reusable "remember this device" upsert: key on (user_id, device_id),
+    // refresh platform, and keep an existing location when the new one is NULL.
+    async fn remember(db: &Db, row: LoginDeviceNew) -> stakit_orm::Result<u64> {
+        db.insert(row)
+            .on_conflict((LoginDevice::user_id, LoginDevice::device_id))
+            .set(LoginDevice::platform)
+            .set_coalesce(LoginDevice::location)
+            .exec()
+            .await
+    }
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    db.raw(
+        "create table login_devices (id integer primary key, user_id integer not null, \
+         device_id text not null, platform text not null, location text, \
+         unique(user_id, device_id))",
+    )
+    .exec()
+    .await
+    .unwrap();
+
+    // Mon: first login from the phone — geolocation not resolved yet (NULL).
+    remember(
+        &db,
+        LoginDeviceNew {
+            id: 1,
+            user_id: 7,
+            device_id: "phone".to_owned(),
+            platform: "ios-16".to_owned(),
+            location: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Async geolocation resolves a little later -> Berlin.
+    db.raw("update login_devices set location = 'Berlin' where id = 1")
+        .exec()
+        .await
+        .unwrap();
+
+    // Tue: same phone logs in again, platform refreshed, location still NULL.
+    remember(
+        &db,
+        LoginDeviceNew {
+            id: 2, // a fresh candidate id; the conflict updates the existing row instead
+            user_id: 7,
+            device_id: "phone".to_owned(),
+            platform: "ios-17".to_owned(),
+            location: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Exactly one row, platform refreshed, and "Berlin" PRESERVED (not wiped).
+    let rows = db
+        .find::<LoginDevice>()
+        .order_by(asc(LoginDevice::id))
+        .all()
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "exactly one device row per (user, device)");
+    assert_eq!(rows[0].id, 1, "the original row is updated in place");
+    assert_eq!(rows[0].platform, "ios-17", "platform refreshed");
+    assert_eq!(
+        rows[0].location.as_deref(),
+        Some("Berlin"),
+        "coalesce kept the previously-learned location"
+    );
+
+    // Wed: a login that DID resolve a location overwrites the stored one.
+    remember(
+        &db,
+        LoginDeviceNew {
+            id: 3,
+            user_id: 7,
+            device_id: "phone".to_owned(),
+            platform: "ios-17".to_owned(),
+            location: Some("Munich".to_owned()),
+        },
+    )
+    .await
+    .unwrap();
+    let rows = db.find::<LoginDevice>().all().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].location.as_deref(),
+        Some("Munich"),
+        "a non-NULL incoming location overwrites"
+    );
+
+    // A different device for the same user is a separate row (key is composite).
+    remember(
+        &db,
+        LoginDeviceNew {
+            id: 4,
+            user_id: 7,
+            device_id: "laptop".to_owned(),
+            platform: "macos".to_owned(),
+            location: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.find::<LoginDevice>().count().await.unwrap(), 2);
+}

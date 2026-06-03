@@ -77,7 +77,7 @@ impl<T: Table> Update<T> {
             writer.push(" where ");
             filter.write(&mut writer)?;
         }
-        Ok(crate::render::finish(writer))
+        crate::render::finish(writer)
     }
 
     /// Render the SQL (for inspection / unit tests).
@@ -150,7 +150,7 @@ impl<T: Table> Delete<T> {
             writer.push(" where ");
             filter.write(&mut writer)?;
         }
-        Ok(crate::render::finish(writer))
+        crate::render::finish(writer)
     }
 
     /// Render the SQL (for inspection / unit tests).

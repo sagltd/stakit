@@ -49,7 +49,7 @@ pub enum Value {
     /// backend's vector literal (`$N::vector` on pgvector, `vector32($N)` on Turso,
     /// JSON text on `sqlite-vec`); see [`crate::vector`].
     Vector(Vec<f32>),
-    /// A PostGIS geometry/geography: bare WKT (e.g. `POINT(1 2)`, **no** SRID
+    /// A `PostGIS` geometry/geography: bare WKT (e.g. `POINT(1 2)`, **no** SRID
     /// prefix) plus an optional SRID as a first-class field. Bound as
     /// `$N::geometry` (or `ST_SetSRID($N::geometry, srid)` when `srid` is set) on
     /// Postgres, and read back via `ST_AsText`; see [`crate::geo`].
@@ -98,7 +98,7 @@ pub enum ValueKind {
     Json,
     /// An embedding vector for vector search.
     Vector,
-    /// A PostGIS geometry/geography (carried as (E)WKT text).
+    /// A `PostGIS` geometry/geography (carried as (E)WKT text).
     Geo,
 }
 

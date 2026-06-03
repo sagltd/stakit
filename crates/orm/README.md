@@ -190,7 +190,7 @@ let u = db.find::<User>().filter(eq(User::id, 1)).one().await?;
 // partial projection -> tuple, inferred as (i64, String)
 let pairs = db.select((User::id, User::email)).from::<User>().all().await?;
 
-// filters: eq ne gt lt gte lte like is_null and or not any_of
+// filters: eq ne gt lt gte lte like contains is_null and or not any_of matches matches_in
 let some = db.find::<User>()
     .filter(and(gt(User::age, 18), not(like(User::email, "%@spam.com"))))
     .order_by(asc(User::age))
@@ -200,6 +200,10 @@ let some = db.find::<User>()
 
 // IN membership — one array bind on Postgres, IN (?, …) elsewhere; empty -> no rows
 let batch = db.find::<User>().filter(any_of(User::id, &[1_i64, 2, 3])).all().await?;
+
+// literal substring — LIKE-metacharacters in the needle are escaped (no wildcard
+// injection); `like(...)` is the raw form when you want to supply your own pattern
+let acme = db.find::<User>().filter(contains(User::email, "@acme.")).all().await?;
 
 // terminals: all / one / one_or_err / exact_one / count / exists / stream
 let n = db.find::<User>().count().await?;                     // i64
@@ -269,12 +273,53 @@ db.insert_many(rows).exec().await?;
 // RETURNING (Postgres / SQLite / Turso; errors on MySQL with Error::Unsupported)
 let id = db.insert(new_user).returning(User::id).one().await?;
 
-// upsert
+// upsert — overwrite every non-key column on a single-column conflict
 db.insert(new_user).on_conflict_do_update(User::id).exec().await?;
 
 db.update::<User>().set(User::name, "Renamed").filter(eq(User::id, 1)).exec().await?;
 db.delete::<User>().filter(eq(User::id, 1)).exec().await?;
 ```
+
+### Upsert: composite keys & per-column updates
+
+`on_conflict(key)` takes a single column **or a tuple** for a composite key, then you
+pick exactly which columns to refresh — every column you don't list is left untouched:
+
+```rust
+db.insert(DeviceNew { user_id, device_id, platform, location: None })
+    .on_conflict((Device::user_id, Device::device_id)) // composite key
+    .set(Device::platform)            // platform = excluded.platform (overwrite)
+    .set_coalesce(Device::location)   // location = coalesce(excluded.location, devices.location)
+    .exec().await?;
+```
+
+- `.set(col)` → `col = excluded.col` (take the incoming value).
+- `.set_coalesce(col)` → `col = coalesce(excluded.col, <table>.col)` — take the incoming
+  value, **but keep the stored one when the incoming value is `NULL`**. Ideal for
+  best-effort fields (an async-resolved geolocation, a late-arriving attribute) that a
+  later write with no value must not erase.
+- `.do_update_all()` — overwrite every non-key column (no need to list them).
+- `.do_update_all_except(Device::created_at)` — overwrite all but the given column(s).
+- `.do_nothing()` — keep the existing row.
+
+This collapses the classic "SELECT, then UPDATE-or-INSERT, plus a unique index and
+hand-rolled race handling" into **one atomic statement**. Generated SQL:
+
+```sql
+-- Postgres / SQLite / Turso
+ON CONFLICT ("user_id", "device_id") DO UPDATE SET
+  "platform" = excluded."platform",
+  "location" = coalesce(excluded."location", "devices"."location")
+
+-- MySQL (keys implicitly on a unique index; VALUES() = incoming, bare col = stored)
+ON DUPLICATE KEY UPDATE
+  `platform` = values(`platform`),
+  `location` = coalesce(values(`location`), `location`)
+```
+
+The conflict key must be backed by a unique/primary constraint: named explicitly in
+`ON CONFLICT (...)` on Postgres/`SQLite`/Turso, matched implicitly by `MySQL`. Verified
+e2e on real Postgres and SQLite (the "remember this device" login scenario).
 
 ## Transactions
 
@@ -434,8 +479,10 @@ Now `db.insert`, `db.find::<Item>()`, `db.get`, `#[derive(Row)]`, and
 blanket `Option<T>` impl). Rule of thumb: impl **(1)+(2)** to store/read it, add **(3)**
 to compare against it in `WHERE`.
 
-PostGIS plugs in the same way: store `geometry` as WKT (`Text`) or WKB (`Bytes`), and
-use `db.raw(...)`/`sql_expr` for `ST_*` functions and operators.
+Geospatial points are already first-class — see [Geospatial](#geospatial--geopoint-works-with-or-without-postgis)
+below for the built-in `GeoPoint` type (no custom impls needed). For other PostGIS
+geometries (polygons, lines), use the `Geometry`/`Geography` newtypes the same way, or
+drop to `db.raw(...)`/`sql_expr` for arbitrary `ST_*` calls.
 
 ## Vector search (pgvector / Turso / sqlite-vec)
 
@@ -477,6 +524,96 @@ and caveats per backend:
 Without an ANN index `nearest()` is an exact full scan. `Distance` is L2/Cosine/Inner­Product;
 for any other metric use `sql_expr`/`raw`. (Verified e2e on Turso; pgvector/sqlite-vec
 need their extensions, which aren't bundled.)
+
+## Geospatial — `GeoPoint` (works with or without PostGIS)
+
+`GeoPoint` is a built-in lat/lng column type. It stores as plain **WKT text on every
+backend** — so it works as an ordinary column with **zero extensions** — and *also*
+binds as a native `geometry` on Postgres when PostGIS is installed (the bind gets a
+`::geometry` cast, wrapped in `ST_SetSRID(.., srid)` when a SRID is attached). Same
+type, same code, both modes.
+
+```rust
+use stakit_orm::prelude::*;     // GeoPoint, DistanceUnit, st_dwithin, …
+
+#[derive(Table)]
+#[table(name = "places")]
+struct Place {
+    #[column(pk)] id: i64,
+    // No PostGIS? use `text`. With PostGIS, use `geometry(Point,4326)` (+ a GiST index).
+    #[column(sql_type = "text")]
+    location: GeoPoint,
+}
+
+let here = GeoPoint::new(48.8566, 2.3522);          // (lat, lng)
+db.insert(PlaceNew { id: 1, location: here }).exec().await?;   // binds "POINT(2.3522 48.8566)"
+let p = db.get::<Place>(1).one().await?;            // reads WKT text back into GeoPoint
+let same = db.find::<Place>().filter(eq(Place::location, here)).all().await?;
+```
+
+**Constructors & accessors** (note WKT is `POINT(lng lat)` — lng first — but
+`new` takes the conventional `lat, lng`):
+
+```rust
+GeoPoint::new(lat, lng);              // conventional order
+GeoPoint::from_lng_lat(lng, lat);     // GeoJSON / WKT order
+GeoPoint::with_srid(lat, lng, 4326);  // tag a SRID (survives the PostGIS bind)
+GeoPoint::try_new(lat, lng)?;         // validated: lat ∈ [-90,90], lng ∈ [-180,180]
+p.lat(); p.lng(); p.as_lat_lng(); p.as_lng_lat();
+p.wkt();   // "POINT(lng lat)"        p.ewkt();  // "SRID=4326;POINT(lng lat)"
+```
+
+**Conversions** — GeoJSON and degrees-minutes-seconds, both round-trip:
+
+```rust
+let gj = p.to_geojson();              // {"type":"Point","coordinates":[lng,lat]}
+let p2 = GeoPoint::from_geojson(&gj)?;
+let (lat_dms, lng_dms) = p.to_dms();  // Dms { degrees, minutes, seconds, hemisphere }
+let p3 = GeoPoint::from_dms(lat_dms, lng_dms);
+```
+
+**Geodesy on the WGS-84 sphere** (no DB round-trip, no extension — pure Rust):
+
+```rust
+use stakit_orm::DistanceUnit::{Kilometers, Meters, Miles, NauticalMiles};
+
+let km   = paris.distance(&london, Kilometers);   // also haversine_meters(&other)
+let brg  = paris.bearing(&london);                // initial bearing, degrees
+let dest = paris.destination(90.0, 10.0, Kilometers); // 10 km due east
+let mid  = paris.midpoint(&london);
+let near = paris.within(&london, 500.0, Kilometers);  // bool
+let (sw, ne) = paris.bounding_box(5.0, Kilometers);   // corners for a coarse pre-filter
+```
+
+`DistanceUnit` is `Meters | Kilometers | Miles | NauticalMiles` with
+`from_meters` / `to_meters` converters.
+
+### PostGIS spatial queries (Postgres + PostGIS only)
+
+When PostGIS *is* installed, typed predicates render the `ST_*` functions and the
+`<->` KNN operator — geometry is always parameter-bound (never interpolated):
+
+```rust
+use stakit_orm::{st_dwithin, st_intersects, st_contains, st_within, st_distance};
+
+// rows within 1 km of `here`
+let nearby = db.find::<Place>()
+    .filter(st_dwithin(Place::location, here, 1_000.0))   // ST_DWithin(col, $1::geometry, $2)
+    .all().await?;
+
+// distance as a selectable projection, KNN-ordered nearest-first
+let ranked = db.select((Place::id, st_distance(Place::location, here)))
+    .from::<Place>()
+    .nearest_geo(Place::location, here)                   // ORDER BY col <-> $1
+    .limit(10)
+    .all().await?;
+```
+
+Also `st_intersects` / `st_contains` / `st_within` for polygons (pass a `Geometry`
+WKT). These emit PostGIS SQL, so they require the extension; the `GeoPoint` type,
+storage, and all the geodesy above need **nothing**. (PostGIS isn't bundled with the
+embedded test Postgres, so the spatial-query SQL is render-tested; plain-text
+`GeoPoint` round-trips are verified e2e on SQLite and Postgres.)
 
 ## Full-text search (Postgres / SQLite FTS5 / Turso FTS5)
 

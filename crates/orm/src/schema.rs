@@ -56,7 +56,7 @@ pub struct Column {
     /// Whether a (non-unique) secondary index should be created on this column.
     pub is_index: bool,
     /// The index access method, when one was requested explicitly (e.g. `"gist"`
-    /// for a PostGIS geometry column via `#[column(index = "gist")]`). `None` uses
+    /// for a `PostGIS` geometry column via `#[column(index = "gist")]`). `None` uses
     /// the backend default (B-tree). Only meaningful when [`is_index`](Self::is_index).
     pub index_method: Option<&'static str>,
     /// Whether the column is nullable.
@@ -72,7 +72,7 @@ impl Column {
     /// column has no secondary index ([`is_index`](Self::is_index) is `false`).
     ///
     /// Emits `create index "idx_<table>_<name>" on "<table>" using <method> ("<name>")`
-    /// when an [`index_method`](Self::index_method) is set (e.g. `gist` for a PostGIS
+    /// when an [`index_method`](Self::index_method) is set (e.g. `gist` for a `PostGIS`
     /// geometry column), or the same without the `using` clause for the default
     /// B-tree. Identifiers are quoted; the method is a developer-supplied
     /// `&'static str` written verbatim.

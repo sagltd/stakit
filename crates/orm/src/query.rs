@@ -27,7 +27,7 @@ struct NearestOrder {
     metric: Distance,
 }
 
-/// A PostGIS KNN ordering: `ORDER BY "table"."name" <-> $N::geometry`.
+/// A `PostGIS` KNN ordering: `ORDER BY "table"."name" <-> $N::geometry`.
 struct NearestGeo {
     table: &'static str,
     name: &'static str,
@@ -168,9 +168,9 @@ impl<P: Projection> Select<P> {
         self
     }
 
-    /// Order by PostGIS distance to `geom` (KNN nearest-neighbour search): appends
-    /// `ORDER BY "table"."name" <-> $N::geometry`, which PostGIS answers from a
-    /// GiST index. Combine with `.limit(k)` for top-k. See [`crate::geo`].
+    /// Order by `PostGIS` distance to `geom` (KNN nearest-neighbour search): appends
+    /// `ORDER BY "table"."name" <-> $N::geometry`, which `PostGIS` answers from a
+    /// `GiST` index. Combine with `.limit(k)` for top-k. See [`crate::geo`].
     #[must_use]
     pub fn nearest_geo<T, Ty>(
         mut self,
@@ -273,8 +273,13 @@ impl<P: Projection> Select<P> {
             order_started = true;
         }
         if let Some(geo) = nearest_geo {
+            // `<->` is a PostGIS/pgvector operator — flag non-Postgres so the
+            // terminal errors early instead of emitting SQL the DB would reject.
+            if !writer.supports_spatial() {
+                writer.mark_unsupported("PostGIS");
+            }
             writer.push(if order_started { ", " } else { " order by " });
-            // PostGIS KNN: `<col> <-> $N::geometry` (the cast is added by push_bind).
+            // `PostGIS` KNN: `<col> <-> $N::geometry` (the cast is added by push_bind).
             writer.push_qualified(geo.table, geo.name)?;
             writer.push(" <-> ");
             writer.push_bind(geo.geom);
@@ -288,7 +293,7 @@ impl<P: Projection> Select<P> {
             writer.push(" offset ");
             writer.push_bind(Value::I64(offset));
         }
-        let (sql, arguments) = crate::render::finish(writer);
+        let (sql, arguments) = crate::render::finish(writer)?;
         Ok((projection, sql, arguments))
     }
 

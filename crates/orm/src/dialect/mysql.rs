@@ -25,6 +25,9 @@ impl Dialect for MySqlDialect {
     fn supports_returning(&self) -> bool {
         false
     }
+    fn upsert_on_duplicate_key(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
