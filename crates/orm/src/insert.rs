@@ -720,6 +720,23 @@ mod tests {
     }
 
     #[test]
+    fn pg_do_update_all_with_composite_target_skips_all_key_columns() {
+        let conflict = Conflict {
+            targets: target(&["user_id", "device_id"]),
+            action: ConflictAction::UpdateAll,
+        };
+        let sql = render(
+            &PostgresDialect,
+            &conflict,
+            &["user_id", "device_id", "platform", "last_seen"],
+        );
+        assert_eq!(
+            sql,
+            r#" on conflict ("user_id", "device_id") do update set "platform" = excluded."platform", "last_seen" = excluded."last_seen""#
+        );
+    }
+
+    #[test]
     fn pg_do_update_all_except_skips_target_and_listed() {
         let conflict = Conflict {
             targets: target(&["user_id", "device_id"]),

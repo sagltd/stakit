@@ -631,3 +631,80 @@ async fn turso_fts5_match() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].title, "Rust");
 }
+
+// ----- composite-key upsert with coalesce against real Turso / libSQL -----
+//
+// Turso shares the standard `ON CONFLICT (...)` path with SQLite. This proves it
+// end-to-end on the non-sqlx engine: one row per (user_id, device_id), and
+// `set_coalesce` preserves a learned location across a later NULL-location login.
+
+#[derive(Table, Debug)]
+#[table(name = "tt_login_devices")]
+#[allow(dead_code)]
+struct TtLoginDevice {
+    #[column(pk)]
+    id: i64,
+    user_id: i64,
+    #[column(sql_type = "text")]
+    device_id: String,
+    platform: String,
+    #[column(nullable)]
+    location: Option<String>,
+}
+
+#[tokio::test]
+async fn upsert_composite_key_coalesce_remembers_device_on_turso() {
+    async fn remember(db: &Db, row: TtLoginDeviceNew) -> stakit_orm::Result<u64> {
+        db.insert(row)
+            .on_conflict((TtLoginDevice::user_id, TtLoginDevice::device_id))
+            .set(TtLoginDevice::platform)
+            .set_coalesce(TtLoginDevice::location)
+            .exec()
+            .await
+    }
+
+    let db = Db::connect_turso_local(":memory:").await.expect("open");
+    db.raw(
+        "create table tt_login_devices (id integer primary key, user_id integer not null, \
+         device_id text not null, platform text not null, location text, \
+         unique(user_id, device_id))",
+    )
+    .exec()
+    .await
+    .expect("create");
+
+    remember(
+        &db,
+        TtLoginDeviceNew {
+            id: 1,
+            user_id: 7,
+            device_id: "phone".to_owned(),
+            platform: "ios-16".to_owned(),
+            location: None,
+        },
+    )
+    .await
+    .unwrap();
+    db.raw("update tt_login_devices set location = 'Berlin' where id = 1")
+        .exec()
+        .await
+        .unwrap();
+    remember(
+        &db,
+        TtLoginDeviceNew {
+            id: 2,
+            user_id: 7,
+            device_id: "phone".to_owned(),
+            platform: "ios-17".to_owned(),
+            location: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let rows = db.find::<TtLoginDevice>().all().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, 1);
+    assert_eq!(rows[0].platform, "ios-17");
+    assert_eq!(rows[0].location.as_deref(), Some("Berlin"));
+}

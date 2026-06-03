@@ -312,3 +312,92 @@ async fn mysql_enums_temporal_json() {
         .unwrap();
     assert_eq!(highs.len(), 1);
 }
+
+// ----- composite-key upsert with coalesce against real MySQL (env-gated) -----
+//
+// Proves the `ON DUPLICATE KEY UPDATE col = values(col)` / `coalesce(values(col),
+// col)` path against a live MySQL server: one row per (user_id, device_id), and
+// a learned location survives a later NULL-location login. Skips without MYSQL_URL.
+
+#[derive(Table, Debug)]
+#[table(name = "mt_login_devices")]
+#[allow(dead_code)]
+struct MtLoginDevice {
+    #[column(pk)]
+    id: i64,
+    user_id: i64,
+    device_id: String,
+    platform: String,
+    #[column(nullable)]
+    location: Option<String>,
+}
+
+#[tokio::test]
+async fn upsert_composite_key_coalesce_remembers_device_on_mysql() {
+    async fn remember(db: &Db, row: MtLoginDeviceNew) -> stakit_orm::Result<u64> {
+        db.insert(row)
+            .on_conflict((MtLoginDevice::user_id, MtLoginDevice::device_id))
+            .set(MtLoginDevice::platform)
+            .set_coalesce(MtLoginDevice::location)
+            .exec()
+            .await
+    }
+
+    let Ok(url) = std::env::var("MYSQL_URL") else {
+        eprintln!("MYSQL_URL not set; skipping MySQL upsert e2e");
+        return;
+    };
+    let db = Db::connect_mysql(&url).await.expect("connect mysql");
+
+    db.raw("drop table if exists mt_login_devices")
+        .exec()
+        .await
+        .expect("drop");
+    db.raw(
+        "create table mt_login_devices (\
+            id bigint primary key, \
+            user_id bigint not null, \
+            device_id varchar(255) not null, \
+            platform varchar(255) not null, \
+            location varchar(255), \
+            unique key uq_user_device (user_id, device_id))",
+    )
+    .exec()
+    .await
+    .expect("create");
+
+    remember(
+        &db,
+        MtLoginDeviceNew {
+            id: 1,
+            user_id: 7,
+            device_id: "phone".to_owned(),
+            platform: "ios-16".to_owned(),
+            location: None,
+        },
+    )
+    .await
+    .unwrap();
+    db.raw("update mt_login_devices set location = 'Berlin' where id = 1")
+        .exec()
+        .await
+        .unwrap();
+    remember(
+        &db,
+        MtLoginDeviceNew {
+            id: 2,
+            user_id: 7,
+            device_id: "phone".to_owned(),
+            platform: "ios-17".to_owned(),
+            location: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let rows = db.find::<MtLoginDevice>().all().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, 1);
+    assert_eq!(rows[0].platform, "ios-17");
+    assert_eq!(rows[0].location.as_deref(), Some("Berlin"));
+}

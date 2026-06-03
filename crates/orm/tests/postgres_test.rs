@@ -720,5 +720,24 @@ async fn upsert_composite_key_coalesce_remembers_device_on_postgres() {
     assert_eq!(one.location.as_deref(), Some("Munich"));
     assert_eq!(db.find::<PgLoginDevice>().count().await.unwrap(), 1);
 
+    // on_conflict + RETURNING: an upsert that conflicts updates in place and returns
+    // the surviving row's id (proves the conflict clause precedes RETURNING).
+    let returned: i64 = db
+        .insert(PgLoginDeviceNew {
+            id: 99,
+            user_id: 7,
+            device_id: "phone".to_owned(),
+            platform: "ios-18".to_owned(),
+            location: None,
+        })
+        .on_conflict((PgLoginDevice::user_id, PgLoginDevice::device_id))
+        .set(PgLoginDevice::platform)
+        .returning(PgLoginDevice::id)
+        .one()
+        .await
+        .unwrap();
+    assert_eq!(returned, 1, "RETURNING yields the existing row id on conflict-update");
+    assert_eq!(db.find::<PgLoginDevice>().count().await.unwrap(), 1);
+
     postgres.stop().await.ok();
 }
