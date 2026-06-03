@@ -2,8 +2,11 @@
 
 use crate::validate::error::ValidationError;
 
-/// Value must look like a URL: `scheme://host…` with a valid scheme and a
-/// non-empty host. Not a full URL parser — fast and good enough for input.
+/// Value must look like a URL, with no whitespace or control characters.
+///
+/// Requires `scheme://host…` with a valid scheme and a non-empty host. A raw space
+/// or newline is invalid (it must be percent-encoded). Not a full URL parser — fast
+/// and good enough for input.
 ///
 /// # Errors
 /// Fails with code `url` if the structure is invalid.
@@ -17,6 +20,11 @@ pub fn url(value: &str) -> Result<(), ValidationError> {
 }
 
 fn looks_like_url(s: &str) -> bool {
+    // A raw space, newline, or control char is never valid in a URL (must be
+    // percent-encoded); reject outright (a newline also enables log/header injection).
+    if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
     let Some(pos) = s.find("://") else {
         return false;
     };
