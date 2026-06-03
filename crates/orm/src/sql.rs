@@ -20,6 +20,7 @@ const DEFAULT_SQL_CAPACITY: usize = 96;
 /// The dialect's per-statement flags are read **once** at construction and cached
 /// as plain fields, so the hot assembly path (`push_bind`, `push_ident`) does no
 /// vtable dispatch per bind/identifier.
+#[allow(clippy::struct_excessive_bools)] // cached per-dialect rendering flags
 pub struct SqlWriter {
     sql: String,
     binds: BindBuffer,
@@ -28,6 +29,7 @@ pub struct SqlWriter {
     quote_char: char,
     supports_any_array: bool,
     supports_spatial: bool,
+    supports_cast: bool,
     vector_bind: (&'static str, &'static str),
     geo_bind: (&'static str, &'static str),
     // Set when a clause needs a backend feature this dialect lacks (e.g. PostGIS
@@ -63,6 +65,7 @@ impl SqlWriter {
             quote_char: dialect.quote_char(),
             supports_any_array: dialect.supports_any_array(),
             supports_spatial: dialect.supports_spatial(),
+            supports_cast: dialect.supports_cast(),
             vector_bind: dialect.vector_bind(),
             geo_bind: dialect.geo_bind(),
             unsupported: None,
@@ -136,6 +139,25 @@ impl SqlWriter {
     /// Queue a bind value and write its positional placeholder (`$N` for
     /// Postgres, `?N` for SQLite/libSQL).
     pub fn push_bind(&mut self, value: Value) {
+        // A cast-tagged value renders `$N::<cast>` (Postgres composite/enum/domain/
+        // custom types). The driver only ever sees the unwrapped `inner`, so no
+        // driver needs a `Value::Cast` arm. On a dialect without `::` casts the bind
+        // is flagged so the terminal returns `Error::Unsupported`.
+        if let Value::Cast { cast, inner } = value {
+            if self.supports_cast {
+                self.binds.push(*inner);
+                let position = self.binds.len();
+                self.push_placeholder(position);
+                self.sql.push_str("::");
+                self.sql.push_str(cast);
+            } else {
+                self.mark_unsupported(cast);
+                self.binds.push(*inner);
+                let position = self.binds.len();
+                self.push_placeholder(position);
+            }
+            return;
+        }
         // `PostGIS` geometries get the most involved treatment: a `::geometry` cast,
         // wrapped in `ST_SetSRID(.., srid)` when a SRID is attached. Other backends
         // return `("", "")` from `geo_bind`, so the WKT just binds as plain text.
@@ -201,6 +223,13 @@ impl SqlWriter {
     #[must_use]
     pub const fn supports_any_array(&self) -> bool {
         self.supports_any_array
+    }
+
+    /// Whether this backend supports `$N::type` / `expr::type` casts (Postgres).
+    /// Used to gate read-side projection casts (e.g. composite `col::text`).
+    #[must_use]
+    pub const fn supports_cast(&self) -> bool {
+        self.supports_cast
     }
 
     /// Borrow the assembled SQL text.

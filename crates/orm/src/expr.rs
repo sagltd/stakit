@@ -777,7 +777,8 @@ mod tests {
     #[test]
     fn contains_escapes_like_metacharacters_in_bound_value() {
         // Backslash escaped first, then `%`/`_`, wrapped in `%…%`.
-        let (sql, binds) = render_with(crate::dialect::default_dialect(), contains(NAME, r"50%_\x"));
+        let (sql, binds) =
+            render_with(crate::dialect::default_dialect(), contains(NAME, r"50%_\x"));
         assert_eq!(sql, r#""t"."name" like $1 escape '\'"#);
         assert_eq!(binds.len(), 1);
         assert_eq!(binds[0], Value::Text(r"%50\%\_\\x%".to_owned()));

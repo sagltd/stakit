@@ -65,6 +65,11 @@ pub struct Column {
     pub default: Option<&'static str>,
     /// Foreign-key reference, if any.
     pub references: Option<ForeignKey>,
+    /// A cast applied when this column is **selected** in a whole-row projection
+    /// (e.g. `Some("text")` for a Postgres composite read as `col::text`). `None`
+    /// selects the column bare. Sourced from the field type's
+    /// [`FromValue::READ_CAST`](crate::FromValue::READ_CAST).
+    pub read_cast: Option<&'static str>,
 }
 
 impl Column {
@@ -82,7 +87,7 @@ impl Column {
     /// let geo = Column {
     ///     name: "location", sql_type: "geometry(Point,4326)", is_pk: false,
     ///     is_unique: false, is_index: true, index_method: Some("gist"),
-    ///     is_nullable: false, default: None, references: None,
+    ///     is_nullable: false, default: None, references: None, read_cast: None,
     /// };
     /// assert_eq!(
     ///     geo.create_index_sql("places").as_deref(),

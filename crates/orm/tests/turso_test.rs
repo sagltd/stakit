@@ -708,3 +708,40 @@ async fn upsert_composite_key_coalesce_remembers_device_on_turso() {
     assert_eq!(rows[0].platform, "ios-17");
     assert_eq!(rows[0].location.as_deref(), Some("Berlin"));
 }
+
+// ----- Vec<T> + HashMap columns via JSON fallback on Turso/libSQL -----
+
+#[derive(Table, Debug)]
+#[table(name = "tt_bags")]
+#[allow(dead_code)]
+struct TtBag {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    nums: Vec<i32>,
+    #[column(sql_type = "text")]
+    meta: std::collections::HashMap<String, i32>,
+}
+
+#[tokio::test]
+async fn vec_and_map_round_trip_as_json_on_turso() {
+    let db = Db::connect_turso_local(":memory:").await.expect("open");
+    db.raw("create table tt_bags (id integer primary key, nums text not null, meta text not null)")
+        .exec()
+        .await
+        .expect("create");
+    let mut meta = std::collections::HashMap::new();
+    meta.insert("a".to_owned(), 1);
+    db.insert(TtBagNew {
+        id: 1,
+        nums: vec![4, 5, 6],
+        meta: meta.clone(),
+    })
+    .exec()
+    .await
+    .expect("insert");
+
+    let bag = db.get::<TtBag>(1).one().await.unwrap().unwrap();
+    assert_eq!(bag.nums, vec![4, 5, 6]);
+    assert_eq!(bag.meta, meta);
+}

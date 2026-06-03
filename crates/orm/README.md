@@ -484,6 +484,104 @@ below for the built-in `GeoPoint` type (no custom impls needed). For other PostG
 geometries (polygons, lines), use the `Geometry`/`Geography` newtypes the same way, or
 drop to `db.raw(...)`/`sql_expr` for arbitrary `ST_*` calls.
 
+## Collections — `Vec<T>` and `HashMap` / `BTreeMap`
+
+`Vec<T>`, `HashMap<K, V>`, and `BTreeMap<K, V>` are usable as columns directly — no
+wrapper:
+
+```rust
+#[derive(Table)]
+#[table(name = "bags")]
+struct Bag {
+    #[column(pk)] id: i64,
+    #[column(sql_type = "int[]")]  tags: Vec<i32>,                  // "text" on sqlite/turso/mysql
+    #[column(sql_type = "jsonb")]  meta: std::collections::HashMap<String, i32>,
+}
+// db.insert(BagNew { id: 1, tags: vec![1,2,3], meta }).exec().await?;
+// let bag = db.get::<Bag>(1).one().await?;   // tags: Vec<i32>, meta: HashMap<..> — decoded
+```
+
+- **`Vec<T>`** → a **native Postgres array** (`int[]`, `text[]`, `uuid[]`, `float8[]`,
+  `timestamptz[]`, …) for both bind and read; on SQLite/MySQL/Turso it transparently
+  falls back to a **JSON array** in a text/JSON column. `Option<Vec<T>>` is a nullable
+  array; an empty `Vec` round-trips. (Nested `Vec<Vec<T>>` isn't a native array — use
+  `Json<Vec<Vec<T>>>`.)
+- **`HashMap`/`BTreeMap`** → **JSON** everywhere (`jsonb`/`json`/text). Portable, no
+  `hstore` extension. Any `serde`-able key/value works.
+
+Pick the column `sql_type` per backend (`int[]` on Postgres, `text` elsewhere); the
+runtime bind/decode adapts automatically. For arbitrary nested data, `Json<T>` (above)
+still works for any `serde` type.
+
+## Composite types — `#[derive(Type)]` (Postgres)
+
+Map a Rust struct to a Postgres **composite type** (`CREATE TYPE … AS (…)`):
+
+```rust
+use stakit_orm::Type;
+
+#[derive(Type, Debug, Clone, PartialEq)]
+#[db_type(name = "address_type")]      // defaults to snake_case struct name
+struct Address {
+    street: String,
+    city: String,
+    zip: String,
+    is_primary: bool,
+}
+
+#[derive(Table)]
+#[table(name = "users")]
+struct User {
+    #[column(pk)] id: i64,
+    #[column(sql_type = "address_type")] home: Address,
+    #[column(nullable, sql_type = "address_type")] work: Option<Address>,
+}
+
+// run once before the table migration:
+db.raw(Address::create_type_sql()).exec().await?;  // CREATE TYPE address_type AS (...)
+// then it just works — bind, read, and filter:
+db.insert(UserNew { id: 1, home, work: None }).exec().await?;
+let u = db.get::<User>(1).one().await?;                       // home: Address (decoded)
+let here = db.find::<User>().filter(eq(User::home, home2)).all().await?;
+```
+
+The value binds as the composite text literal cast `$N::address_type` (with correct
+quoting/escaping of commas, quotes, NULLs), and reads back transparently (the column is
+auto-selected as `home::text`). `#[derive(Type)]` generates `ToValue`/`FromValue`/`IntoExpr`
+plus `SQL_TYPE_NAME` and `create_type_sql()`. Field types must themselves be column types
+(`String`, `bool`, enums, `Option<…>`, …).
+
+**Composite types are Postgres-only.** Binding one on SQLite/MySQL/Turso fails fast with
+`Error::Unsupported` (rather than emitting SQL the DB would reject).
+
+## Bring your own DB type — the cast hook
+
+The library can't know every Postgres/extension type. For any type that needs an
+explicit `$N::cast` (a native `ENUM`, `domain`, `inet`, `ltree`, a future PG type), you
+add it **from your own crate, no library changes** — set `ToValue::WRITE_CAST`:
+
+```rust
+struct Mood(String);   // CREATE TYPE mood AS ENUM ('happy','sad', …)
+
+impl stakit_orm::ToValue for Mood {
+    const WRITE_CAST: Option<&'static str> = Some("mood");     // ← the whole hook
+    fn to_value(self) -> stakit_orm::Value { stakit_orm::Value::Text(self.0) }
+}
+impl stakit_orm::FromValue for Mood {
+    const KIND: stakit_orm::ValueKind = stakit_orm::ValueKind::Text;
+    fn from_value(v: stakit_orm::Value) -> stakit_orm::Result<Self> {
+        Ok(Self(<String as stakit_orm::FromValue>::from_value(v)?))
+    }
+}
+// + the one-line IntoExpr<Mood> (see Color above) to filter on it.
+```
+
+Now `insert`/`find`/`get`/`eq(col, Mood(..))` all emit `$N::mood` — on inserts **and**
+in `WHERE` (and a `NULL` `Option<Mood>` casts too). The cast is applied only on
+cast-capable dialects (Postgres); elsewhere a value requiring it errors with
+`Error::Unsupported`. If your type also needs a read cast (composite-style), set
+`FromValue::READ_CAST = Some("text")` so it's selected as `col::text`.
+
 ## Vector search (pgvector / Turso / sqlite-vec)
 
 First-class. Store embeddings in a `Vector` column; `nearest()` renders the right SQL

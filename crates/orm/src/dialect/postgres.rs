@@ -39,6 +39,9 @@ impl Dialect for PostgresDialect {
     fn supports_spatial(&self) -> bool {
         true
     }
+    fn supports_cast(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

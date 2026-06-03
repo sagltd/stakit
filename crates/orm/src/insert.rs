@@ -234,12 +234,17 @@ impl<N: Insertable> Insert<N> {
     /// Render the SQL (for inspection / unit tests).
     ///
     /// # Errors
-    /// Returns an error if an identifier is invalid.
+    /// Returns an error if an identifier is invalid, or [`Error::Unsupported`] if a
+    /// bound value needs a backend feature this dialect lacks (e.g. a composite
+    /// `::type` cast on a non-Postgres backend).
     pub fn to_sql(self) -> Result<String> {
         if self.rows.is_empty() {
             return Ok(String::new());
         }
         let (_exec, writer) = self.render(None)?;
+        if let Some(feature) = writer.unsupported() {
+            return Err(Error::Unsupported(feature));
+        }
         Ok(writer.sql().to_owned())
     }
 
@@ -623,11 +628,13 @@ fn write_conflict(
     Ok(())
 }
 
-/// Helper for generated code: convert a field into a backend-neutral [`Value`].
+/// Helper for generated code: convert a field into a backend-neutral [`Value`],
+/// applying the type's [`ToValue::WRITE_CAST`](crate::ToValue::WRITE_CAST) so a
+/// composite/custom column (and its `NULL`) binds with the right `::type` cast.
 #[doc(hidden)]
 #[must_use]
 pub fn boxed_bind<T: crate::value::ToValue>(value: T) -> crate::value::Value {
-    value.to_value()
+    crate::value::with_cast(value.to_value(), T::WRITE_CAST)
 }
 
 #[cfg(test)]

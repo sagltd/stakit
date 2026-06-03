@@ -44,6 +44,14 @@ where
     }
     fn write_columns(&self, out: &mut SqlWriter) -> Result<()> {
         out.push_qualified(self.table, self.name)?;
+        // A composite/custom type reads via a cast (e.g. `col::text`) so the cell
+        // arrives in the form its `FromValue` decodes. Only on cast-capable dialects.
+        if let Some(cast) = <Ty as FromValue>::READ_CAST {
+            if out.supports_cast() {
+                out.push("::");
+                out.push(cast);
+            }
+        }
         Ok(())
     }
     fn decode(&self, row: &dyn Row, start: usize) -> Result<Ty> {
@@ -222,6 +230,14 @@ fn write_all_columns<T: Table>(out: &mut SqlWriter) -> Result<()> {
             out.push(", ");
         }
         out.push_qualified(T::TABLE, column.name)?;
+        // Composite/custom columns read via a cast (`col::text`) so the cell decodes
+        // through their `FromValue`. Only on cast-capable dialects (Postgres).
+        if let Some(cast) = column.read_cast {
+            if out.supports_cast() {
+                out.push("::");
+                out.push(cast);
+            }
+        }
     }
     Ok(())
 }

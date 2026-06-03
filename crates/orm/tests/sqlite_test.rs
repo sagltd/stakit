@@ -1220,6 +1220,49 @@ async fn typed_json_struct_round_trips() {
     assert_eq!(got.profile.0, profile);
 }
 
+// Vec / HashMap / any serde type stored directly via `Json<T>` on any backend.
+#[derive(Table, Debug)]
+#[table(name = "bags")]
+#[allow(dead_code)]
+struct Bag {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    list: stakit_orm::Json<Vec<String>>,
+    #[column(sql_type = "text")]
+    map: stakit_orm::Json<std::collections::HashMap<String, i32>>,
+}
+
+#[tokio::test]
+async fn json_stores_vec_and_hashmap() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    db.raw("create table bags (id integer primary key, list text not null, map text not null)")
+        .exec()
+        .await
+        .unwrap();
+
+    let mut map = std::collections::HashMap::new();
+    map.insert("a".to_owned(), 1);
+    map.insert("b".to_owned(), 2);
+    db.insert(BagNew {
+        id: 1,
+        list: stakit_orm::Json(vec!["x".to_owned(), "y".to_owned()]),
+        map: stakit_orm::Json(map.clone()),
+    })
+    .exec()
+    .await
+    .expect("insert collections");
+
+    let got = db.get::<Bag>(1).one().await.unwrap().unwrap();
+    assert_eq!(got.list.0, vec!["x".to_owned(), "y".to_owned()]);
+    assert_eq!(got.map.0, map);
+}
+
 // ----- pgvector SQL rendering (no extension needed; checks the generated SQL) -----
 
 #[derive(Table, Debug)]
@@ -1406,21 +1449,30 @@ async fn spatial_ops_error_unsupported_on_sqlite() {
         .find::<GeoPlace>()
         .filter(st_dwithin(GeoPlace::loc, here, 1000.0))
         .to_sql();
-    assert!(matches!(err, Err(Error::Unsupported("PostGIS"))), "got {err:?}");
+    assert!(
+        matches!(err, Err(Error::Unsupported("PostGIS"))),
+        "got {err:?}"
+    );
 
     // `nearest_geo` — the `<->` KNN ordering operator.
     let err = db
         .find::<GeoPlace>()
         .nearest_geo(GeoPlace::loc, GeoPoint::new(0.0, 0.0))
         .to_sql();
-    assert!(matches!(err, Err(Error::Unsupported("PostGIS"))), "got {err:?}");
+    assert!(
+        matches!(err, Err(Error::Unsupported("PostGIS"))),
+        "got {err:?}"
+    );
 
     // `st_distance` as a selectable projection.
     let err = db
         .select((GeoPlace::id, stakit_orm::st_distance(GeoPlace::loc, here)))
         .from::<GeoPlace>()
         .to_sql();
-    assert!(matches!(err, Err(Error::Unsupported("PostGIS"))), "got {err:?}");
+    assert!(
+        matches!(err, Err(Error::Unsupported("PostGIS"))),
+        "got {err:?}"
+    );
 }
 
 /// The same `geo_places` table viewed with a plain `String` location column —
@@ -1569,4 +1621,190 @@ async fn upsert_composite_key_coalesce_remembers_device() {
     .await
     .unwrap();
     assert_eq!(db.find::<LoginDevice>().count().await.unwrap(), 2);
+}
+
+// ----- Vec<T> + HashMap columns via JSON fallback on SQLite (no native arrays) -----
+
+#[derive(Table, Debug)]
+#[table(name = "lite_bags")]
+#[allow(dead_code)]
+struct LiteBag {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    nums: Vec<i32>,
+    #[column(sql_type = "text")]
+    tags: Vec<String>,
+    #[column(nullable, sql_type = "text")]
+    maybe: Option<Vec<i32>>,
+    #[column(sql_type = "text")]
+    meta: std::collections::HashMap<String, i32>,
+}
+
+#[tokio::test]
+async fn vec_and_map_round_trip_as_json_on_sqlite() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    db.raw(
+        "create table lite_bags (id integer primary key, nums text not null, \
+         tags text not null, maybe text, meta text not null)",
+    )
+    .exec()
+    .await
+    .unwrap();
+
+    let mut meta = std::collections::HashMap::new();
+    meta.insert("a".to_owned(), 1);
+    db.insert(LiteBagNew {
+        id: 1,
+        nums: vec![1, 2, 3],
+        tags: vec!["x".to_owned(), "y".to_owned()],
+        maybe: Some(vec![9]),
+        meta: meta.clone(),
+    })
+    .exec()
+    .await
+    .expect("insert");
+    db.insert(LiteBagNew {
+        id: 2,
+        nums: vec![],
+        tags: vec![],
+        maybe: None,
+        meta: std::collections::HashMap::new(),
+    })
+    .exec()
+    .await
+    .expect("insert empty");
+
+    let b1 = db.get::<LiteBag>(1).one().await.unwrap().unwrap();
+    assert_eq!(b1.nums, vec![1, 2, 3], "Vec<i32> via JSON text");
+    assert_eq!(b1.tags, vec!["x".to_owned(), "y".to_owned()]);
+    assert_eq!(b1.maybe, Some(vec![9]));
+    assert_eq!(b1.meta, meta);
+
+    let b2 = db.get::<LiteBag>(2).one().await.unwrap().unwrap();
+    assert_eq!(b2.nums, Vec::<i32>::new());
+    assert_eq!(b2.maybe, None);
+
+    // The stored cell is JSON text.
+    let raw = db
+        .raw("select id, nums from lite_bags where id = 1")
+        .all::<RawNums>()
+        .await
+        .unwrap();
+    assert_eq!(raw[0].nums, "[1,2,3]");
+}
+
+#[derive(Table, Debug)]
+#[table(name = "lite_bags")]
+#[allow(dead_code)]
+struct RawNums {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    nums: String,
+}
+
+// Composite types are Postgres-only: binding one on SQLite errors at build time.
+#[derive(stakit_orm::Type, Debug, Clone, PartialEq)]
+#[db_type(name = "lite_addr")]
+#[allow(dead_code)]
+struct LiteAddr {
+    street: String,
+    city: String,
+}
+
+#[derive(Table, Debug)]
+#[table(name = "lite_addr_rows")]
+#[allow(dead_code)]
+struct LiteAddrRow {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "lite_addr")]
+    home: LiteAddr,
+}
+
+#[tokio::test]
+async fn composite_type_errors_unsupported_on_sqlite() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    // The `::lite_addr` cast isn't a SQLite thing -> Error::Unsupported at SQL build.
+    let err = db
+        .insert(LiteAddrRowNew {
+            id: 1,
+            home: LiteAddr {
+                street: "x".to_owned(),
+                city: "y".to_owned(),
+            },
+        })
+        .to_sql();
+    assert!(
+        matches!(err, Err(Error::Unsupported("lite_addr"))),
+        "got {err:?}"
+    );
+}
+
+// Date/time array elements via JSON fallback (regression: json_to_scalar dates).
+#[derive(Table, Debug)]
+#[table(name = "lite_dates")]
+#[allow(dead_code)]
+struct LiteDates {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "text")]
+    days: Vec<chrono::NaiveDate>,
+    #[column(sql_type = "text")]
+    naive: Vec<chrono::NaiveDateTime>,
+    #[column(sql_type = "text")]
+    instants: Vec<chrono::DateTime<chrono::Utc>>,
+}
+
+#[tokio::test]
+async fn date_arrays_round_trip_as_json_on_sqlite() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let db = Db::sqlite(pool);
+    db.raw("create table lite_dates (id integer primary key, days text not null, naive text not null, instants text not null)")
+        .exec()
+        .await
+        .unwrap();
+
+    let day = chrono::NaiveDate::from_ymd_opt(2020, 1, 2).unwrap();
+    let naive = day.and_hms_opt(3, 4, 5).unwrap();
+    let instant = "2020-01-02T03:04:05Z"
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+    db.insert(LiteDatesNew {
+        id: 1,
+        days: vec![day],
+        naive: vec![naive],
+        instants: vec![instant],
+    })
+    .exec()
+    .await
+    .expect("insert");
+
+    let row = db.get::<LiteDates>(1).one().await.unwrap().unwrap();
+    assert_eq!(row.days, vec![day], "Vec<NaiveDate> via JSON fallback");
+    assert_eq!(
+        row.naive,
+        vec![naive],
+        "Vec<NaiveDateTime> via JSON fallback"
+    );
+    assert_eq!(
+        row.instants,
+        vec![instant],
+        "Vec<DateTime<Utc>> via JSON fallback"
+    );
 }

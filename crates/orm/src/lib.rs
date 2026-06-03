@@ -27,6 +27,8 @@
 //! # }
 //! ```
 
+#[doc(hidden)]
+pub mod composite;
 mod db;
 pub mod dialect;
 pub mod driver;
@@ -92,6 +94,9 @@ pub use stakit_orm_derive::Row;
 /// The `#[derive(DbEnum)]` macro: makes a fieldless enum a column type (stored as
 /// text by default, or as an integer with `#[db_enum(int)]`).
 pub use stakit_orm_derive::DbEnum;
+
+/// The `#[derive(Type)]` macro: makes a struct a Postgres composite column type.
+pub use stakit_orm_derive::Type;
 
 /// Common imports: the [`Db`] handle, the derive, query operators, and core
 /// traits/types.

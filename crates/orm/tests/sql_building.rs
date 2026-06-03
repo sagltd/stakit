@@ -746,3 +746,133 @@ fn table_metadata_is_emitted() {
     assert_eq!(reference.table, "users");
     assert_eq!(reference.column, "id");
 }
+
+// ----- #[derive(Type)] Postgres composite types -----
+
+#[derive(stakit_orm::Type, Debug, Clone, PartialEq)]
+#[db_type(name = "address_type")]
+#[allow(dead_code)]
+struct Address {
+    street: String,
+    city: String,
+    is_primary: bool,
+}
+
+#[derive(Table)]
+#[table(name = "people")]
+#[allow(dead_code)]
+struct Person {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "address_type")]
+    home: Address,
+}
+
+#[test]
+fn composite_create_type_sql_and_name() {
+    assert_eq!(Address::SQL_TYPE_NAME, "address_type");
+    assert_eq!(
+        Address::create_type_sql(),
+        "create type address_type as (street text, city text, is_primary boolean)"
+    );
+}
+
+#[test]
+fn composite_insert_casts_placeholder() {
+    use stakit_orm::Insert;
+    let sql = Insert::new(vec![PersonNew {
+        id: 1,
+        home: Address {
+            street: "123 Main, Apt 4".to_owned(),
+            city: "NYC".to_owned(),
+            is_primary: true,
+        },
+    }])
+    .to_sql()
+    .unwrap();
+    // The composite binds as the text literal cast to the type.
+    assert!(sql.contains("values ($1, $2::address_type)"), "got {sql}");
+}
+
+#[test]
+fn composite_whole_row_select_reads_as_text() {
+    let sql = Select::new(Person::all())
+        .from::<Person>()
+        .to_sql()
+        .unwrap();
+    // The composite column is selected as `home::text` so it decodes via FromValue.
+    assert!(sql.contains(r#""people"."home"::text"#), "got {sql}");
+}
+
+#[test]
+fn composite_filter_casts_in_where() {
+    let sql = Select::new(Person::all())
+        .from::<Person>()
+        .filter(eq(
+            Person::home,
+            Address {
+                street: "x".to_owned(),
+                city: "y".to_owned(),
+                is_primary: false,
+            },
+        ))
+        .to_sql()
+        .unwrap();
+    assert!(sql.contains("::address_type"), "got {sql}");
+}
+
+// ----- user-extensible custom type: cast a placeholder to ANY DB type, no lib edit -----
+
+#[derive(Debug, Clone, PartialEq)]
+struct Mood(String); // maps to a Postgres `CREATE TYPE mood AS ENUM (...)`
+
+impl stakit_orm::ToValue for Mood {
+    // The whole extensibility hook: name the DB cast; bind the payload as text.
+    const WRITE_CAST: Option<&'static str> = Some("mood");
+    fn to_value(self) -> stakit_orm::Value {
+        stakit_orm::Value::Text(self.0)
+    }
+}
+impl stakit_orm::FromValue for Mood {
+    const KIND: stakit_orm::ValueKind = stakit_orm::ValueKind::Text;
+    fn from_value(v: stakit_orm::Value) -> stakit_orm::Result<Self> {
+        Ok(Self(<String as stakit_orm::FromValue>::from_value(v)?))
+    }
+}
+impl stakit_orm::expr::IntoExpr<Self> for Mood {
+    fn into_operand(self) -> stakit_orm::expr::Operand {
+        stakit_orm::expr::Operand::Value(stakit_orm::value::with_cast(
+            <Self as stakit_orm::ToValue>::to_value(self),
+            <Self as stakit_orm::ToValue>::WRITE_CAST,
+        ))
+    }
+}
+
+#[derive(Table)]
+#[table(name = "players")]
+#[allow(dead_code)]
+struct Player {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "mood")]
+    mood: Mood,
+}
+
+#[test]
+fn user_custom_type_casts_on_insert_and_filter() {
+    use stakit_orm::Insert;
+    let sql = Insert::new(vec![PlayerNew {
+        id: 1,
+        mood: Mood("happy".to_owned()),
+    }])
+    .to_sql()
+    .unwrap();
+    assert!(sql.contains("$2::mood"), "insert cast, got {sql}");
+
+    let sql = Select::new(Player::all())
+        .from::<Player>()
+        .filter(eq(Player::mood, Mood("sad".to_owned())))
+        .to_sql()
+        .unwrap();
+    assert!(sql.contains("$1::mood"), "filter cast, got {sql}");
+}

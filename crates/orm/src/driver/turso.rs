@@ -239,9 +239,11 @@ fn to_libsql(value: Value) -> Result<LibsqlValue> {
         Value::Vector(x) => LibsqlValue::Text(crate::vector::to_literal(&x)),
         // No `PostGIS` on Turso; bind the WKT as plain text.
         Value::Geo { wkt, .. } => LibsqlValue::Text(wkt),
-        Value::Array(..) => {
-            return Err(Error::Encode("Turso does not support array binds".into()));
-        }
+        // A `Vec<T>` column has no native libSQL array type — store as JSON text.
+        Value::Array(_, items) => LibsqlValue::Text(crate::value::array_to_json_text(&items)),
+        // `::` casts aren't a libSQL thing; the SQL writer already flagged this bind
+        // as unsupported (the statement errors before reaching here). Defensive only.
+        Value::Cast { inner, .. } => return to_libsql(*inner),
     })
 }
 
@@ -317,6 +319,8 @@ fn cell_to_value(cell: LibsqlValue, kind: ValueKind) -> Result<Value> {
             wkt: as_text(cell)?,
             srid: None,
         },
+        // No native arrays on libSQL — stored as JSON text.
+        ValueKind::Array(elem) => crate::value::json_text_to_array(&as_text(cell)?, *elem)?,
     })
 }
 

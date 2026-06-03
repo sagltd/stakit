@@ -79,6 +79,14 @@ pub trait Dialect: Send + Sync {
         FullText::Fts5Match
     }
 
+    /// Whether this backend supports `$N::type` placeholder casts (Postgres). Used
+    /// by [`Value::Cast`](crate::Value::Cast) for composite / enum / domain / custom
+    /// types. Only Postgres overrides this to `true`; elsewhere a cast bind is
+    /// rejected at build time with `Error::Unsupported`.
+    fn supports_cast(&self) -> bool {
+        false
+    }
+
     /// Whether this backend supports `PostGIS` spatial SQL — the `ST_*` predicate
     /// functions ([`crate::st_dwithin`] etc.) and the `<->` KNN operator
     /// ([`crate::Select::nearest_geo`]). Only Postgres overrides this to `true`;

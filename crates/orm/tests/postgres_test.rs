@@ -736,8 +736,227 @@ async fn upsert_composite_key_coalesce_remembers_device_on_postgres() {
         .one()
         .await
         .unwrap();
-    assert_eq!(returned, 1, "RETURNING yields the existing row id on conflict-update");
+    assert_eq!(
+        returned, 1,
+        "RETURNING yields the existing row id on conflict-update"
+    );
     assert_eq!(db.find::<PgLoginDevice>().count().await.unwrap(), 1);
+
+    postgres.stop().await.ok();
+}
+
+// ----- #[derive(Type)] composite types against real Postgres -----
+
+#[derive(stakit_orm::Type, Debug, Clone, PartialEq)]
+#[db_type(name = "pg_address")]
+#[allow(dead_code)]
+struct PgAddress {
+    street: String,
+    city: String,
+    zip: String,
+    is_primary: bool,
+}
+
+#[derive(Table, Debug)]
+#[table(name = "pg_people")]
+#[allow(dead_code)]
+struct PgPerson {
+    #[column(pk)]
+    id: i64,
+    name: String,
+    #[column(sql_type = "pg_address")]
+    home: PgAddress,
+    #[column(nullable, sql_type = "pg_address")]
+    work: Option<PgAddress>,
+}
+
+#[tokio::test]
+async fn composite_type_round_trips_on_postgres() {
+    let (postgres, db) = setup().await;
+    db.raw(PgAddress::create_type_sql())
+        .exec()
+        .await
+        .expect("create type");
+    db.raw(
+        "create table pg_people (id bigint primary key, name text not null, \
+         home pg_address not null, work pg_address)",
+    )
+    .exec()
+    .await
+    .expect("create table");
+
+    // `street` has a comma -> exercises composite text quoting/escaping.
+    let home = PgAddress {
+        street: "123 Main, Apt 4".to_owned(),
+        city: "Berlin".to_owned(),
+        zip: "10115".to_owned(),
+        is_primary: true,
+    };
+    let work = PgAddress {
+        street: "1 Office Rd".to_owned(),
+        city: "Berlin".to_owned(),
+        zip: "10117".to_owned(),
+        is_primary: false,
+    };
+    db.insert(PgPersonNew {
+        id: 1,
+        name: "Ann".to_owned(),
+        home: home.clone(),
+        work: Some(work.clone()),
+    })
+    .exec()
+    .await
+    .expect("insert with composite");
+    db.insert(PgPersonNew {
+        id: 2,
+        name: "Bo".to_owned(),
+        home: home.clone(),
+        work: None,
+    })
+    .exec()
+    .await
+    .expect("insert null work");
+
+    // Whole-row read decodes the composite transparently (selected as `home::text`).
+    let p1 = db.get::<PgPerson>(1).one().await.unwrap().unwrap();
+    assert_eq!(
+        p1.home, home,
+        "composite round-trips incl. the comma in street"
+    );
+    assert_eq!(p1.work, Some(work));
+
+    let p2 = db.get::<PgPerson>(2).one().await.unwrap().unwrap();
+    assert_eq!(p2.work, None, "NULL composite reads as None");
+
+    // Filter by composite equality (the value casts to `::pg_address` in WHERE).
+    let found = db
+        .find::<PgPerson>()
+        .filter(eq(PgPerson::home, home.clone()))
+        .all()
+        .await
+        .expect("composite equality filter");
+    assert_eq!(found.len(), 2);
+
+    postgres.stop().await.ok();
+}
+
+// ----- native Vec<T> arrays + HashMap columns on Postgres -----
+
+#[derive(Table, Debug)]
+#[table(name = "pg_bags")]
+#[allow(dead_code)]
+struct PgBag {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "int[]")]
+    nums: Vec<i32>,
+    #[column(sql_type = "text[]")]
+    tags: Vec<String>,
+    #[column(nullable, sql_type = "int[]")]
+    maybe: Option<Vec<i32>>,
+    #[column(sql_type = "jsonb")]
+    meta: std::collections::HashMap<String, i32>,
+}
+
+#[tokio::test]
+async fn native_arrays_and_map_round_trip_on_postgres() {
+    let (postgres, db) = setup().await;
+    db.raw(
+        "create table pg_bags (id bigint primary key, nums int[] not null, \
+         tags text[] not null, maybe int[], meta jsonb not null)",
+    )
+    .exec()
+    .await
+    .expect("create");
+
+    let mut meta = std::collections::HashMap::new();
+    meta.insert("a".to_owned(), 1);
+    meta.insert("b".to_owned(), 2);
+    db.insert(PgBagNew {
+        id: 1,
+        nums: vec![1, 2, 3],
+        tags: vec!["x".to_owned(), "y, z".to_owned()],
+        maybe: Some(vec![9, 8]),
+        meta: meta.clone(),
+    })
+    .exec()
+    .await
+    .expect("insert");
+    db.insert(PgBagNew {
+        id: 2,
+        nums: vec![],
+        tags: vec![],
+        maybe: None,
+        meta: std::collections::HashMap::new(),
+    })
+    .exec()
+    .await
+    .expect("insert empty/null");
+
+    let b1 = db.get::<PgBag>(1).one().await.unwrap().unwrap();
+    assert_eq!(b1.nums, vec![1, 2, 3], "native int[] round-trips");
+    assert_eq!(b1.tags, vec!["x".to_owned(), "y, z".to_owned()], "text[]");
+    assert_eq!(b1.maybe, Some(vec![9, 8]));
+    assert_eq!(b1.meta, meta, "HashMap via jsonb");
+
+    let b2 = db.get::<PgBag>(2).one().await.unwrap().unwrap();
+    assert_eq!(b2.nums, Vec::<i32>::new(), "empty array");
+    assert_eq!(b2.maybe, None, "NULL array reads as None");
+    assert!(b2.meta.is_empty());
+
+    postgres.stop().await.ok();
+}
+
+// ----- native date/time arrays on Postgres (regression: read/null symmetry) -----
+
+#[derive(Table, Debug)]
+#[table(name = "pg_dates")]
+#[allow(dead_code)]
+struct PgDates {
+    #[column(pk)]
+    id: i64,
+    #[column(sql_type = "date[]")]
+    days: Vec<chrono::NaiveDate>,
+    #[column(sql_type = "timestamptz[]")]
+    instants: Vec<chrono::DateTime<chrono::Utc>>,
+    #[column(sql_type = "timestamp[]")]
+    naive: Vec<chrono::NaiveDateTime>,
+    #[column(nullable, sql_type = "timestamp[]")]
+    maybe: Option<Vec<chrono::NaiveDateTime>>,
+}
+
+#[tokio::test]
+async fn native_date_time_arrays_round_trip_on_postgres() {
+    let (postgres, db) = setup().await;
+    db.raw(
+        "create table pg_dates (id bigint primary key, days date[] not null, \
+         instants timestamptz[] not null, naive timestamp[] not null, maybe timestamp[])",
+    )
+    .exec()
+    .await
+    .expect("create");
+
+    let day = chrono::NaiveDate::from_ymd_opt(2020, 1, 2).unwrap();
+    let instant = "2020-01-02T03:04:05Z"
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+    let naive = day.and_hms_opt(3, 4, 5).unwrap();
+    db.insert(PgDatesNew {
+        id: 1,
+        days: vec![day],
+        instants: vec![instant],
+        naive: vec![naive],
+        maybe: None,
+    })
+    .exec()
+    .await
+    .expect("insert date arrays");
+
+    let row = db.get::<PgDates>(1).one().await.unwrap().unwrap();
+    assert_eq!(row.days, vec![day]);
+    assert_eq!(row.instants, vec![instant]);
+    assert_eq!(row.naive, vec![naive]);
+    assert_eq!(row.maybe, None, "NULL timestamp[] reads as None");
 
     postgres.stop().await.ok();
 }

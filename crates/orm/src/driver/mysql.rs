@@ -47,6 +47,14 @@ impl Row for MySqlRow {
             ValueKind::Json => read!(self, index, kind, serde_json::Value, Value::Json),
             ValueKind::Vector => Err(Error::Decode("MySQL has no vector type".into())),
             ValueKind::Geo => Err(Error::Decode("PostGIS geometry is Postgres-only".into())),
+            // No native arrays on MySQL — stored as JSON text.
+            ValueKind::Array(elem) => {
+                let cell: Option<String> = self.try_get(index).map_err(into_decode)?;
+                cell.map_or_else(
+                    || Ok(Value::Null(kind)),
+                    |text| crate::value::json_text_to_array(&text, *elem),
+                )
+            }
         }
     }
 
@@ -214,9 +222,11 @@ fn bind_scalar(args: &mut MySqlArguments, value: Value) -> Result<()> {
         Value::Geo { .. } => {
             return Err(Error::Encode("PostGIS geometry is Postgres-only".into()));
         }
-        Value::Array(..) => {
-            return Err(Error::Encode("MySQL does not support array binds".into()));
-        }
+        // A `Vec<T>` column has no native MySQL array type — store it as JSON text.
+        Value::Array(_, items) => args.add(crate::value::array_to_json_text(&items)),
+        // `::` casts aren't a MySQL thing; the SQL writer already flagged this bind
+        // as unsupported (the statement errors before reaching here). Defensive only.
+        Value::Cast { inner, .. } => return bind_scalar(args, *inner),
     };
     result.map_err(Error::Encode)
 }
@@ -229,7 +239,8 @@ fn bind_null(args: &mut MySqlArguments, kind: ValueKind) -> Result<()> {
         ValueKind::F32 => args.add(None::<f32>),
         ValueKind::F64 => args.add(None::<f64>),
         ValueKind::Bool => args.add(None::<bool>),
-        ValueKind::Text => args.add(None::<String>),
+        // Text and arrays (stored as JSON text) bind a text null.
+        ValueKind::Text | ValueKind::Array(_) => args.add(None::<String>),
         ValueKind::Bytes => args.add(None::<Vec<u8>>),
         ValueKind::Uuid => args.add(None::<Uuid>),
         ValueKind::Timestamptz => args.add(None::<DateTime<Utc>>),

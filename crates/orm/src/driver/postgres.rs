@@ -44,6 +44,7 @@ impl Row for PgRow {
             ValueKind::Json => read!(self, index, kind, serde_json::Value, Value::Json),
             ValueKind::Vector => read_vector(self, index),
             ValueKind::Geo => read_geo(self, index),
+            ValueKind::Array(_) => read_pg_array(self, index, kind),
         }
     }
 
@@ -212,6 +213,9 @@ fn bind_scalar(args: &mut PgArguments, value: Value) -> Result<()> {
         // wraps it in `ST_SetSRID(.., srid)` when a SRID is attached).
         Value::Geo { wkt, .. } => args.add(wkt),
         Value::Array(kind, values) => return bind_array(args, kind, values),
+        // The SQL writer unwraps `Cast` before queueing the bind, so this is only a
+        // defensive fallback — encode the inner payload (the `::cast` is in the SQL).
+        Value::Cast { inner, .. } => return bind_scalar(args, *inner),
     };
     result.map_err(Error::Encode)
 }
@@ -233,8 +237,65 @@ fn bind_null(args: &mut PgArguments, kind: ValueKind) -> Result<()> {
         ValueKind::Date => args.add(None::<NaiveDate>),
         ValueKind::NaiveTime => args.add(None::<NaiveTime>),
         ValueKind::Json => args.add(None::<serde_json::Value>),
+        ValueKind::Array(elem) => return bind_null_array(args, *elem),
     };
     result.map_err(Error::Encode)
+}
+
+/// Bind a typed `NULL` array for a nullable native-array column.
+fn bind_null_array(args: &mut PgArguments, elem: ValueKind) -> Result<()> {
+    let result = match elem {
+        ValueKind::I16 => args.add(None::<Vec<i16>>),
+        ValueKind::I32 => args.add(None::<Vec<i32>>),
+        ValueKind::I64 => args.add(None::<Vec<i64>>),
+        ValueKind::F32 => args.add(None::<Vec<f32>>),
+        ValueKind::F64 => args.add(None::<Vec<f64>>),
+        ValueKind::Bool => args.add(None::<Vec<bool>>),
+        ValueKind::Uuid => args.add(None::<Vec<Uuid>>),
+        ValueKind::Timestamptz => args.add(None::<Vec<DateTime<Utc>>>),
+        ValueKind::NaiveDateTime => args.add(None::<Vec<NaiveDateTime>>),
+        ValueKind::Date => args.add(None::<Vec<NaiveDate>>),
+        ValueKind::NaiveTime => args.add(None::<Vec<NaiveTime>>),
+        ValueKind::Bytes => args.add(None::<Vec<Vec<u8>>>),
+        _ => args.add(None::<Vec<String>>),
+    };
+    result.map_err(Error::Encode)
+}
+
+/// Read a native Postgres array column (`int[]`, `text[]`, …) into a
+/// [`Value::Array`]. `kind` is the full `ValueKind::Array(elem)` (used for `NULL`).
+fn read_pg_array(row: &PgRow, index: usize, kind: ValueKind) -> Result<Value> {
+    let ValueKind::Array(elem_ref) = kind else {
+        return Err(Error::Decode("read_pg_array: not an array kind".into()));
+    };
+    let elem = *elem_ref;
+    macro_rules! arr {
+        ($ty:ty, $wrap:expr) => {{
+            let cell: Option<Vec<$ty>> = row.try_get(index).map_err(into_decode)?;
+            match cell {
+                None => Ok(Value::Null(kind)),
+                Some(items) => Ok(Value::Array(elem, items.into_iter().map($wrap).collect())),
+            }
+        }};
+    }
+    match elem {
+        ValueKind::I16 => arr!(i16, Value::I16),
+        ValueKind::I32 => arr!(i32, Value::I32),
+        ValueKind::I64 => arr!(i64, Value::I64),
+        ValueKind::F32 => arr!(f32, Value::F32),
+        ValueKind::F64 => arr!(f64, Value::F64),
+        ValueKind::Bool => arr!(bool, Value::Bool),
+        ValueKind::Text => arr!(String, Value::Text),
+        ValueKind::Uuid => arr!(Uuid, Value::Uuid),
+        ValueKind::Timestamptz => arr!(DateTime<Utc>, Value::Timestamptz),
+        ValueKind::NaiveDateTime => arr!(NaiveDateTime, Value::NaiveDateTime),
+        ValueKind::Date => arr!(NaiveDate, Value::Date),
+        ValueKind::NaiveTime => arr!(NaiveTime, Value::NaiveTime),
+        ValueKind::Bytes => arr!(Vec<u8>, Value::Bytes),
+        other => Err(Error::Decode(
+            format!("unsupported native array element {other:?} (use Json<Vec<_>>)").into(),
+        )),
+    }
 }
 
 /// Read a pgvector column (text form `[..]`) into a [`Value::Vector`]. The query
@@ -304,6 +365,11 @@ fn bind_array(args: &mut PgArguments, kind: ValueKind, values: Vec<Value>) -> Re
         ValueKind::Geo => {
             return Err(Error::Encode(
                 "geometry array binds are not supported".into(),
+            ));
+        }
+        ValueKind::Array(_) => {
+            return Err(Error::Encode(
+                "nested arrays are not supported (use Json<Vec<Vec<_>>>)".into(),
             ));
         }
     };

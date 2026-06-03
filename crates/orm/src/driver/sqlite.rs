@@ -64,6 +64,14 @@ impl Row for SqliteRow {
                 let cell: Option<String> = self.try_get(index).map_err(into_decode)?;
                 Ok(cell.map_or(Value::Null(kind), |wkt| Value::Geo { wkt, srid: None }))
             }
+            // No native arrays on SQLite — stored as JSON text.
+            ValueKind::Array(elem) => {
+                let cell: Option<String> = self.try_get(index).map_err(into_decode)?;
+                cell.map_or_else(
+                    || Ok(Value::Null(kind)),
+                    |text| crate::value::json_text_to_array(&text, *elem),
+                )
+            }
         }
     }
 
@@ -228,11 +236,12 @@ fn bind_scalar(args: &mut SqliteArguments, value: Value) -> Result<()> {
         Value::Vector(x) => args.add(crate::vector::to_literal(&x)),
         // No `PostGIS` on SQLite; bind the WKT as plain text.
         Value::Geo { wkt, .. } => args.add(wkt),
-        // Arrays never reach SQLite: the dialect has `supports_any_array() == false`,
-        // so list membership is rendered as `IN (?, …)` with scalar binds.
-        Value::Array(..) => {
-            return Err(Error::Encode("SQLite does not support array binds".into()));
-        }
+        // A `Vec<T>` column has no native SQLite array type — store it as JSON text.
+        // (`any_of` list membership never lands here; it expands to `IN (?, …)`.)
+        Value::Array(_, items) => args.add(crate::value::array_to_json_text(&items)),
+        // `::` casts aren't a SQLite thing; the SQL writer already flagged this bind
+        // as unsupported (the statement errors before reaching here). Defensive only.
+        Value::Cast { inner, .. } => return bind_scalar(args, *inner),
     };
     result.map_err(Error::Encode)
 }
@@ -244,8 +253,11 @@ fn bind_null(args: &mut SqliteArguments, kind: ValueKind) -> Result<()> {
         ValueKind::I64 => args.add(None::<i64>),
         ValueKind::F32 | ValueKind::F64 => args.add(None::<f64>),
         ValueKind::Bool => args.add(None::<bool>),
-        // Vector/geometry bind as text literals, so their nulls are text nulls too.
-        ValueKind::Text | ValueKind::Vector | ValueKind::Geo => args.add(None::<String>),
+        // Vector/geometry bind as text literals, and arrays store as JSON text — so
+        // their nulls are text nulls too.
+        ValueKind::Text | ValueKind::Vector | ValueKind::Geo | ValueKind::Array(_) => {
+            args.add(None::<String>)
+        }
         ValueKind::Bytes => args.add(None::<Vec<u8>>),
         ValueKind::Uuid => args.add(None::<Uuid>),
         ValueKind::Timestamptz => args.add(None::<DateTime<Utc>>),

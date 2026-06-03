@@ -52,6 +52,27 @@ pub fn derive_db_enum(input: TokenStream) -> TokenStream {
         .into()
 }
 
+/// Derive a **Postgres composite type** for a struct so it can be a column field.
+///
+/// Emits `ToValue`/`FromValue`/`IntoExpr`: the value binds as the composite text
+/// literal `(f1,f2,…)` cast `$N::<type_name>`, and reads back from that text form
+/// (select the column as `col::text`). The composite's type name defaults to the
+/// struct name in `snake_case`; override with `#[db_type(name = "address_type")]`.
+/// Use it on a [`Table`](stakit_orm::Table) field with
+/// `#[column(sql_type = "address_type")]`. Composite types are **Postgres-only** —
+/// binding one on another backend fails at run time with `Error::Unsupported`.
+///
+/// Each field type must itself be `ToValue + FromValue` (scalars, enums, `Option`).
+/// `<Type>::create_type_sql()` returns the `CREATE TYPE … AS (…)` DDL to run before
+/// the table migration.
+#[proc_macro_derive(Type, attributes(db_type))]
+pub fn derive_type(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    expand_type(&input)
+        .unwrap_or_else(|error| error.to_compile_error())
+        .into()
+}
+
 /// Return the first value that appears more than once, if any.
 fn first_duplicate(values: &[String]) -> Option<String> {
     let mut seen = std::collections::HashSet::new();
@@ -217,6 +238,188 @@ fn expand_db_enum(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> 
         impl ::stakit_orm::expr::IntoExpr<#name> for #name {
             fn into_operand(self) -> ::stakit_orm::expr::Operand {
                 ::stakit_orm::expr::Operand::Value(<Self as ::stakit_orm::ToValue>::to_value(self))
+            }
+        }
+    })
+}
+
+/// Convert a `CamelCase` ident to `snake_case` (default composite type name).
+fn to_snake_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (index, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if index > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_lines)]
+fn expand_type(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let name = &input.ident;
+    let Data::Struct(data) = &input.data else {
+        return Err(syn::Error::new_spanned(
+            name,
+            "Type can only derive for structs",
+        ));
+    };
+    let Fields::Named(fields) = &data.fields else {
+        return Err(syn::Error::new_spanned(
+            name,
+            "Type requires named fields (a Postgres composite type)",
+        ));
+    };
+    if fields.named.is_empty() {
+        return Err(syn::Error::new_spanned(
+            name,
+            "Type needs at least one field",
+        ));
+    }
+
+    // Composite type name: `#[db_type(name = "address_type")]` or snake_case struct.
+    let mut type_name = to_snake_case(&name.to_string());
+    for attr in &input.attrs {
+        if !attr.path().is_ident("db_type") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("name") {
+                type_name = meta.value()?.parse::<LitStr>()?.value();
+                Ok(())
+            } else {
+                Err(meta.error("expected `name = \"...\"`"))
+            }
+        })?;
+    }
+
+    let mut field_idents = Vec::new();
+    let mut field_types = Vec::new();
+    let mut ddl_fields = Vec::new(); // "field sqltype" pairs for CREATE TYPE
+    for field in &fields.named {
+        let ident = field.ident.clone().expect("named field");
+        let ty = &field.ty;
+
+        // Per-field SQL type: `#[db_type(sql_type = "...")]` or inferred (Option<T>
+        // maps via its inner T). Used only for `create_type_sql()`.
+        let mut explicit_sql: Option<String> = None;
+        for attr in &field.attrs {
+            if !attr.path().is_ident("db_type") {
+                continue;
+            }
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("sql_type") {
+                    explicit_sql = Some(meta.value()?.parse::<LitStr>()?.value());
+                    Ok(())
+                } else {
+                    Err(meta.error("expected `sql_type = \"...\"`"))
+                }
+            })?;
+        }
+        let base_ty = unwrap_generic(ty, "Option").unwrap_or(ty);
+        let sql = match explicit_sql {
+            Some(s) => s,
+            None => sql_type(base_ty)
+                .ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        ty,
+                        "composite field type needs `#[db_type(sql_type = \"...\")]` (unknown SQL mapping)",
+                    )
+                })?
+                .to_owned(),
+        };
+        // `bytea` has no faithful composite *text* encoding here — reject it rather
+        // than silently dropping the bytes (use a hex `text` field or `Json` instead).
+        if sql.eq_ignore_ascii_case("bytea") {
+            return Err(syn::Error::new_spanned(
+                ty,
+                "bytea fields are not supported in #[derive(Type)] composites; \
+                 store bytes as hex text or in a Json field",
+            ));
+        }
+        let field_name = ident.to_string();
+        ddl_fields.push(format!("{field_name} {sql}"));
+        field_idents.push(ident);
+        field_types.push(ty.clone());
+    }
+
+    let field_count = field_idents.len();
+    let create_type_sql = format!("create type {type_name} as ({})", ddl_fields.join(", "));
+
+    Ok(quote! {
+        #[automatically_derived]
+        impl ::stakit_orm::ToValue for #name {
+            // The `::<type_name>` cast is applied at the bind boundary (so it also
+            // casts a NULL `Option<Self>`); `to_value` yields the plain text literal.
+            const WRITE_CAST: ::core::option::Option<&'static str> =
+                ::core::option::Option::Some(#type_name);
+            fn to_value(self) -> ::stakit_orm::Value {
+                let __fields = [
+                    #( ::stakit_orm::ToValue::to_value(self.#field_idents) ),*
+                ];
+                ::stakit_orm::Value::Text(::stakit_orm::composite::encode(&__fields))
+            }
+        }
+
+        #[automatically_derived]
+        impl ::stakit_orm::FromValue for #name {
+            const KIND: ::stakit_orm::ValueKind = ::stakit_orm::ValueKind::Text;
+            // Select the composite as `col::text` so it arrives as the text literal.
+            const READ_CAST: ::core::option::Option<&'static str> = ::core::option::Option::Some("text");
+            fn from_value(value: ::stakit_orm::Value) -> ::stakit_orm::Result<Self> {
+                let __text = match value {
+                    ::stakit_orm::Value::Text(s) => s,
+                    ::stakit_orm::Value::Cast { inner, .. } => match *inner {
+                        ::stakit_orm::Value::Text(s) => s,
+                        other => return ::core::result::Result::Err(::stakit_orm::Error::Decode(
+                            ::std::format!(concat!("expected composite text for ", stringify!(#name), ", got {:?}"), other).into(),
+                        )),
+                    },
+                    other => return ::core::result::Result::Err(::stakit_orm::Error::Decode(
+                        ::std::format!(concat!("expected composite text for ", stringify!(#name), ", got {:?}"), other).into(),
+                    )),
+                };
+                let mut __fields = ::stakit_orm::composite::parse(&__text, #field_count)?.into_iter();
+                ::core::result::Result::Ok(Self {
+                    #( #field_idents: {
+                        let __f = __fields.next().ok_or_else(|| ::stakit_orm::Error::Decode(
+                            "composite: missing field".into(),
+                        ))?;
+                        <#field_types as ::stakit_orm::FromValue>::from_value(
+                            ::stakit_orm::composite::field_value(
+                                &__f,
+                                <#field_types as ::stakit_orm::FromValue>::KIND,
+                            )?,
+                        )?
+                    } ),*
+                })
+            }
+        }
+
+        #[automatically_derived]
+        impl ::stakit_orm::expr::IntoExpr<#name> for #name {
+            fn into_operand(self) -> ::stakit_orm::expr::Operand {
+                // Apply the composite cast so `eq(col, value)` renders `$N::<type>`.
+                ::stakit_orm::expr::Operand::Value(::stakit_orm::value::with_cast(
+                    <Self as ::stakit_orm::ToValue>::to_value(self),
+                    <Self as ::stakit_orm::ToValue>::WRITE_CAST,
+                ))
+            }
+        }
+
+        #[automatically_derived]
+        impl #name {
+            /// The Postgres composite type name (`#[db_type(name=…)]` or snake_case).
+            pub const SQL_TYPE_NAME: &'static str = #type_name;
+
+            /// The `CREATE TYPE … AS (…)` DDL to run before any table that uses it.
+            #[must_use]
+            pub fn create_type_sql() -> &'static str {
+                #create_type_sql
             }
         }
     })
@@ -681,6 +884,7 @@ fn column_literal(column: &ColumnModel) -> proc_macro2::TokenStream {
             }
         },
     );
+    let field_ty = &column.field_ty;
     quote! {
         ::stakit_orm::Column {
             name: #name,
@@ -692,6 +896,8 @@ fn column_literal(column: &ColumnModel) -> proc_macro2::TokenStream {
             is_nullable: #is_nullable,
             default: #default,
             references: #references,
+            // Read-side cast (e.g. composite `col::text`), from the field's type.
+            read_cast: <#field_ty as ::stakit_orm::FromValue>::READ_CAST,
         }
     }
 }
