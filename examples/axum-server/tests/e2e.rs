@@ -33,7 +33,13 @@ fn client_for(origin: &str) -> Client {
 async fn http_unary_ok() {
     let client = client_for(&spawn().await);
     let res = client
-        .fetch(greet, Greet { name: "sam".to_owned(), user_id: None })
+        .fetch(
+            greet,
+            Greet {
+                name: "sam".to_owned(),
+                user_id: None,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(res.data().unwrap().message, "Hello, sam! (admin=true)");
@@ -43,7 +49,13 @@ async fn http_unary_ok() {
 async fn http_unary_validation_error() {
     let client = client_for(&spawn().await);
     let res = client
-        .fetch(greet, Greet { name: String::new(), user_id: None })
+        .fetch(
+            greet,
+            Greet {
+                name: String::new(),
+                user_id: None,
+            },
+        )
         .await
         .unwrap();
     let error = res.error().unwrap();
@@ -56,8 +68,20 @@ async fn http_typed_batch_many_actions() {
     let client = client_for(&spawn().await);
     let results = client
         .batch()
-        .add(greet, Greet { name: "alice".to_owned(), user_id: Some(1) })
-        .add(greet, Greet { name: "bob".to_owned(), user_id: None })
+        .add(
+            greet,
+            Greet {
+                name: "alice".to_owned(),
+                user_id: Some(1),
+            },
+        )
+        .add(
+            greet,
+            Greet {
+                name: "bob".to_owned(),
+                user_id: None,
+            },
+        )
         .add(version, ())
         .send()
         .await
@@ -83,7 +107,9 @@ async fn http_multipart_file_upload() {
     let res = client
         .fetch_with(
             save_image,
-            SaveImage { file_name: "e2e.png".to_owned() },
+            SaveImage {
+                file_name: "e2e.png".to_owned(),
+            },
             CallOpts::new().file(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
         )
         .await

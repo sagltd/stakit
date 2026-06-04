@@ -58,7 +58,10 @@ fn email_rejects_whitespace_and_control_chars() {
     assert!(email("a b@c.com").is_err(), "internal space");
     // Tabs / newlines / CR — a newline is an email-header-injection vector.
     assert!(email("a@b.com\n").is_err(), "trailing newline");
-    assert!(email("a@b.com\r\nBcc: x@y.com").is_err(), "header injection");
+    assert!(
+        email("a@b.com\r\nBcc: x@y.com").is_err(),
+        "header injection"
+    );
     assert!(email("a\t@b.com").is_err(), "tab");
     // Unicode non-breaking space.
     assert!(email("a\u{00A0}b@c.com").is_err(), "nbsp");
@@ -86,7 +89,10 @@ fn url_rejects_whitespace_and_control_chars() {
     assert!(url("https://example.com/a b").is_err(), "space in path");
     assert!(url("https://example.com\n").is_err(), "trailing newline");
     assert!(url(" https://example.com").is_err(), "leading space");
-    assert!(url("https://example.com\r\nHost: evil").is_err(), "injection");
+    assert!(
+        url("https://example.com\r\nHost: evil").is_err(),
+        "injection"
+    );
 }
 
 #[test]

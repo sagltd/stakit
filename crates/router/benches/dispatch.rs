@@ -7,7 +7,7 @@ use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use stakit_model::Model;
-use stakit_router::{Cx, Error, Frame, Router, action};
+use stakit_router::{BorrowAction, Cx, Error, Frame, Router, action};
 
 fn main() {
     divan::main();
@@ -57,13 +57,76 @@ async fn noop() -> Result<(), Error> {
     Ok(())
 }
 
+// Zero-copy twin of `greet`: `name` borrows from the request buffer. Output is
+// the name length (a `u64`) so the benchmark isolates the *parse* difference —
+// owned `Value` + field clone vs borrowed `from_slice` — not output allocation.
+#[derive(Model, Serialize, Deserialize)]
+struct GreetBorrow<'a> {
+    #[validate(min_len = 1, max_len = 8192)]
+    name: &'a str,
+}
+
+struct GreetB;
+
+impl<G, R> BorrowAction<G, R> for GreetB
+where
+    G: Send + Sync + 'static,
+    R: Send + Sync + 'static,
+{
+    type Input<'de>
+        = GreetBorrow<'de>
+    where
+        G: 'de,
+        R: 'de;
+    type Output = u64;
+    type Error = Error;
+
+    fn name(&self) -> &'static str {
+        "greetb"
+    }
+
+    async fn run<'a>(&'a self, _cx: &'a Cx<G, R>, input: GreetBorrow<'a>) -> Result<u64, Error> {
+        Ok(input.name.len() as u64)
+    }
+}
+
 fn router() -> Router<App, Req> {
     Router::builder()
         .ctx(App)
         .register(greet)
         .register(noop)
+        .register_borrow(GreetB)
         .register_stream(count)
         .build()
+}
+
+/// A string-heavy single-call payload (a long `name`) where copy cost dominates.
+fn big_payload(action: &str) -> Vec<u8> {
+    let name = "x".repeat(2048);
+    format!(r#"{{"{action}":{{"name":"{name}"}}}}"#).into_bytes()
+}
+
+/// Owned path as a real axum server runs it: parse the body into a `Value`, then
+/// dispatch (which clones each `String` field out of the `Value`).
+#[divan::bench]
+fn owned_from_bytes(bencher: Bencher<'_, '_>) {
+    let router = router();
+    bencher
+        .with_inputs(|| big_payload("greet"))
+        .bench_values(|body: Vec<u8>| {
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            black_box(block_on(router.on_request(Req, value)))
+        });
+}
+
+/// Borrow path: deserialize straight from the bytes, `name` borrowing the buffer
+/// — no intermediate `Value`, no per-field `String` allocation.
+#[divan::bench]
+fn borrowed_from_bytes(bencher: Bencher<'_, '_>) {
+    let router = router();
+    bencher
+        .with_inputs(|| big_payload("greetb"))
+        .bench_values(|body: Vec<u8>| black_box(block_on(router.on_request_borrowed(Req, &body))));
 }
 
 /// Full unary dispatch on valid input (single-call payload — the hot path).

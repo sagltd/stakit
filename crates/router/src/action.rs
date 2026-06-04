@@ -9,7 +9,7 @@ use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::de::{Deserialize, DeserializeOwned};
 use serde_json::Value;
 use stakit_model::{Model, TSType, Validate};
 
@@ -107,6 +107,122 @@ where
                 self.before(cx).await?; // guard before deserialize/validate
                 let input: A::Input =
                     serde_json::from_value(params).map_err(|e| Error::decode(&e))?;
+                input.validate().map_err(Error::validation)?;
+                let result = self.run(cx, input).await.map_err(Into::into);
+                self.after(cx).await;
+                serde_json::to_value(result?).map_err(|e| Error::encode(&e))
+            });
+            match work.catch_unwind().await {
+                Ok(result) => result,
+                Err(panic) => Err(Error::internal(format!(
+                    "action panicked: {}",
+                    panic_message(&*panic)
+                ))),
+            }
+        })
+    }
+}
+
+/// A **zero-copy** unary action: its input borrows directly from the request
+/// body buffer instead of owning copies of every field.
+///
+/// Where [`Action::Input`] is `DeserializeOwned` (every `String` field is a
+/// fresh allocation), `BorrowAction::Input<'de>` is `Deserialize<'de>` — so a
+/// `&'a str` / `Cow<'a, str>` / `&'a [u8]` field points straight into the bytes
+/// the client sent (`serde_json::from_slice`, no intermediate `Value`, no
+/// per-field copy). Use it for hot, payload-heavy endpoints; the borrowed input
+/// lives only for the duration of the call.
+///
+/// Dispatched via [`Router::on_request_borrowed`](crate::Router::on_request_borrowed),
+/// registered via [`Builder::register_borrow`](crate::Builder::register_borrow).
+/// This is purely additive — [`Action`] and its pipeline are unchanged.
+pub trait BorrowAction<G, R>: Send + Sync + 'static {
+    /// Validated input that borrows from the request buffer for `'de`.
+    type Input<'de>: Model + Deserialize<'de> + Send
+    where
+        G: 'de,
+        R: 'de;
+    /// Serializable, TypeScript-exportable output.
+    type Output: TSType + Serialize + Send;
+    /// The action's own error type (see [`Action::Error`]).
+    type Error: Into<Error> + ErrorCodes + Send + 'static;
+
+    /// The action's stable name (used for routing + TS).
+    fn name(&self) -> &'static str;
+
+    /// Hook run **before** params are deserialized/validated (see
+    /// [`Action::before`]). `Err` short-circuits.
+    fn before<'a>(
+        &'a self,
+        _cx: &'a Cx<G, R>,
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
+        async { Ok(()) }
+    }
+
+    /// Hook run **after** the action completes (see [`Action::after`]).
+    fn after<'a>(&'a self, _cx: &'a Cx<G, R>) -> impl Future<Output = ()> + Send + 'a {
+        async {}
+    }
+
+    /// Runs the action. `input` borrows from the request buffer (alive for the
+    /// whole call). Returns a native future; the router boxes once at erasure.
+    fn run<'a>(
+        &'a self,
+        cx: &'a Cx<G, R>,
+        input: Self::Input<'a>,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send + 'a;
+}
+
+/// Object-safe erasure for borrowing actions. `dispatch` takes the raw param
+/// bytes (a slice of the request buffer) rather than an owned [`Value`], so the
+/// borrowed input can point into them.
+pub(crate) trait ErasedBorrowAction<G, R>: Send + Sync {
+    fn input_ref(&self) -> String;
+    fn output_ref(&self) -> String;
+    fn collect_ts(&self, out: &mut std::collections::BTreeMap<String, String>);
+    fn error_codes(&self) -> &'static [&'static str];
+    fn dispatch<'a>(
+        &'a self,
+        cx: &'a Cx<G, R>,
+        params: &'a [u8],
+    ) -> BoxFuture<'a, Result<Value, Error>>;
+}
+
+impl<G, R, A> ErasedBorrowAction<G, R> for A
+where
+    A: BorrowAction<G, R>,
+    G: Send + Sync + 'static,
+    R: Send + Sync + 'static,
+{
+    fn input_ref(&self) -> String {
+        // TS export is lifetime-agnostic; any concrete lifetime names the type.
+        <A::Input<'static> as TSType>::ts_ref()
+    }
+
+    fn output_ref(&self) -> String {
+        <A::Output as TSType>::ts_ref()
+    }
+
+    fn collect_ts(&self, out: &mut std::collections::BTreeMap<String, String>) {
+        <A::Input<'static> as TSType>::ts_declarations(out);
+        <A::Output as TSType>::ts_declarations(out);
+    }
+
+    fn error_codes(&self) -> &'static [&'static str] {
+        <A::Error as ErrorCodes>::error_codes()
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        cx: &'a Cx<G, R>,
+        params: &'a [u8],
+    ) -> BoxFuture<'a, Result<Value, Error>> {
+        Box::pin(async move {
+            let work = AssertUnwindSafe(async move {
+                self.before(cx).await?; // guard before deserialize/validate
+                // Zero-copy: `input` borrows out of `params` (the request buffer).
+                let input: A::Input<'a> =
+                    serde_json::from_slice(params).map_err(|e| Error::decode(&e))?;
                 input.validate().map_err(Error::validation)?;
                 let result = self.run(cx, input).await.map_err(Into::into);
                 self.after(cx).await;

@@ -17,7 +17,7 @@ mod router;
 mod session;
 mod ts;
 
-pub use action::{Action, StreamAction};
+pub use action::{Action, BorrowAction, StreamAction};
 pub use client::{ClientAction, DEFAULT_CLIENT_CALL_TIMEOUT};
 pub use cx::Cx;
 pub use endpoint::{Endpoint, Kind};

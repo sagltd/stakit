@@ -136,6 +136,7 @@ dependencies = [
  "stakit-model",
  "stakit-router",
  "tokio",
+ "tower",
 ]
 
 [[package]]

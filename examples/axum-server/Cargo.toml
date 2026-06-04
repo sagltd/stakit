@@ -15,6 +15,10 @@ futures = "0.3"
 async-stream = "0.3"
 stakit-client = { path = "../../crates/client" }
 
+[dev-dependencies]
+# In-process HTTP driving of the axum app (no socket) for the zero-copy e2e test.
+tower = { version = "0.5", features = ["util"] }
+
 [[bin]]
 name = "axum-server-example"
 path = "src/main.rs"

@@ -5,6 +5,7 @@
 //! — as long as the leaf type implements [`Validate`] (i.e. derives `Model`).
 //! Container elements/values contribute their index/key to the error path.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 
@@ -16,6 +17,15 @@ use crate::validate::error::ValidationErrors;
 impl<T: Validate + ?Sized> Validate for &T {
     fn validate(&self) -> Result<(), ValidationErrors> {
         T::validate(self)
+    }
+}
+
+impl<B> Validate for Cow<'_, B>
+where
+    B: Validate + ToOwned + ?Sized,
+{
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        B::validate(self)
     }
 }
 

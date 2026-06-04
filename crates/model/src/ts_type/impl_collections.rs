@@ -1,5 +1,6 @@
 //! [`TSType`] impls for container / reference / generic types.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::TSType;
@@ -33,6 +34,20 @@ impl<T: TSType + ?Sized> TSType for Box<T> {
     }
     fn ts_declarations(out: &mut Decls) {
         T::ts_declarations(out);
+    }
+}
+
+/// `Cow<'a, B>` is transparent to its pointee — the canonical borrowed-or-owned
+/// field (`Cow<'a, str>` deserializes zero-copy when the input allows, else owns).
+impl<B> TSType for Cow<'_, B>
+where
+    B: TSType + ToOwned + ?Sized,
+{
+    fn ts_ref() -> String {
+        B::ts_ref()
+    }
+    fn ts_declarations(out: &mut Decls) {
+        B::ts_declarations(out);
     }
 }
 

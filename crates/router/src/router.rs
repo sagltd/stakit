@@ -5,14 +5,15 @@ use std::time::Duration;
 
 use futures::{Stream, StreamExt as _};
 use hashbrown::HashMap;
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
 use stakit_model::TSType;
 
-use crate::action::{ErasedAction, ErasedStreamAction};
+use crate::action::{ErasedAction, ErasedBorrowAction, ErasedStreamAction};
 use crate::client::{ClientAction, ClientHandle, ClientMeta, DEFAULT_CLIENT_CALL_TIMEOUT};
 use crate::session::Session;
-use crate::{Action, Cx, Error, Frame, Reply, StreamAction};
+use crate::{Action, BorrowAction, Cx, Error, Frame, Reply, StreamAction};
 
 /// A registry of actions, generic over the global ctx `G` and request ctx `R`.
 ///
@@ -29,6 +30,7 @@ use crate::{Action, Cx, Error, Frame, Reply, StreamAction};
 pub struct Router<G, R> {
     pub(crate) app: Arc<G>,
     pub(crate) actions: HashMap<&'static str, Arc<dyn ErasedAction<G, R>>>,
+    pub(crate) borrow_actions: HashMap<&'static str, Arc<dyn ErasedBorrowAction<G, R>>>,
     pub(crate) streams: HashMap<&'static str, Arc<dyn ErasedStreamAction<G, R>>>,
     pub(crate) client_actions: Vec<ClientMeta>,
     pub(crate) client_call_timeout: Duration,
@@ -50,6 +52,7 @@ where
         Builder {
             app: None,
             actions: HashMap::new(),
+            borrow_actions: HashMap::new(),
             streams: HashMap::new(),
             client_actions: Vec::new(),
             client_call_timeout: DEFAULT_CLIENT_CALL_TIMEOUT,
@@ -88,6 +91,76 @@ where
             }
             _ => Value::Object(Map::new()),
         }
+    }
+
+    /// **Zero-copy** unary dispatch: feed the raw request body bytes and the
+    /// router parses the envelope *and* each call's params straight out of that
+    /// buffer — borrow actions ([`Builder::register_borrow`]) get `&'a str` /
+    /// `Cow` fields pointing into `body` with no intermediate [`Value`] and no
+    /// per-field copy.
+    ///
+    /// A strict superset of [`Router::on_request`] for the object/array payload
+    /// shapes: any call naming a plain [`Action`] falls back to the owned path
+    /// (one parse into a [`Value`]), so a mixed router works through this one
+    /// entrypoint. `body` must outlive the call (it does — it's borrowed here).
+    pub async fn on_request_borrowed(&self, req: R, body: &[u8]) -> Value
+    where
+        R: Clone,
+    {
+        // Object form: `{ "action": params, … }` — keys + param slices borrow `body`.
+        if let Ok(map) = serde_json::from_slice::<indexmap::IndexMap<&str, &RawValue>>(body) {
+            let replies = futures::future::join_all(map.into_iter().map(|(action, raw)| {
+                let req = req.clone();
+                async move {
+                    let reply = self.dispatch_one_borrowed(req, action, raw.get()).await;
+                    (action.to_owned(), reply)
+                }
+            }))
+            .await;
+            let mut out = Map::with_capacity(replies.len());
+            for (action, reply) in replies {
+                out.insert(action, reply.into_value());
+            }
+            return Value::Object(out);
+        }
+        // Array form: `[["action", params], …]` — ordered, duplicates allowed.
+        if let Ok(items) = serde_json::from_slice::<Vec<(&str, &RawValue)>>(body) {
+            let replies = futures::future::join_all(items.into_iter().map(|(action, raw)| {
+                let req = req.clone();
+                async move { self.dispatch_one_borrowed(req, action, raw.get()).await }
+            }))
+            .await;
+            return Value::Array(replies.into_iter().map(Reply::into_value).collect());
+        }
+        Value::Object(Map::new())
+    }
+
+    /// Routes one borrowed call: a registered borrow action gets the raw param
+    /// bytes (zero-copy); a plain owned action falls back through a single
+    /// `Value` parse; otherwise `404`. Errors pass through `on_error`.
+    async fn dispatch_one_borrowed(&self, req: R, action: &str, params: &str) -> Reply {
+        let cx = Cx {
+            app: Arc::clone(&self.app),
+            req,
+            client: ClientHandle::default(),
+        };
+        if let Some(handler) = self.borrow_actions.get(action) {
+            return match handler.dispatch(&cx, params.as_bytes()).await {
+                Ok(data) => Reply::ok(data),
+                Err(error) => Reply::error((self.on_error)(error)),
+            };
+        }
+        if let Some(handler) = self.actions.get(action) {
+            let value = match serde_json::from_str::<Value>(params) {
+                Ok(value) => value,
+                Err(error) => return Reply::error((self.on_error)(Error::decode(&error))),
+            };
+            return match handler.dispatch(&cx, value).await {
+                Ok(data) => Reply::ok(data),
+                Err(error) => Reply::error((self.on_error)(error)),
+            };
+        }
+        Reply::error((self.on_error)(Error::not_found(action)))
     }
 
     /// Runs several `(action, params)` entries concurrently, preserving order.
@@ -171,7 +244,12 @@ where
     /// Generates a TypeScript client definition for every registered action.
     #[must_use]
     pub fn generate_ts(&self) -> String {
-        crate::ts::generate(&self.actions, &self.streams, &self.client_actions)
+        crate::ts::generate(
+            &self.actions,
+            &self.borrow_actions,
+            &self.streams,
+            &self.client_actions,
+        )
     }
 }
 
@@ -257,6 +335,7 @@ fn parse_array(items: Vec<Value>) -> Vec<(String, Value)> {
 pub struct Builder<G, R> {
     app: Option<Arc<G>>,
     actions: HashMap<&'static str, Arc<dyn ErasedAction<G, R>>>,
+    borrow_actions: HashMap<&'static str, Arc<dyn ErasedBorrowAction<G, R>>>,
     streams: HashMap<&'static str, Arc<dyn ErasedStreamAction<G, R>>>,
     client_actions: Vec<ClientMeta>,
     client_call_timeout: Duration,
@@ -279,6 +358,18 @@ where
     #[must_use]
     pub fn register<A: Action<G, R>>(mut self, action: A) -> Self {
         self.actions.insert(Action::name(&action), Arc::new(action));
+        self
+    }
+
+    /// Registers a **zero-copy** borrow action (keyed by its `name()`), dispatched
+    /// via [`Router::on_request_borrowed`]. Its input borrows from the request
+    /// buffer instead of owning copies. Additive — does not affect [`register`].
+    ///
+    /// [`register`]: Builder::register
+    #[must_use]
+    pub fn register_borrow<A: BorrowAction<G, R>>(mut self, action: A) -> Self {
+        self.borrow_actions
+            .insert(BorrowAction::name(&action), Arc::new(action));
         self
     }
 
@@ -341,6 +432,7 @@ where
                 .app
                 .expect("Router::builder().ctx(...) must be set before build()"),
             actions: self.actions,
+            borrow_actions: self.borrow_actions,
             streams: self.streams,
             client_actions: self.client_actions,
             client_call_timeout: self.client_call_timeout,

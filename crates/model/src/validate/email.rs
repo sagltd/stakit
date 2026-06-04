@@ -39,5 +39,8 @@ fn looks_like_email(s: &str) -> bool {
         return false;
     }
     // Domain must be dotted, with no leading/trailing/empty labels (`a..b`).
-    !domain.starts_with('.') && !domain.ends_with('.') && !domain.contains("..") && domain.contains('.')
+    !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains("..")
+        && domain.contains('.')
 }

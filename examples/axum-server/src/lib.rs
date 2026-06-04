@@ -19,6 +19,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Multipart, Query, State};
 use axum::http::HeaderMap;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, post};
 use futures::{SinkExt as _, StreamExt as _};
@@ -27,6 +28,7 @@ use serde_json::Value;
 // One dependency for the whole API surface: traits, types, the `#[model]` /
 // `#[action]` macros, and the router itself all come from `stakit-router`.
 // (`stakit-model` is still a Cargo dependency — the macros expand to its paths.)
+use stakit_model::Validate as _;
 use stakit_router::{ClientAction, Cx, Error, Router, action, model};
 
 // ---- global context ----
@@ -88,6 +90,16 @@ pub struct Saved {
     pub path: String,
 }
 
+/// Zero-copy login params: `email` borrows **straight out of the request body
+/// buffer** — no allocation, no copy — thanks to the lifetime-aware `#[model]`.
+/// The owning `Bytes` must outlive this struct (it does, for the handler scope).
+#[model]
+pub struct LoginUserParams<'a> {
+    /// Email or phone identifying the account.
+    #[validate(min_len = 1, max_len = 320, email)]
+    pub email: &'a str,
+}
+
 // ---- client action (server -> client, used over websocket) ----
 /// A toast to show on the client.
 #[model]
@@ -109,7 +121,10 @@ impl ClientAction for ShowToast {
 #[action]
 pub async fn greet(cx: &Cx<App, Req>, params: Greet) -> Result<Greeting, Error> {
     Ok(Greeting {
-        message: format!("{}, {}! (admin={})", cx.app.greeting, params.name, cx.req.admin),
+        message: format!(
+            "{}, {}! (admin={})",
+            cx.app.greeting, params.name, cx.req.admin
+        ),
     })
 }
 
@@ -132,13 +147,18 @@ pub fn count(params: Count) -> impl futures::Stream<Item = Result<u64, Error>> {
 /// Unary action that calls back to the client (duplex only).
 #[action]
 pub async fn notify(cx: &Cx<App, Req>, params: Greet) -> Result<Greeting, Error> {
-    let ack = cx.client_call::<ShowToast>(Toast { text: params.name }).await?;
+    let ack = cx
+        .client_call::<ShowToast>(Toast { text: params.name })
+        .await?;
     Ok(Greeting { message: ack })
 }
 
 /// Streams `0..n`, asking the client to show a toast before each item.
 #[action(stream)]
-pub fn progress(cx: &Cx<App, Req>, params: Count) -> impl futures::Stream<Item = Result<u64, Error>> {
+pub fn progress(
+    cx: &Cx<App, Req>,
+    params: Count,
+) -> impl futures::Stream<Item = Result<u64, Error>> {
     async_stream::stream! {
         for i in 0..params.n {
             match cx.client_call::<ShowToast>(Toast { text: format!("step {i}") }).await {
@@ -199,9 +219,30 @@ pub fn app() -> AxumRouter {
     };
     AxumRouter::new()
         .route("/app", get(app_get).post(app_post))
+        .route("/login", post(login))
         .route("/stream", post(stream_handler))
         .route("/ws", get(ws))
         .with_state(state)
+}
+
+// ---- zero-copy unary: POST /login (raw JSON body, no router envelope) ----
+/// Deserializes [`LoginUserParams`] **borrowing directly** from the request body
+/// `Bytes`, validates it, and replies — `email` never leaves the original
+/// network buffer (`serde_json::from_slice` + `&'a str` = zero-copy parse).
+async fn login(body: Bytes) -> Response {
+    // `params.email` points into `body`; `body` is owned here and outlives `params`.
+    let params: LoginUserParams<'_> = match serde_json::from_slice(&body) {
+        Ok(params) => params,
+        Err(error) => return (StatusCode::BAD_REQUEST, format!("decode: {error}")).into_response(),
+    };
+    if let Err(errors) = params.validate() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(serde_json::json!({ "ok": false, "error": errors.to_string() })),
+        )
+            .into_response();
+    }
+    axum::Json(serde_json::json!({ "ok": true, "email": params.email })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -223,7 +264,11 @@ fn payload_from(q: &Q) -> Value {
 }
 
 // ---- unary: GET /app (no body) ----
-async fn app_get(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<Q>) -> Response {
+async fn app_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<Q>,
+) -> Response {
     let response = state
         .router
         .on_request(req_from(&headers, Vec::new()), payload_from(&q))
