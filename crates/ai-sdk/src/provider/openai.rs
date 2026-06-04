@@ -10,7 +10,7 @@
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
 
-use crate::message::{AssistantContent, Message, ToolResultPart, UserContent};
+use crate::message::{AssistantContent, Image, Message, ToolResultPart, UserContent};
 use crate::provider::{
     ChatRequest, ChatResponse, EventStream, Provider, StopReason, StreamEvent, ToolChoice, ToolDef,
 };
@@ -73,85 +73,90 @@ pub struct OpenAiModel {
 }
 
 impl Provider for OpenAiModel {
-    type Raw = Value;
-
     fn model_id(&self) -> &str {
         &self.model
     }
 
-    async fn complete(
+    fn complete(
         &self,
         request: ChatRequest,
-    ) -> Result<ChatResponse<Self::Raw>, ProviderError> {
-        let body = build_body(&self.pick_model(&request), &request, false);
-        let resp = self.send(body).await?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-        if !status.is_success() {
-            return Err(api_error(status.as_u16(), &text));
-        }
-        let value: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Decode {
-            err: e.to_string(),
-            body: text.clone(),
-        })?;
-        Ok(parse_response(value))
+    ) -> futures::future::BoxFuture<'_, Result<ChatResponse, ProviderError>> {
+        Box::pin(async move {
+            let body = build_body(&self.pick_model(&request), &request, false);
+            let resp = self.send(body).await?;
+            let status = resp.status();
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            if !status.is_success() {
+                return Err(api_error(status.as_u16(), &text));
+            }
+            let value: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Decode {
+                err: e.to_string(),
+                body: text.clone(),
+            })?;
+            Ok(parse_response(&value))
+        })
     }
 
-    async fn stream(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
-        let body = build_body(&self.pick_model(&request), &request, true);
-        let resp = self.send(body).await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(api_error(status.as_u16(), &text));
-        }
-        let mut bytes = resp.bytes_stream();
-        let stream = async_stream::stream! {
-            let mut buf = String::new();
-            let mut accum = Accum::default();
-            let mut started = false;
-            while let Some(chunk) = bytes.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        yield Err(ProviderError::Transport(e.to_string()));
-                        return;
-                    }
-                };
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(nl) = buf.find('\n') {
-                    let line: String = buf.drain(..=nl).collect();
-                    let line = line.trim();
-                    let Some(data) = line.strip_prefix("data:") else { continue };
-                    let data = data.trim();
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if data == "[DONE]" {
-                        for ev in accum.finish() {
-                            yield Ok(ev);
+    fn stream(
+        &self,
+        request: ChatRequest,
+    ) -> futures::future::BoxFuture<'_, Result<EventStream, ProviderError>> {
+        Box::pin(async move {
+            let body = build_body(&self.pick_model(&request), &request, true);
+            let resp = self.send(body).await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(api_error(status.as_u16(), &text));
+            }
+            let mut bytes = resp.bytes_stream();
+            let stream = async_stream::stream! {
+                let mut buf = String::new();
+                let mut accum = Accum::default();
+                let mut started = false;
+                while let Some(chunk) = bytes.next().await {
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(e) => {
+                            yield Err(ProviderError::Transport(e.to_string()));
+                            return;
                         }
-                        return;
-                    }
-                    if let Ok(event) = serde_json::from_str::<Value>(data) {
-                        if !started {
-                            started = true;
-                            yield Ok(StreamEvent::Start { usage: Usage::default() });
+                    };
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some(nl) = buf.find('\n') {
+                        let line: String = buf.drain(..=nl).collect();
+                        let line = line.trim();
+                        let Some(data) = line.strip_prefix("data:") else { continue };
+                        let data = data.trim();
+                        if data.is_empty() {
+                            continue;
                         }
-                        for ev in accum.push(&event) {
-                            yield Ok(ev);
+                        if data == "[DONE]" {
+                            for ev in accum.finish() {
+                                yield Ok(ev);
+                            }
+                            return;
+                        }
+                        if let Ok(event) = serde_json::from_str::<Value>(data) {
+                            if !started {
+                                started = true;
+                                yield Ok(StreamEvent::Start { usage: Usage::default() });
+                            }
+                            for ev in accum.push(&event) {
+                                yield Ok(ev);
+                            }
                         }
                     }
                 }
-            }
-            for ev in accum.finish() {
-                yield Ok(ev);
-            }
-        };
-        Ok(Box::pin(stream))
+                for ev in accum.finish() {
+                    yield Ok(ev);
+                }
+            };
+            Ok(stream.boxed())
+        })
     }
 }
 
@@ -190,6 +195,16 @@ fn api_error(status: u16, body: &str) -> ProviderError {
 
 // --- request mapping -------------------------------------------------------
 
+/// Builds the `OpenAI` (non-streaming) request body for a [`ChatRequest`].
+///
+/// Exposed for offline body/cache-shape tests; the request's `model` field is
+/// used. Not part of the stable API.
+#[doc(hidden)]
+#[must_use]
+pub fn build_request_body(req: &ChatRequest) -> Value {
+    build_body(&req.model, req, false)
+}
+
 fn build_body(model: &str, req: &ChatRequest, stream: bool) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
@@ -207,6 +222,11 @@ fn build_body(model: &str, req: &ChatRequest, stream: bool) -> Value {
     }
     if !req.stop_sequences.is_empty() {
         body.insert("stop".into(), json!(req.stop_sequences));
+    }
+    // OpenAI auto-caches stable prefixes; the cache key only routes a
+    // conversation to one cache shard (it does not enable caching itself).
+    if let Some(key) = &req.cache_key {
+        body.insert("prompt_cache_key".into(), json!(key));
     }
     if stream {
         body.insert("stream".into(), json!(true));
@@ -243,16 +263,57 @@ fn map_user_parts(parts: &[UserContent], out: &mut Vec<Value>) {
             }));
         }
     }
-    let text: String = parts
-        .iter()
-        .filter_map(|p| match p {
-            UserContent::Text(t) => Some(t.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !text.is_empty() {
-        out.push(json!({ "role": "user", "content": text }));
+    // Check if there are any images in this user turn.
+    let has_images = parts.iter().any(|p| matches!(p, UserContent::Image(_)));
+    if has_images {
+        // Emit a multi-part content array combining text and images.
+        let mut content_parts: Vec<Value> = Vec::new();
+        for p in parts {
+            match p {
+                UserContent::Text(t) => {
+                    content_parts.push(json!({ "type": "text", "text": &**t }));
+                }
+                UserContent::Image(img) => {
+                    content_parts.push(map_image_block(img));
+                }
+                UserContent::ToolResult { .. } => {}
+            }
+        }
+        if !content_parts.is_empty() {
+            out.push(json!({ "role": "user", "content": content_parts }));
+        }
+    } else {
+        let text: String = parts
+            .iter()
+            .filter_map(|p| match p {
+                UserContent::Text(t) => Some(&**t),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            out.push(json!({ "role": "user", "content": text }));
+        }
+    }
+}
+
+/// Maps an [`Image`] to an `OpenAI` content part block.
+fn map_image_block(img: &Image) -> Value {
+    match img {
+        Image::Url { url } => {
+            json!({ "type": "image_url", "image_url": { "url": &**url } })
+        }
+        Image::Base64 { media_type, data } => {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+            let data_uri = format!("data:{};base64,{b64}", &**media_type);
+            json!({ "type": "image_url", "image_url": { "url": data_uri } })
+        }
+        Image::FileId { file_id } => {
+            // OpenAI file input uses the "input_image" type with file_id.
+            // https://platform.openai.com/docs/guides/images?api-mode=responses
+            json!({ "type": "input_image", "file_id": &**file_id })
+        }
     }
 }
 
@@ -324,7 +385,7 @@ fn map_tool_choice(choice: &ToolChoice) -> Value {
 
 // --- response mapping ------------------------------------------------------
 
-fn parse_response(value: Value) -> ChatResponse<Value> {
+fn parse_response(value: &Value) -> ChatResponse {
     let choice = value.get("choices").and_then(|c| c.get(0));
     let message = choice.and_then(|c| c.get("message"));
     let mut content = Vec::new();
@@ -333,7 +394,7 @@ fn parse_response(value: Value) -> ChatResponse<Value> {
         .and_then(Value::as_str)
     {
         if !text.is_empty() {
-            content.push(AssistantContent::Text(text.to_owned()));
+            content.push(AssistantContent::Text(text.into()));
         }
     }
     if let Some(calls) = message
@@ -355,7 +416,6 @@ fn parse_response(value: Value) -> ChatResponse<Value> {
         content,
         stop,
         usage,
-        raw: value,
     }
 }
 
@@ -538,7 +598,7 @@ mod tests {
             "usage": { "prompt_tokens": 12, "completion_tokens": 4,
                        "prompt_tokens_details": { "cached_tokens": 8 } }
         });
-        let resp = parse_response(value);
+        let resp = parse_response(&value);
         assert_eq!(resp.stop, StopReason::ToolUse);
         assert_eq!(resp.usage.input_tokens, 12);
         assert_eq!(resp.usage.cache_read_tokens, 8);

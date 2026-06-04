@@ -1,19 +1,20 @@
-//! Third-party extensibility proof: build an agent and add a brand-new provider
-//! and a hand-written tool using ONLY items re-exported from `stakit_ai_sdk`.
+//! Third-party extensibility proof: build a stateful agent and add a brand-new
+//! provider, a hand-written tool, and a middleware using ONLY items re-exported
+//! from `stakit_ai_sdk`.
 //!
 //! Nothing here touches crate internals — every type is reached through the
 //! public `stakit_ai_sdk::*` surface. If this file compiles and passes, an
-//! outside developer can ship their own provider and tools as a downstream
-//! crate without forking or patching `stakit-ai-sdk`.
+//! outside developer can ship their own provider, tools and middleware as a
+//! downstream crate without forking or patching `stakit-ai-sdk`.
 #![allow(dead_code)]
-// The fake provider satisfies the async `Provider` trait but does no async work.
-#![allow(clippy::unused_async_trait_impl)]
 
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use stakit_ai_sdk::{
-    Agent, AssistantContent, BoxFuture, CancelToken, ChatRequest, ChatResponse, EventStream,
-    FinishReason, LoopEvent, Message, Provider, ProviderError, StopReason, StreamEvent, Tool,
-    ToolCx, ToolDef, ToolDyn, ToolError, Usage, UserContent, tool,
+    Agent, AgentCx, AgentError, AgentEvent, AgentMiddleware, Approval, AssistantContent,
+    ChatRequest, ChatResponse, EventStream, Finish, Flow, Message, PendingToolCall, Provider,
+    ProviderError, StopReason, StreamEvent, Tool, ToolCx, ToolDef, ToolDyn, ToolError, Usage,
+    UserContent, tool,
 };
 use stakit_model::{JsonSchema, Model};
 
@@ -22,9 +23,6 @@ use stakit_model::{JsonSchema, Model};
 // ---------------------------------------------------------------------------
 
 /// A fake provider that echoes the last user text back as the assistant reply.
-///
-/// First turn: emit a single `TextDelta` echoing the last user message, then
-/// `End { EndTurn }`. This is enough to drive the agent loop to completion.
 #[derive(Clone)]
 struct EchoProvider {
     model: String,
@@ -45,7 +43,7 @@ impl EchoProvider {
             .rev()
             .find_map(|m| match m {
                 Message::User(parts) => parts.iter().find_map(|p| match p {
-                    UserContent::Text(t) => Some(t.clone()),
+                    UserContent::Text(t) => Some(t.to_string()),
                     _ => None,
                 }),
                 Message::Assistant(_) => None,
@@ -63,41 +61,39 @@ impl EchoProvider {
 }
 
 impl Provider for EchoProvider {
-    type Raw = ();
-
     fn model_id(&self) -> &str {
         &self.model
     }
 
-    async fn complete(
-        &self,
-        request: ChatRequest,
-    ) -> Result<ChatResponse<Self::Raw>, ProviderError> {
-        let echoed = format!("echo: {}", Self::last_user_text(&request));
-        Ok(ChatResponse {
-            content: vec![AssistantContent::Text(echoed)],
-            stop: StopReason::EndTurn,
-            usage: Self::canned_usage(),
-            raw: (),
+    fn complete(&self, request: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
+        Box::pin(async move {
+            let echoed = format!("echo: {}", Self::last_user_text(&request));
+            Ok(ChatResponse {
+                content: vec![AssistantContent::Text(echoed.into())],
+                stop: StopReason::EndTurn,
+                usage: Self::canned_usage(),
+            })
         })
     }
 
-    async fn stream(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
-        let echoed = format!("echo: {}", Self::last_user_text(&request));
-        let events: Vec<Result<StreamEvent, ProviderError>> = vec![
-            Ok(StreamEvent::Start {
-                usage: Usage {
-                    input_tokens: 7,
-                    ..Usage::default()
-                },
-            }),
-            Ok(StreamEvent::TextDelta(echoed)),
-            Ok(StreamEvent::End {
-                stop: StopReason::EndTurn,
-                usage: Self::canned_usage(),
-            }),
-        ];
-        Ok(futures::stream::iter(events).boxed())
+    fn stream(&self, request: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
+        Box::pin(async move {
+            let echoed = format!("echo: {}", Self::last_user_text(&request));
+            let events: Vec<Result<StreamEvent, ProviderError>> = vec![
+                Ok(StreamEvent::Start {
+                    usage: Usage {
+                        input_tokens: 7,
+                        ..Usage::default()
+                    },
+                }),
+                Ok(StreamEvent::TextDelta(echoed)),
+                Ok(StreamEvent::End {
+                    stop: StopReason::EndTurn,
+                    usage: Self::canned_usage(),
+                }),
+            ];
+            Ok(futures::stream::iter(events).boxed())
+        })
     }
 }
 
@@ -153,45 +149,63 @@ impl Tool<()> for ReverseTool {
 }
 
 // ---------------------------------------------------------------------------
+// (4) A middleware implemented BY HAND against the public trait.
+// ---------------------------------------------------------------------------
+
+/// Approves every tool call except those named in `block`.
+struct Policy {
+    block: &'static str,
+}
+
+#[async_trait::async_trait]
+impl AgentMiddleware<()> for Policy {
+    async fn on_tool_approve(
+        &self,
+        _cx: &AgentCx<'_, ()>,
+        call: &PendingToolCall,
+    ) -> Result<Approval, AgentError> {
+        if call.name == self.block {
+            Ok(Approval::Deny {
+                message: format!("{} blocked by policy", call.name),
+            })
+        } else {
+            Ok(Approval::Allow)
+        }
+    }
+
+    async fn on_step(&self, _cx: &mut AgentCx<'_, ()>) -> Result<Flow, AgentError> {
+        Ok(Flow::Continue)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn extensibility_outsider_builds_agent_over_custom_provider() {
-    let agent = Agent::<EchoProvider, ()>::builder(EchoProvider::new())
-        .register(shout)
-        .register(ReverseTool)
-        .build();
+    let mut agent = Agent::new(())
+        .provider(EchoProvider::new())
+        .register_tool(shout)
+        .register_tool(ReverseTool)
+        .register_middleware(Policy { block: "nothing" })
+        .with_context(vec![Message::user("hello world")]);
 
-    assert_eq!(
-        agent.tool_names(),
-        vec!["shout".to_string(), "reverse".to_string()]
-    );
+    let mut run = agent.run();
+    let mut saw_delta = false;
+    let mut outcome = None;
+    while let Some(ev) = run.next().await {
+        match ev {
+            AgentEvent::MessageDelta(t) if t.contains("hello world") => saw_delta = true,
+            AgentEvent::Done(o) => outcome = Some(o),
+            _ => {}
+        }
+    }
+    assert!(saw_delta, "expected a MessageDelta echoing the input");
 
-    let events: Vec<LoopEvent> = agent
-        .run(
-            vec![Message::user_text("hello world")],
-            (),
-            CancelToken::new(),
-        )
-        .collect()
-        .await;
-
-    // The loop must have streamed at least one text delta with our echo.
-    let saw_delta = events
-        .iter()
-        .any(|e| matches!(e, LoopEvent::TextDelta(t) if t.contains("hello world")));
-    assert!(
-        saw_delta,
-        "expected a TextDelta echoing the input: {events:?}"
-    );
-
-    // And it must terminate with a clean Done.
-    let Some(LoopEvent::Done { text, reason, .. }) = events.last() else {
-        panic!("last event is not Done: {events:?}");
-    };
-    assert_eq!(*reason, FinishReason::EndTurn);
-    assert_eq!(text, "echo: hello world");
+    let out = outcome.expect("a Done outcome");
+    assert!(matches!(out.finish, Finish::EndTurn));
+    assert_eq!(out.text, "echo: hello world");
 }
 
 #[tokio::test]
@@ -200,7 +214,7 @@ async fn custom_provider_complete_works() {
     let resp = provider
         .complete({
             let mut r = ChatRequest::new("echo-1");
-            r.messages.push(Message::user_text("ping"));
+            r.messages.push(Message::user("ping"));
             r
         })
         .await

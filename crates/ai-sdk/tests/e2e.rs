@@ -9,15 +9,15 @@
 //!
 //! `e2e_claude_all` and `e2e_openai_all` each exercise the same scenarios —
 //! tools, multi-step loop, parallel tool calls, skill loading, prompt
-//! injection, and tool approval (`can_use_tool`) — against the real provider.
+//! injection, and tool approval (middleware `Deny`) — against the real provider.
 #![cfg(all(feature = "claude", feature = "openai"))]
 #![allow(dead_code)]
 
 use futures::StreamExt;
 use stakit_ai_sdk::{
-    Agent, CacheStrategy, CancelToken, ChatRequest, ClaudeClient, FinishReason, FsSkillLoader,
-    LoopEvent, Message, ModelPrice, OpenAiClient, Permission, Pricing, Provider, SystemPrompt,
-    tool,
+    Agent, AgentCx, AgentError, AgentEvent, AgentMiddleware, Approval, CacheStrategy, ChatRequest,
+    ClaudeClient, Finish, Flow, Message, ModelPrice, OpenAiClient, PendingToolCall, Pricing,
+    Provider, Skill, SkillContent, SkillLoader, SystemPrompt, ToolOutcome, tool,
 };
 use stakit_model::{JsonSchema, Model};
 
@@ -42,10 +42,6 @@ fn load_env() {
     let _ = dotenvy::from_path(path);
 }
 
-fn skills_root() -> String {
-    format!("{}/../../.agents/skills", env!("CARGO_MANIFEST_DIR"))
-}
-
 fn pricing(model: &str) -> Pricing {
     Pricing::new().with(
         model,
@@ -58,89 +54,145 @@ fn pricing(model: &str) -> Pricing {
     )
 }
 
-async fn collect<P: Provider>(agent: &Agent<P, ()>, history: Vec<Message>) -> Vec<LoopEvent> {
-    agent.run(history, (), CancelToken::new()).collect().await
+/// A trivial in-test skill loader (replaces the removed `FsSkillLoader`).
+struct DemoSkills;
+
+#[async_trait::async_trait]
+impl SkillLoader<()> for DemoSkills {
+    async fn list(&self, _ctx: &()) -> Result<Vec<Skill>, AgentError> {
+        Ok(vec![Skill {
+            id: "rust-best-practices".into(),
+            name: "rust-best-practices".into(),
+            description: "Idiomatic Rust guidance.".into(),
+        }])
+    }
+    async fn load(&self, _ctx: &(), id: &str) -> Result<SkillContent, AgentError> {
+        if id == "rust-best-practices" {
+            Ok(SkillContent {
+                body: "Write idiomatic Rust: prefer borrows, handle errors with Result.".into(),
+                references: Vec::new(),
+            })
+        } else {
+            Err(AgentError::Skill(format!("unknown skill: {id}")))
+        }
+    }
 }
 
-fn done(events: &[LoopEvent]) -> (&str, FinishReason) {
+/// A middleware that denies a named tool (replaces `can_use_tool`).
+struct DenyPolicy {
+    tool: &'static str,
+}
+
+#[async_trait::async_trait]
+impl AgentMiddleware<()> for DenyPolicy {
+    async fn on_tool_approve(
+        &self,
+        _cx: &AgentCx<'_, ()>,
+        call: &PendingToolCall,
+    ) -> Result<Approval, AgentError> {
+        if call.name == self.tool {
+            Ok(Approval::Deny {
+                message: format!("{} blocked by policy", call.name),
+            })
+        } else {
+            Ok(Approval::Allow)
+        }
+    }
+}
+
+/// A middleware that injects one extra user turn before the first model call.
+struct InjectQuestion {
+    text: &'static str,
+}
+
+#[async_trait::async_trait]
+impl AgentMiddleware<()> for InjectQuestion {
+    async fn on_start(&self, cx: &mut AgentCx<'_, ()>) -> Result<Flow, AgentError> {
+        cx.messages_mut().push(Message::user(self.text));
+        Ok(Flow::Continue)
+    }
+}
+
+async fn collect(agent: &mut Agent<()>) -> Vec<AgentEvent> {
+    agent.run().collect().await
+}
+
+fn done(events: &[AgentEvent]) -> (String, Finish) {
     match events.last() {
-        Some(LoopEvent::Done { text, reason, .. }) => (text, *reason),
+        Some(AgentEvent::Done(o)) => (o.text.clone(), o.finish.clone()),
         other => panic!("expected Done, got {other:?}"),
     }
 }
 
-fn tool_calls(events: &[LoopEvent], name: &str) -> usize {
+fn tool_calls(events: &[AgentEvent], name: &str) -> usize {
     events
         .iter()
-        .filter(|e| matches!(e, LoopEvent::ToolCall { name: n, .. } if n == name))
+        .filter(|e| matches!(e, AgentEvent::ToolCall { name: n, .. } if n == name))
+        .count()
+}
+
+fn ok_tool_results(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::ToolResult {
+                    result: ToolOutcome::Ok(_),
+                    ..
+                }
+            )
+        })
         .count()
 }
 
 // --- scenarios (provider-agnostic) ----------------------------------------
 
 /// Tool round-trip + multi-step loop + usage + cost.
-async fn scenario_tools_and_loop<P: Provider>(model: P, id: &str) {
-    let agent = Agent::<P, ()>::builder(model)
+async fn scenario_tools_and_loop<P: Provider + 'static>(model: P, id: &str) {
+    let mut agent = Agent::new(())
+        .provider(model)
         .model(id)
         .pricing(pricing(id))
         .max_tokens(512)
-        .register(get_weather)
-        .build();
-    let events = collect(
-        &agent,
-        vec![Message::user_text(
+        .register_tool(get_weather)
+        .with_context(vec![Message::user(
             "Use the get_weather tool for Paris, then tell me the weather in one sentence.",
-        )],
-    )
-    .await;
+        )]);
+    let events = collect(&mut agent).await;
 
     assert!(
         tool_calls(&events, "get_weather") >= 1,
         "no tool call: {events:?}"
     );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            LoopEvent::ToolResult {
-                is_error: false,
-                ..
-            }
-        )),
-        "no tool result"
-    );
+    assert!(ok_tool_results(&events) >= 1, "no successful tool result");
     // tool turn + final turn => at least two steps.
     let steps = events
         .iter()
-        .filter(|e| matches!(e, LoopEvent::StepEnd { .. }))
+        .filter(|e| matches!(e, AgentEvent::StepEnd { .. }))
         .count();
     assert!(steps >= 2, "expected a multi-step loop, got {steps}");
-    let (text, reason) = done(&events);
-    assert_eq!(reason, FinishReason::EndTurn);
+    let (text, finish) = done(&events);
+    assert!(matches!(finish, Finish::EndTurn));
     assert!(!text.is_empty());
-    let total: Option<f64> = events
-        .iter()
-        .find_map(|e| match e {
-            LoopEvent::Done { cost, .. } => Some(*cost),
-            _ => None,
-        })
-        .flatten();
-    assert!(total.unwrap_or(0.0) > 0.0, "cost should be estimated");
+    let cost = match events.last() {
+        Some(AgentEvent::Done(o)) => o.cost,
+        _ => None,
+    };
+    assert!(cost.unwrap_or(0.0) > 0.0, "cost should be estimated");
 }
 
 /// The model issues several tool calls; the loop runs them concurrently.
-async fn scenario_parallel_tools<P: Provider>(model: P, id: &str) {
-    let agent = Agent::<P, ()>::builder(model)
+async fn scenario_parallel_tools<P: Provider + 'static>(model: P, id: &str) {
+    let mut agent = Agent::new(())
+        .provider(model)
         .model(id)
         .max_tokens(512)
-        .register(get_weather)
-        .build();
-    let events = collect(
-        &agent,
-        vec![Message::user_text(
+        .register_tool(get_weather)
+        .with_context(vec![Message::user(
             "Call the get_weather tool separately for BOTH Paris and Tokyo, then summarize both.",
-        )],
-    )
-    .await;
+        )]);
+    let events = collect(&mut agent).await;
     assert!(
         tool_calls(&events, "get_weather") >= 2,
         "expected >=2 weather tool calls: {events:?}"
@@ -148,56 +200,38 @@ async fn scenario_parallel_tools<P: Provider>(model: P, id: &str) {
 }
 
 /// Skill loading via the built-in `load_skill` tool (progressive disclosure).
-async fn scenario_skills<P: Provider>(model: P, id: &str) {
-    let agent = Agent::<P, ()>::builder(model)
+async fn scenario_skills<P: Provider + 'static>(model: P, id: &str) {
+    let mut agent = Agent::new(())
+        .provider(model)
         .model(id)
         .max_tokens(512)
-        .skills(FsSkillLoader::new(skills_root()))
-        .build();
-    let events = collect(
-        &agent,
-        vec![Message::user_text(
+        .system("You are a helpful assistant.")
+        .skills(DemoSkills)
+        .with_context(vec![Message::user(
             "Call load_skill for the \"rust-best-practices\" skill, then reply with the word loaded.",
-        )],
-    )
-    .await;
+        )]);
+    let events = collect(&mut agent).await;
     assert!(
         tool_calls(&events, "load_skill") >= 1,
         "model should call load_skill: {events:?}"
     );
     assert!(
-        events.iter().any(|e| matches!(
-            e,
-            LoopEvent::ToolResult {
-                is_error: false,
-                ..
-            }
-        )),
-        "load_skill should succeed"
+        ok_tool_results(&events) >= 1,
+        "load_skill should succeed: {events:?}"
     );
 }
 
-/// Mid-loop prompt injection via `run_with_input`.
-async fn scenario_inject<P: Provider>(model: P, id: &str) {
-    let agent = Agent::<P, ()>::builder(model)
+/// Mid-loop prompt injection via a middleware.
+async fn scenario_inject<P: Provider + 'static>(model: P, id: &str) {
+    let mut agent = Agent::new(())
+        .provider(model)
         .model(id)
         .max_tokens(64)
-        .build();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tx.send(Message::user_text(
-        "What is 2 + 2? Reply with only the number.",
-    ))
-    .unwrap();
-    drop(tx);
-    let events: Vec<LoopEvent> = agent
-        .run_with_input(
-            vec![Message::user_text("Await a question.")],
-            (),
-            CancelToken::new(),
-            Some(rx),
-        )
-        .collect()
-        .await;
+        .register_middleware(InjectQuestion {
+            text: "What is 2 + 2? Reply with only the number.",
+        })
+        .with_context(vec![Message::user("Await a question.")]);
+    let events = collect(&mut agent).await;
     let (text, _) = done(&events);
     assert!(
         text.contains('4'),
@@ -205,27 +239,20 @@ async fn scenario_inject<P: Provider>(model: P, id: &str) {
     );
 }
 
-/// Tool approval: `can_use_tool` denies the call; the model gets an error result.
-async fn scenario_approval_denies<P: Provider>(model: P, id: &str) {
-    let agent = Agent::<P, ()>::builder(model)
+/// Tool approval: a middleware denies the call; the model gets an error result.
+async fn scenario_approval_denies<P: Provider + 'static>(model: P, id: &str) {
+    let mut agent = Agent::new(())
+        .provider(model)
         .model(id)
         .max_tokens(256)
-        .register(get_weather)
-        .can_use_tool(|name, _args, _cx| {
-            Box::pin(async move {
-                Permission::Deny {
-                    reason: format!("{name} blocked by policy"),
-                }
-            })
+        .register_tool(get_weather)
+        .register_middleware(DenyPolicy {
+            tool: "get_weather",
         })
-        .build();
-    let events = collect(
-        &agent,
-        vec![Message::user_text(
+        .with_context(vec![Message::user(
             "Use the get_weather tool to get the weather in Paris.",
-        )],
-    )
-    .await;
+        )]);
+    let events = collect(&mut agent).await;
     assert!(
         tool_calls(&events, "get_weather") >= 1,
         "model should attempt the tool"
@@ -233,10 +260,10 @@ async fn scenario_approval_denies<P: Provider>(model: P, id: &str) {
     assert!(
         events.iter().any(|e| matches!(
             e,
-            LoopEvent::ToolResult { is_error: true, output, .. }
-                if output.as_str().is_some_and(|s| s.contains("blocked by policy"))
+            AgentEvent::ToolResult { result: ToolOutcome::Denied { message }, .. }
+                if message.contains("blocked by policy")
         )),
-        "denied tool should yield an error result: {events:?}"
+        "denied tool should yield a Denied result: {events:?}"
     );
 }
 
@@ -288,10 +315,10 @@ async fn e2e_claude_prompt_caching() {
     let request = || {
         let mut r = ChatRequest::new(CLAUDE_MODEL);
         r.system = Some(SystemPrompt {
-            text: big.clone(),
+            text: big.clone().into(),
             cache: true,
         });
-        r.messages = vec![Message::user_text("Reply with the single word: ok")];
+        r.messages = vec![Message::user("Reply with the single word: ok")];
         r.max_tokens = 16;
         r.cache = CacheStrategy::Auto;
         r
@@ -324,7 +351,7 @@ async fn e2e_openai_prompt_caching() {
     let request = || {
         let mut r = ChatRequest::new(OPENAI_MODEL);
         r.system = Some(SystemPrompt::from(big.clone()));
-        r.messages = vec![Message::user_text("Reply with the single word: ok")];
+        r.messages = vec![Message::user("Reply with the single word: ok")];
         r.max_tokens = 16;
         r
     };
@@ -345,18 +372,15 @@ async fn e2e_openai_streaming_text() {
     let Ok(client) = OpenAiClient::from_env() else {
         return;
     };
-    let agent = Agent::<_, ()>::builder(client.model(OPENAI_MODEL))
+    let mut agent = Agent::new(())
+        .provider(client.model(OPENAI_MODEL))
         .model(OPENAI_MODEL)
         .max_tokens(64)
-        .build();
-    let events = collect(
-        &agent,
-        vec![Message::user_text("Count from 1 to 5, words only.")],
-    )
-    .await;
+        .with_context(vec![Message::user("Count from 1 to 5, words only.")]);
+    let events = collect(&mut agent).await;
     let deltas = events
         .iter()
-        .filter(|e| matches!(e, LoopEvent::TextDelta(_)))
+        .filter(|e| matches!(e, AgentEvent::MessageDelta(_)))
         .count();
     assert!(deltas > 0, "expected streamed text deltas: {events:?}");
     let (text, _) = done(&events);
@@ -370,18 +394,15 @@ async fn e2e_claude_streaming_text() {
     let Ok(client) = ClaudeClient::from_env() else {
         return;
     };
-    let agent = Agent::<_, ()>::builder(client.model(CLAUDE_MODEL))
+    let mut agent = Agent::new(())
+        .provider(client.model(CLAUDE_MODEL))
         .model(CLAUDE_MODEL)
         .max_tokens(64)
-        .build();
-    let events = collect(
-        &agent,
-        vec![Message::user_text("Count from 1 to 5, words only.")],
-    )
-    .await;
+        .with_context(vec![Message::user("Count from 1 to 5, words only.")]);
+    let events = collect(&mut agent).await;
     let deltas = events
         .iter()
-        .filter(|e| matches!(e, LoopEvent::TextDelta(_)))
+        .filter(|e| matches!(e, AgentEvent::MessageDelta(_)))
         .count();
     assert!(deltas > 0, "expected streamed text deltas: {events:?}");
     let (text, _) = done(&events);

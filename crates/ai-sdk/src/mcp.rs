@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::cx::ToolCx;
-use crate::error::{AiError, ToolError};
+use crate::error::{AgentError, ToolError};
 use crate::provider::ToolDef;
 use crate::tool::{ToolDyn, ToolSet};
 
@@ -93,9 +93,9 @@ impl McpConfig {
     /// Parses an MCP config from JSON text.
     ///
     /// # Errors
-    /// Returns [`AiError::Mcp`] if the JSON is malformed.
-    pub fn from_json(text: &str) -> Result<Self, AiError> {
-        serde_json::from_str(text).map_err(|e| AiError::Mcp(format!("invalid mcp config: {e}")))
+    /// Returns [`AgentError::Mcp`] if the JSON is malformed.
+    pub fn from_json(text: &str) -> Result<Self, AgentError> {
+        serde_json::from_str(text).map_err(|e| AgentError::Mcp(format!("invalid mcp config: {e}")))
     }
 
     /// Expands environment placeholders in every server definition.
@@ -150,10 +150,13 @@ pub struct McpTool {
 /// custom stdio/HTTP client, …); the adapter below turns it into registry tools.
 pub trait McpTransport: Send + Sync + 'static {
     /// Lists the server's tools.
-    fn list_tools(&self) -> BoxFuture<'_, Result<Vec<McpTool>, AiError>>;
+    fn list_tools(&self) -> BoxFuture<'_, Result<Vec<McpTool>, AgentError>>;
     /// Calls a tool by its server-side name with JSON arguments.
-    fn call_tool<'a>(&'a self, name: &'a str, args: Value)
-    -> BoxFuture<'a, Result<Value, AiError>>;
+    fn call_tool<'a>(
+        &'a self,
+        name: &'a str,
+        args: Value,
+    ) -> BoxFuture<'a, Result<Value, AgentError>>;
 }
 
 /// Adapts a connected [`McpTransport`] into a [`ToolSet`]: each MCP tool becomes
@@ -169,7 +172,7 @@ impl<T: McpTransport> McpToolSet<T> {
     ///
     /// # Errors
     /// Propagates transport errors from `list_tools`.
-    pub async fn connect(server: impl Into<String>, transport: T) -> Result<Self, AiError> {
+    pub async fn connect(server: impl Into<String>, transport: T) -> Result<Self, AgentError> {
         let transport = Arc::new(transport);
         let tools = transport.list_tools().await?;
         Ok(Self {
@@ -272,7 +275,7 @@ mod tests {
     struct MockTransport;
 
     impl McpTransport for MockTransport {
-        fn list_tools(&self) -> BoxFuture<'_, Result<Vec<McpTool>, AiError>> {
+        fn list_tools(&self) -> BoxFuture<'_, Result<Vec<McpTool>, AgentError>> {
             Box::pin(async {
                 Ok(vec![McpTool {
                     name: "search".into(),
@@ -285,7 +288,7 @@ mod tests {
             &'a self,
             name: &'a str,
             _args: Value,
-        ) -> BoxFuture<'a, Result<Value, AiError>> {
+        ) -> BoxFuture<'a, Result<Value, AgentError>> {
             Box::pin(async move { Ok(json!({ "called": name })) })
         }
     }

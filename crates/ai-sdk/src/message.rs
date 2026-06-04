@@ -8,8 +8,10 @@
 //! vendor wire shape. This keeps illegal states (e.g. a tool result on an
 //! assistant turn) unrepresentable.
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 /// A single conversation turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,13 +24,27 @@ pub enum Message {
 
 impl Message {
     /// A user turn containing a single text block.
-    pub fn user_text(text: impl Into<String>) -> Self {
+    pub fn user(text: impl Into<Arc<str>>) -> Self {
         Self::User(vec![UserContent::Text(text.into())])
     }
 
+    /// A user turn containing a single text block.
+    ///
+    /// Alias for [`Message::user`]; kept for compatibility.
+    pub fn user_text(text: impl Into<Arc<str>>) -> Self {
+        Self::user(text)
+    }
+
     /// An assistant turn containing a single text block.
-    pub fn assistant_text(text: impl Into<String>) -> Self {
+    pub fn assistant(text: impl Into<Arc<str>>) -> Self {
         Self::Assistant(vec![AssistantContent::Text(text.into())])
+    }
+
+    /// An assistant turn containing a single text block.
+    ///
+    /// Alias for [`Message::assistant`]; kept for compatibility.
+    pub fn assistant_text(text: impl Into<Arc<str>>) -> Self {
+        Self::assistant(text)
     }
 }
 
@@ -36,9 +52,9 @@ impl Message {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UserContent {
     /// Plain text.
-    Text(String),
+    Text(Arc<str>),
     /// An image input.
-    Image(ImageSource),
+    Image(Image),
     /// The result of a tool call, referencing the originating [`AssistantContent::ToolUse`] by `id`.
     ToolResult {
         /// Correlates with the `id` of the assistant `ToolUse` block.
@@ -54,7 +70,7 @@ pub enum UserContent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AssistantContent {
     /// Plain text.
-    Text(String),
+    Text(Arc<str>),
     /// A request to call a tool, with already-parsed arguments.
     ToolUse {
         /// Unique id for this call; the matching `ToolResult` references it.
@@ -92,28 +108,41 @@ pub enum ToolResultPart {
     /// Text output.
     Text(String),
     /// Image output.
-    Image(ImageSource),
+    Image(Image),
 }
 
-/// The source of an image input.
+/// A provider-neutral image reference inside a message.
+///
+/// Prefer [`Image::Url`] / [`Image::FileId`]: base64 is re-sent every turn and
+/// bloats both the request and the prompt cache. Each provider adapter maps this
+/// to its own wire format at send time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ImageSource {
-    /// Base64-encoded image bytes with a MIME type (e.g. `image/png`).
-    Base64 {
-        /// MIME media type.
-        media_type: String,
-        /// Base64 data.
-        data: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Image {
+    /// A public URL the provider fetches.
+    Url {
+        /// The image URL.
+        url: Arc<str>,
     },
-    /// A URL the provider fetches.
-    Url(String),
+    /// An id from a provider Files API (uploaded once, referenced cheaply).
+    FileId {
+        /// The file identifier.
+        file_id: Arc<str>,
+    },
+    /// Inline base64 bytes; use only when no URL/file id exists.
+    Base64 {
+        /// MIME type, e.g. `image/png`.
+        media_type: Arc<str>,
+        /// Raw bytes (cheap to clone).
+        data: Bytes,
+    },
 }
 
 /// The request-level system prompt, with an optional cache breakpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemPrompt {
     /// The system prompt text.
-    pub text: String,
+    pub text: Arc<str>,
     /// Request a prompt-cache breakpoint after this block (Anthropic; no-op on
     /// providers with automatic caching).
     pub cache: bool,
@@ -121,19 +150,56 @@ pub struct SystemPrompt {
 
 impl From<String> for SystemPrompt {
     fn from(text: String) -> Self {
-        Self { text, cache: false }
+        Self {
+            text: text.into(),
+            cache: false,
+        }
     }
 }
 
 impl From<&str> for SystemPrompt {
     fn from(text: &str) -> Self {
-        Self::from(text.to_owned())
+        Self {
+            text: text.into(),
+            cache: false,
+        }
+    }
+}
+
+impl From<Arc<str>> for SystemPrompt {
+    fn from(text: Arc<str>) -> Self {
+        Self { text, cache: false }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_url_is_cheap_clone_and_serializes_as_url() {
+        let img = Image::Url {
+            url: "https://x/y.png".into(),
+        };
+        let clone = img.clone();
+        assert!(matches!(clone, Image::Url { ref url } if &**url == "https://x/y.png"));
+        let json = serde_json::to_value(&img).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "type": "url", "url": "https://x/y.png" })
+        );
+    }
+
+    #[test]
+    fn image_base64_roundtrips() {
+        let img = Image::Base64 {
+            media_type: "image/png".into(),
+            data: bytes::Bytes::from_static(b"\x89PNG"),
+        };
+        let json = serde_json::to_value(&img).unwrap();
+        let back: Image = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, Image::Base64 { .. }));
+    }
 
     #[test]
     fn user_text_builds_single_text_block() {
@@ -158,7 +224,16 @@ mod tests {
     #[test]
     fn system_prompt_from_str_has_no_cache_breakpoint() {
         let sp = SystemPrompt::from("you are helpful");
-        assert_eq!(sp.text, "you are helpful");
+        assert_eq!(&*sp.text, "you are helpful");
         assert!(!sp.cache);
+    }
+
+    #[test]
+    fn user_message_text_is_arc_backed_and_cheap_to_clone() {
+        let m = Message::user("hello");
+        let c = m.clone();
+        // Both the original and the clone share the same Arc-backed text.
+        assert_eq!(m, c);
+        assert!(format!("{c:?}").contains("hello"));
     }
 }

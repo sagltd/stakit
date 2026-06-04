@@ -6,7 +6,7 @@
 //! Requires `ANTHROPIC_API_KEY` (loaded from the repo-root `.env`).
 
 use futures::StreamExt;
-use stakit_ai_sdk::{Agent, CancelToken, ClaudeClient, LoopEvent, Message};
+use stakit_ai_sdk::{Agent, AgentEvent, ClaudeClient, Message};
 
 const MODEL: &str = "claude-haiku-4-5-20251001";
 
@@ -21,25 +21,22 @@ async fn main() {
         }
     };
 
-    let agent = Agent::<_, ()>::builder(client.model(MODEL))
+    let mut agent = Agent::new(())
+        .provider(client.model(MODEL))
+        .system("You are a helpful assistant.")
         .max_tokens(256)
-        .build();
+        .with_context(vec![Message::user("Say hello in exactly five words.")]);
 
-    let mut stream = Box::pin(agent.run(
-        vec![Message::user_text("Say hello in exactly five words.")],
-        (),
-        CancelToken::new(),
-    ));
-
-    while let Some(event) = stream.next().await {
-        match event {
-            LoopEvent::TextDelta(text) => print!("{text}"),
-            LoopEvent::Done { usage, cost, .. } => {
+    let mut run = agent.run();
+    while let Some(ev) = run.next().await {
+        match ev {
+            AgentEvent::MessageDelta(text) => print!("{text}"),
+            AgentEvent::Done(out) => {
                 println!(
                     "\n\n[tokens in={} out={} | est. ${:.6}]",
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    cost.unwrap_or(0.0)
+                    out.usage.input_tokens,
+                    out.usage.output_tokens,
+                    out.cost.unwrap_or(0.0)
                 );
             }
             _ => {}

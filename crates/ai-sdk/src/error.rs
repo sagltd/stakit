@@ -5,7 +5,7 @@
 //! debugging. [`ToolError`] is what tool bodies return — deliberately **not**
 //! an `Error` so a blanket `From` lets any `?`-propagated error become a tool
 //! error ergonomically (the same trick `stakit-router` uses for its `Error`).
-//! [`AiError`] is the crate's top-level error.
+//! [`AgentError`] is the crate's top-level error.
 
 use thiserror::Error;
 
@@ -88,7 +88,7 @@ impl<E: std::error::Error + Send + Sync + 'static> From<E> for ToolError {
 
 /// The crate's top-level error.
 #[derive(Debug, Error)]
-pub enum AiError {
+pub enum AgentError {
     /// A provider call failed.
     #[error(transparent)]
     Provider(#[from] ProviderError),
@@ -105,6 +105,16 @@ pub enum AiError {
     /// A skill could not be loaded.
     #[error("skill error: {0}")]
     Skill(String),
+    /// A host context (db / store) failure.
+    #[error("context error: {0}")]
+    Context(String),
+}
+
+impl AgentError {
+    /// Wrap a host context (db/store) failure.
+    pub fn context(e: impl std::fmt::Display) -> Self {
+        Self::Context(e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -129,8 +139,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_error_flows_into_ai_error() {
-        let ai: AiError = ProviderError::Cancelled.into();
-        assert!(matches!(ai, AiError::Provider(ProviderError::Cancelled)));
+    fn provider_error_flows_into_agent_error() {
+        let ai: AgentError = ProviderError::Cancelled.into();
+        assert!(matches!(ai, AgentError::Provider(ProviderError::Cancelled)));
     }
 }

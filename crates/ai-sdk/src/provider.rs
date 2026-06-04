@@ -9,8 +9,6 @@
 //! tool-call argument fragments internally so a [`StreamEvent::ToolCall`] is
 //! only emitted once whole.
 
-use std::future::Future;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -119,6 +117,12 @@ pub struct ChatRequest {
     pub thinking: ThinkingConfig,
     /// Prompt-cache strategy.
     pub cache: CacheStrategy,
+    /// Opaque cache-routing key for this conversation. Providers with
+    /// key-routed automatic caching (e.g. `OpenAI`'s `prompt_cache_key`) use it
+    /// to pin one conversation to a single cache shard so a shared prefix keeps
+    /// hitting across many concurrent users. `None` lets the provider route by
+    /// content alone.
+    pub cache_key: Option<String>,
     /// Raw per-provider passthrough merged into the request body.
     pub extra: serde_json::Map<String, Value>,
 }
@@ -138,6 +142,7 @@ impl ChatRequest {
             stop_sequences: Vec::new(),
             thinking: ThinkingConfig::Off,
             cache: CacheStrategy::Auto,
+            cache_key: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -145,15 +150,13 @@ impl ChatRequest {
 
 /// A non-streamed provider response.
 #[derive(Debug, Clone)]
-pub struct ChatResponse<R> {
+pub struct ChatResponse {
     /// Normalized assistant output blocks.
     pub content: Vec<AssistantContent>,
     /// Why generation stopped.
     pub stop: StopReason,
     /// Token usage for this request.
     pub usage: Usage,
-    /// Provider-native response body (escape hatch).
-    pub raw: R,
 }
 
 /// A normalized streaming event.
@@ -201,36 +204,29 @@ pub fn event_stream(events: Vec<Result<StreamEvent, ProviderError>>) -> EventStr
     futures::stream::iter(events).boxed()
 }
 
-/// A vendor-neutral LLM backend.
-///
-/// Implementors map [`ChatRequest`] to their wire format and back, returning
-/// the unified [`ChatResponse`] / [`StreamEvent`] types. `Raw` exposes the
-/// provider-native response body as an escape hatch.
-pub trait Provider: Clone + Send + Sync + 'static {
-    /// Provider-native response body, preserved on [`ChatResponse::raw`].
-    type Raw: Send + Sync;
-
-    /// The model id this handle targets (used by the agent for the request and
-    /// for cost lookup, so callers don't repeat the model).
+/// A chat-completion backend. Object-safe so the agent can hold
+/// `Box<dyn Provider>` and switch providers at runtime.
+pub trait Provider: Send + Sync {
+    /// The model id this provider serves (registry key).
     fn model_id(&self) -> &str;
 
-    /// Performs a non-streamed completion.
+    /// One non-streaming completion.
     fn complete(
         &self,
-        request: ChatRequest,
-    ) -> impl Future<Output = Result<ChatResponse<Self::Raw>, ProviderError>> + Send;
+        req: ChatRequest,
+    ) -> futures::future::BoxFuture<'_, Result<ChatResponse, ProviderError>>;
 
-    /// Performs a streamed completion.
+    /// A streaming completion.
     fn stream(
         &self,
-        request: ChatRequest,
-    ) -> impl Future<Output = Result<EventStream, ProviderError>> + Send;
+        req: ChatRequest,
+    ) -> futures::future::BoxFuture<'_, Result<EventStream, ProviderError>>;
 }
 
 #[cfg(test)]
 mod tests {
-    // The mock provider satisfies the async trait but does no async work.
-    #![allow(clippy::unused_async_trait_impl)]
+    use futures::future::BoxFuture;
+
     use super::*;
 
     #[test]
@@ -254,38 +250,47 @@ mod tests {
         assert_eq!(v["parameters"]["type"], "object");
     }
 
-    // A trivial provider proving the trait is usable with native async fns.
-    #[derive(Clone)]
+    /// A trivial provider used in unit tests. Returns a canned response for
+    /// `complete` and an error for `stream`.
     struct MockProvider;
 
     impl Provider for MockProvider {
-        type Raw = ();
-
-        #[expect(
+        #[allow(
             clippy::unnecessary_literal_bound,
-            reason = "trait ties the lifetime to &self"
+            reason = "trait method must return &str"
         )]
         fn model_id(&self) -> &str {
             "mock"
         }
 
-        async fn complete(
+        fn complete(
             &self,
-            _request: ChatRequest,
-        ) -> Result<ChatResponse<Self::Raw>, ProviderError> {
-            Ok(ChatResponse {
-                content: vec![AssistantContent::Text("hello".into())],
-                stop: StopReason::EndTurn,
-                usage: Usage {
-                    output_tokens: 1,
-                    ..Usage::default()
-                },
-                raw: (),
+            _req: ChatRequest,
+        ) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    content: vec![AssistantContent::Text("hello".into())],
+                    stop: StopReason::EndTurn,
+                    usage: Usage {
+                        output_tokens: 1,
+                        ..Usage::default()
+                    },
+                })
             })
         }
 
-        async fn stream(&self, _request: ChatRequest) -> Result<EventStream, ProviderError> {
-            Err(ProviderError::InvalidArgument("not supported".into()))
+        fn stream(&self, _req: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
+            Box::pin(async move {
+                Ok(event_stream(vec![
+                    Ok(StreamEvent::Start {
+                        usage: Usage::default(),
+                    }),
+                    Ok(StreamEvent::End {
+                        stop: StopReason::EndTurn,
+                        usage: Usage::default(),
+                    }),
+                ]))
+            })
         }
     }
 
@@ -299,5 +304,12 @@ mod tests {
         assert_eq!(resp.content, vec![AssistantContent::Text("hello".into())]);
         assert_eq!(resp.stop, StopReason::EndTurn);
         assert_eq!(resp.usage.output_tokens, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_is_object_safe_and_dispatches_via_dyn() {
+        let p: Box<dyn Provider> = Box::new(MockProvider);
+        assert_eq!(p.model_id(), "mock");
+        let _ = p.stream(ChatRequest::new("mock")).await;
     }
 }

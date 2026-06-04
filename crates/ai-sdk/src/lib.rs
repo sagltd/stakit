@@ -11,35 +11,45 @@
 //! layer on top.
 
 mod agent;
+mod agent_cx;
 mod cache;
 mod cancel;
-mod context;
+mod control;
 mod cx;
 mod error;
+mod llm;
 mod loop_event;
 mod mcp;
 mod message;
+mod middleware;
 mod provider;
+mod retry;
 mod skill;
 mod tool;
 mod usage;
 
-pub use agent::{Agent, AgentBuilder};
+pub use agent::{Agent, AgentRun};
+pub use agent_cx::AgentCx;
 pub use cache::{CacheStrategy, CacheTarget, CacheTtl};
 pub use cancel::CancelToken;
-pub use context::{ContextLoader, FsContextLoader, LoadedContext};
-pub use cx::{Permission, ToolCx};
-pub use error::{AiError, ProviderError, ToolError};
-pub use loop_event::{FinishReason, LoopEvent, StopCond};
+pub use control::{Approval, Flow};
+pub use cx::ToolCx;
+pub use error::{AgentError, ProviderError, ToolError};
+pub use llm::LLM;
+pub use loop_event::{
+    AgentEvent, Finish, Outcome, PendingToolCall, Step, StopCond, ToolCallRecord, ToolOutcome,
+};
 pub use mcp::{McpConfig, McpServer, McpTool, McpToolSet, McpTransport};
 pub use message::{
-    AssistantContent, ImageSource, Message, SystemPrompt, Thinking, ToolResultPart, UserContent,
+    AssistantContent, Image, Message, SystemPrompt, Thinking, ToolResultPart, UserContent,
 };
+pub use middleware::AgentMiddleware;
 pub use provider::{
     ChatRequest, ChatResponse, EventStream, Provider, StopReason, StreamEvent, ThinkingConfig,
     ToolChoice, ToolDef, event_stream,
 };
-pub use skill::{FsSkillLoader, SkillContent, SkillLoader, SkillManifest};
+pub use retry::{RetryPolicy, Retryable, classify};
+pub use skill::{Skill, SkillContent, SkillLoader};
 pub use tool::{Tool, ToolDyn, ToolRegistry, ToolSet, TypedTool};
 pub use usage::{ModelPrice, Pricing, Usage};
 
@@ -56,3 +66,15 @@ pub use provider::claude::{ClaudeClient, ClaudeModel};
 /// The built-in `OpenAI` provider (Chat Completions).
 #[cfg(feature = "openai")]
 pub use provider::openai::{OpenAiClient, OpenAiModel};
+
+/// Internal test hooks for offline provider-body/cache assertions. Not part of
+/// the stable public API; shapes may change without notice.
+#[doc(hidden)]
+pub mod test_support {
+    /// Builds the Anthropic request body for a [`crate::ChatRequest`].
+    #[cfg(feature = "claude")]
+    pub use crate::provider::claude::build_request_body as claude_body;
+    /// Builds the `OpenAI` request body for a [`crate::ChatRequest`].
+    #[cfg(feature = "openai")]
+    pub use crate::provider::openai::build_request_body as openai_body;
+}

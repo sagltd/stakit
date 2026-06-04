@@ -15,13 +15,16 @@ serde_json.workspace = true
 thiserror.workspace = true
 futures.workspace = true
 async-stream.workspace = true
-bytes.workspace = true
+base64.workspace = true
+bytes = { workspace = true, features = ["serde"] }
 indexmap.workspace = true
 hashbrown = { workspace = true, features = ["serde"] }
 tokio = { workspace = true, features = ["rt", "sync", "time", "fs", "macros"] }
 reqwest = { workspace = true, optional = true }
 stakit-model = { workspace = true, features = ["schema"] }
 stakit-ai-sdk-derive.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
 
 [features]
 default = ["claude", "openai"]
@@ -29,6 +32,9 @@ default = ["claude", "openai"]
 claude = ["dep:reqwest"]
 # Built-in OpenAI provider (Responses + Chat Completions).
 openai = ["dep:reqwest"]
+# Opt-in feature gate for live integration tests that hit real API endpoints.
+# Tests under this gate are skipped when API keys are absent; never part of CI.
+live-tests = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }

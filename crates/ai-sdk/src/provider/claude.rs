@@ -10,7 +10,7 @@ use futures::StreamExt;
 use serde_json::{Map, Value, json};
 
 use crate::cache::{CacheStrategy, CacheTarget};
-use crate::message::{AssistantContent, Message, Thinking, ToolResultPart, UserContent};
+use crate::message::{AssistantContent, Image, Message, Thinking, ToolResultPart, UserContent};
 use crate::provider::{
     ChatRequest, ChatResponse, EventStream, Provider, StopReason, StreamEvent, ThinkingConfig,
     ToolChoice, ToolDef,
@@ -75,73 +75,78 @@ pub struct ClaudeModel {
 }
 
 impl Provider for ClaudeModel {
-    type Raw = Value;
-
     fn model_id(&self) -> &str {
         &self.model
     }
 
-    async fn complete(
+    fn complete(
         &self,
         request: ChatRequest,
-    ) -> Result<ChatResponse<Self::Raw>, ProviderError> {
-        let model = self.pick_model(&request);
-        let body = build_body(&model, &request, false);
-        let resp = self.send(body).await?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-        if !status.is_success() {
-            return Err(api_error(status.as_u16(), &text));
-        }
-        let value: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Decode {
-            err: e.to_string(),
-            body: text.clone(),
-        })?;
-        Ok(parse_response(value))
+    ) -> futures::future::BoxFuture<'_, Result<ChatResponse, ProviderError>> {
+        Box::pin(async move {
+            let model = self.pick_model(&request);
+            let body = build_body(&model, &request, false);
+            let resp = self.send(body).await?;
+            let status = resp.status();
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            if !status.is_success() {
+                return Err(api_error(status.as_u16(), &text));
+            }
+            let value: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Decode {
+                err: e.to_string(),
+                body: text.clone(),
+            })?;
+            Ok(parse_response(&value))
+        })
     }
 
-    async fn stream(&self, request: ChatRequest) -> Result<EventStream, ProviderError> {
-        let model = self.pick_model(&request);
-        let body = build_body(&model, &request, true);
-        let resp = self.send(body).await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(api_error(status.as_u16(), &text));
-        }
-        let mut bytes = resp.bytes_stream();
-        let stream = async_stream::stream! {
-            let mut buf = String::new();
-            let mut accum = Accum::default();
-            while let Some(chunk) = bytes.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        yield Err(ProviderError::Transport(e.to_string()));
-                        return;
-                    }
-                };
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(nl) = buf.find('\n') {
-                    let line: String = buf.drain(..=nl).collect();
-                    let line = line.trim_end();
-                    let Some(data) = line.strip_prefix("data:") else { continue };
-                    let data = data.trim();
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if let Ok(event) = serde_json::from_str::<Value>(data) {
-                        for ev in accum.push(&event) {
-                            yield Ok(ev);
+    fn stream(
+        &self,
+        request: ChatRequest,
+    ) -> futures::future::BoxFuture<'_, Result<EventStream, ProviderError>> {
+        Box::pin(async move {
+            let model = self.pick_model(&request);
+            let body = build_body(&model, &request, true);
+            let resp = self.send(body).await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(api_error(status.as_u16(), &text));
+            }
+            let mut bytes = resp.bytes_stream();
+            let stream = async_stream::stream! {
+                let mut buf = String::new();
+                let mut accum = Accum::default();
+                while let Some(chunk) = bytes.next().await {
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(e) => {
+                            yield Err(ProviderError::Transport(e.to_string()));
+                            return;
+                        }
+                    };
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some(nl) = buf.find('\n') {
+                        let line: String = buf.drain(..=nl).collect();
+                        let line = line.trim_end();
+                        let Some(data) = line.strip_prefix("data:") else { continue };
+                        let data = data.trim();
+                        if data.is_empty() {
+                            continue;
+                        }
+                        if let Ok(event) = serde_json::from_str::<Value>(data) {
+                            for ev in accum.push(&event) {
+                                yield Ok(ev);
+                            }
                         }
                     }
                 }
-            }
-        };
-        Ok(Box::pin(stream))
+            };
+            Ok(stream.boxed())
+        })
     }
 }
 
@@ -182,24 +187,41 @@ fn api_error(status: u16, body: &str) -> ProviderError {
 
 // --- request mapping -------------------------------------------------------
 
+/// Builds the Anthropic (non-streaming) request body for a [`ChatRequest`].
+///
+/// Exposed for offline body/cache-shape tests; the request's `model` field is
+/// used (falling back to an empty model id), so callers need only pass the
+/// request. Not part of the stable API.
+#[doc(hidden)]
+#[must_use]
+pub fn build_request_body(req: &ChatRequest) -> Value {
+    build_body(&req.model, req, false)
+}
+
 /// Builds the Anthropic request body from a unified [`ChatRequest`].
 fn build_body(model: &str, req: &ChatRequest, stream: bool) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
     body.insert("max_tokens".into(), json!(req.max_tokens));
     body.insert("stream".into(), json!(stream));
-    body.insert("messages".into(), json!(map_messages(&req.messages)));
 
-    let cache_tools = wants_cache(&req.cache, &CacheTarget::Tools)
-        || (matches!(req.cache, CacheStrategy::Auto) && req.system.is_none());
+    // Resolve the cache breakpoints once (prefix order: tools → system →
+    // messages), enforcing Anthropic's max of four across the whole request.
+    let plan = CachePlan::resolve(req);
+
+    body.insert(
+        "messages".into(),
+        json!(map_messages(&req.messages, plan.rolling_message)),
+    );
+
     if let Some(system) = &req.system {
-        body.insert(
-            "system".into(),
-            map_system(system, wants_cache(&req.cache, &CacheTarget::System)),
-        );
+        body.insert("system".into(), map_system(system, plan.cache_system));
     }
     if !req.tools.is_empty() {
-        body.insert("tools".into(), json!(map_tools(&req.tools, cache_tools)));
+        body.insert(
+            "tools".into(),
+            json!(map_tools(&req.tools, plan.cache_last_tool)),
+        );
         body.insert("tool_choice".into(), map_tool_choice(&req.tool_choice));
     }
     if let Some(temp) = req.temperature {
@@ -229,14 +251,135 @@ fn build_body(model: &str, req: &ChatRequest, stream: bool) -> Value {
     Value::Object(body)
 }
 
-/// `Auto` caches the stable prefix (system if present, else tools); explicit
-/// `Breakpoints` honor the requested targets.
-fn wants_cache(strategy: &CacheStrategy, target: &CacheTarget) -> bool {
-    match strategy {
-        CacheStrategy::Off => false,
-        CacheStrategy::Auto => matches!(target, CacheTarget::System),
-        CacheStrategy::Breakpoints { points, .. } => points.contains(target),
+/// Anthropic allows at most four `cache_control` breakpoints per request.
+const MAX_BREAKPOINTS: usize = 4;
+
+/// The resolved set of cache breakpoints for one request, in prefix order
+/// (tools → system → messages). Computed once so the four-breakpoint cap is
+/// enforced across the whole request rather than per block.
+struct CachePlan {
+    /// Place a breakpoint after the last tool definition.
+    cache_last_tool: bool,
+    /// Place a breakpoint after the system prompt block.
+    cache_system: bool,
+    /// Place a rolling breakpoint on the last block of this message index.
+    rolling_message: Option<usize>,
+}
+
+impl CachePlan {
+    /// Resolves breakpoints for `req`, honoring the strategy and the global cap.
+    fn resolve(req: &ChatRequest) -> Self {
+        match &req.cache {
+            CacheStrategy::Off => Self {
+                cache_last_tool: false,
+                cache_system: false,
+                rolling_message: None,
+            },
+            CacheStrategy::Auto => Self::auto(req),
+            CacheStrategy::Breakpoints { points, .. } => Self::explicit(req, points),
+        }
     }
+
+    /// `Auto`: cache the shared prefix — the tools block, the system block, and
+    /// a rolling breakpoint on the previous turn's boundary — capped at four.
+    fn auto(req: &ChatRequest) -> Self {
+        let has_tools = !req.tools.is_empty();
+        let has_system = req.system.is_some();
+        // The rolling breakpoint sits on the previous turn's boundary: the last
+        // message at/before the second-to-last user message (so the in-progress
+        // turn — the last user message and what follows — stays out of the cached
+        // prefix while everything stable before it is cached).
+        let rolling = previous_turn_boundary(&req.messages);
+
+        // Budget already consumed by author-forced breakpoints (per-tool
+        // `cache`, `system.cache`) so the total never exceeds four.
+        let forced = forced_breakpoints(req);
+        let mut budget = MAX_BREAKPOINTS.saturating_sub(forced);
+
+        // Fill in prefix order so the earliest, most-reused blocks win the cap.
+        let cache_last_tool = has_tools && take(&mut budget);
+        let cache_system = has_system && take(&mut budget);
+        let rolling_message = rolling.filter(|_| take(&mut budget));
+
+        Self {
+            cache_last_tool,
+            cache_system,
+            rolling_message,
+        }
+    }
+
+    /// `Breakpoints`: place at exactly the requested targets, capped at four in
+    /// prefix order (tools → system → messages).
+    fn explicit(req: &ChatRequest, points: &[CacheTarget]) -> Self {
+        let mut budget = MAX_BREAKPOINTS.saturating_sub(forced_breakpoints(req));
+
+        let cache_last_tool =
+            !req.tools.is_empty() && points.contains(&CacheTarget::Tools) && take(&mut budget);
+        let cache_system =
+            req.system.is_some() && points.contains(&CacheTarget::System) && take(&mut budget);
+
+        // Resolve the lowest-index message target (one rolling slot), preferring
+        // an explicit index, then the last user message.
+        let mut rolling_message = None;
+        let last_user = last_user_message(&req.messages);
+        for target in points {
+            let idx = match target {
+                CacheTarget::MessageIndex(i) if *i < req.messages.len() => Some(*i),
+                CacheTarget::LastUserMessage => last_user,
+                _ => None,
+            };
+            if let Some(i) = idx {
+                if take(&mut budget) {
+                    rolling_message = Some(i);
+                }
+                break;
+            }
+        }
+
+        Self {
+            cache_last_tool,
+            cache_system,
+            rolling_message,
+        }
+    }
+}
+
+/// Decrements `budget` and reports whether a breakpoint slot was available.
+const fn take(budget: &mut usize) -> bool {
+    if *budget == 0 {
+        false
+    } else {
+        *budget -= 1;
+        true
+    }
+}
+
+/// Counts breakpoints forced by author flags (per-tool `cache`, `system.cache`),
+/// which are placed regardless of strategy and so consume the global budget.
+fn forced_breakpoints(req: &ChatRequest) -> usize {
+    let tools = req.tools.iter().filter(|t| t.cache).count();
+    let system = usize::from(req.system.as_ref().is_some_and(|s| s.cache));
+    tools + system
+}
+
+/// The index of the last user message, if any.
+fn last_user_message(messages: &[Message]) -> Option<usize> {
+    messages.iter().rposition(|m| matches!(m, Message::User(_)))
+}
+
+/// The previous-turn boundary for the rolling breakpoint: the index of the
+/// second-to-last user message. `None` when fewer than two user turns exist
+/// (nothing before the in-progress turn is worth a rolling breakpoint).
+fn previous_turn_boundary(messages: &[Message]) -> Option<usize> {
+    let mut user_indices = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, Message::User(_)))
+        .map(|(i, _)| i);
+    // Take the last two user indices; the second-to-last is the boundary.
+    let mut last_two = user_indices.by_ref().rev().take(2);
+    let _last = last_two.next()?;
+    last_two.next()
 }
 
 fn cache_control() -> Value {
@@ -283,8 +426,32 @@ fn map_tool_choice(choice: &ToolChoice) -> Value {
     }
 }
 
-fn map_messages(messages: &[Message]) -> Vec<Value> {
-    messages.iter().map(map_message).collect()
+/// Maps the conversation, placing a rolling `cache_control` breakpoint on the
+/// last content block of message `rolling` (when set).
+fn map_messages(messages: &[Message], rolling: Option<usize>) -> Vec<Value> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let mut mapped = map_message(m);
+            if rolling == Some(i) {
+                mark_last_block(&mut mapped);
+            }
+            mapped
+        })
+        .collect()
+}
+
+/// Attaches a cache breakpoint to the last content block of a mapped message.
+fn mark_last_block(message: &mut Value) {
+    if let Some(block) = message
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| blocks.last_mut())
+        .and_then(Value::as_object_mut)
+    {
+        block.insert("cache_control".into(), cache_control());
+    }
 }
 
 fn map_message(message: &Message) -> Value {
@@ -349,16 +516,19 @@ fn map_assistant_block(block: &AssistantContent) -> Value {
 fn map_tool_result_part(part: &ToolResultPart) -> Value {
     match part {
         ToolResultPart::Text(t) => json!({ "type": "text", "text": t }),
-        ToolResultPart::Image(src) => json!({ "type": "image", "source": map_image(src) }),
+        ToolResultPart::Image(img) => json!({ "type": "image", "source": map_image(img) }),
     }
 }
 
-fn map_image(src: &crate::message::ImageSource) -> Value {
-    match src {
-        crate::message::ImageSource::Base64 { media_type, data } => json!({
-            "type": "base64", "media_type": media_type, "data": data,
-        }),
-        crate::message::ImageSource::Url(url) => json!({ "type": "url", "url": url }),
+fn map_image(img: &Image) -> Value {
+    match img {
+        Image::Url { url } => json!({ "type": "url", "url": &**url }),
+        Image::Base64 { media_type, data } => {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+            json!({ "type": "base64", "media_type": &**media_type, "data": b64 })
+        }
+        Image::FileId { file_id } => json!({ "type": "file", "file_id": &**file_id }),
     }
 }
 
@@ -366,7 +536,7 @@ fn map_image(src: &crate::message::ImageSource) -> Value {
 
 /// Parses a non-streamed Anthropic response into the unified shape. Missing or
 /// unexpected fields degrade gracefully rather than erroring.
-fn parse_response(value: Value) -> ChatResponse<Value> {
+fn parse_response(value: &Value) -> ChatResponse {
     let content = value
         .get("content")
         .and_then(Value::as_array)
@@ -383,14 +553,13 @@ fn parse_response(value: Value) -> ChatResponse<Value> {
         content,
         stop,
         usage,
-        raw: value,
     }
 }
 
 fn parse_assistant_block(block: &Value) -> Option<AssistantContent> {
     match block.get("type").and_then(Value::as_str)? {
         "text" => Some(AssistantContent::Text(
-            block.get("text").and_then(Value::as_str)?.to_owned(),
+            block.get("text").and_then(Value::as_str)?.into(),
         )),
         "tool_use" => Some(AssistantContent::ToolUse {
             id: block.get("id").and_then(Value::as_str)?.to_owned(),
@@ -641,7 +810,7 @@ mod tests {
             "stop_reason": "tool_use",
             "usage": { "input_tokens": 10, "output_tokens": 7, "cache_read_input_tokens": 3 }
         });
-        let resp = parse_response(value);
+        let resp = parse_response(&value);
         assert_eq!(resp.stop, StopReason::ToolUse);
         assert_eq!(resp.usage.input_tokens, 10);
         assert_eq!(resp.usage.output_tokens, 7);

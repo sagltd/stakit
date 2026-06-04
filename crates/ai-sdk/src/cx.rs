@@ -1,10 +1,10 @@
-//! Tool execution context and permission decisions.
+//! Tool execution context.
 //!
 //! [`ToolCx`] wraps the consumer-chosen context type `Ctx` together with the
 //! run's [`CancelToken`]. `Ctx` is whatever the host needs — a database handle,
 //! a router `Cx`, a websocket client — so the SDK never constrains it. This is
-//! how client-side tools and human-in-the-loop approval are wired without any
-//! dependency on a particular transport.
+//! how client-side tools are wired without any dependency on a particular
+//! transport.
 
 use crate::cancel::CancelToken;
 
@@ -50,20 +50,6 @@ impl<Ctx> ToolCx<Ctx> {
     pub fn into_inner(self) -> Ctx {
         self.ctx
     }
-}
-
-/// A permission decision for a tool call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Permission {
-    /// Allow the call to proceed.
-    Allow,
-    /// Deny the call; `reason` is surfaced to the model as an error result.
-    Deny {
-        /// Why the call was denied.
-        reason: String,
-    },
-    /// Defer to a human / external resolver (see the agent's `on_ask` hook).
-    Ask,
 }
 
 #[cfg(test)]
