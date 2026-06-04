@@ -37,8 +37,6 @@ use crate::skill::{Skill, SkillLoader};
 use crate::tool::{Tool, ToolDyn, TypedTool};
 use crate::usage::{Pricing, Usage};
 
-/// Name of the built-in tool-search tool (offered when deferred tools exist).
-const TOOL_SEARCH: &str = "tool_search";
 /// Name of the built-in skill-load tool (offered when a skill loader is set).
 const LOAD_SKILL: &str = "load_skill";
 /// Name of the built-in skill-search tool.
@@ -298,28 +296,39 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
             }
 
             // ── Skills: list once, cache, and inject the manifest ──────────
-            if self.skill_loader.is_some() && self.skills.is_empty() {
-                let loader = self.skill_loader.as_ref().expect("checked is_some");
-                match loader.list(&self.ctx).await {
-                    Ok(skills) => self.skills = skills,
-                    Err(e) => {
-                        finish = Finish::Stopped {
-                            message: Some(format!("skill loader error: {e}")),
-                        };
-                        run_on_finish(&mw, started, self, total_steps).await;
-                        yield AgentEvent::Done(make_outcome(
-                            String::new(),
-                            self.usage,
-                            cost_now!(),
-                            total_steps,
-                            finish,
-                        ));
-                        self.middleware = mw;
-                        return;
+            if self.skills.is_empty() {
+                if let Some(loader) = &self.skill_loader {
+                    match loader.list(&self.ctx).await {
+                        Ok(skills) => self.skills = skills,
+                        Err(e) => {
+                            finish = Finish::Stopped {
+                                message: Some(format!("skill loader error: {e}")),
+                            };
+                            run_on_finish(&mw, started, self, total_steps).await;
+                            yield AgentEvent::Done(make_outcome(
+                                String::new(),
+                                self.usage,
+                                cost_now!(),
+                                total_steps,
+                                finish,
+                            ));
+                            self.middleware = mw;
+                            return;
+                        }
                     }
                 }
             }
             let skills_active = !self.skills.is_empty();
+
+            // Tool defs and the cache key are constant for the whole run (tools
+            // and skills are fixed once it starts; the cache key derives only
+            // from the app context). Compute them once and clone the cheap pieces
+            // into each step's request rather than recomputing `t.def()` every
+            // step. The system prompt is recomputed each step so that a
+            // middleware's `set_system` call in `on_step` takes effect immediately
+            // on the very next provider request.
+            let (run_tools, run_cache_key) =
+                self.build_run_constants(skills_active);
 
             // ── on_start (registration order; first Stop halts) ────────────
             'run: {
@@ -366,8 +375,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                             }
                         }
                     }
-                    if let Some(flow) = stop_requested {
-                        let Flow::Stop(msg) = flow else { unreachable!() };
+                    if let Some(Flow::Stop(msg)) = stop_requested {
                         finish = Finish::Stopped { message: Some(msg.clone()) };
                         final_text = msg;
                         break 'run;
@@ -375,9 +383,17 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
 
                     yield AgentEvent::StepStart { index };
 
-                    // Build the request and resolve the provider.
-                    let request = self.build_request(skills_active);
-                    if !self.providers.contains_key(&self.current_model) {
+                    // Build the request. Tool defs and cache key are pre-computed
+                    // (constant for the run). The system prompt is rebuilt each
+                    // step from `self.system` so that `set_system` calls from
+                    // `on_step` take effect on the immediately following request.
+                    let step_system = self.build_system(skills_active);
+                    let request = self.build_request(
+                        run_tools.clone(),
+                        step_system,
+                        run_cache_key.clone(),
+                    );
+                    let Some(provider) = self.providers.get(&self.current_model) else {
                         finish = Finish::Stopped {
                             message: Some(
                                 AgentError::context(format!(
@@ -388,47 +404,85 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                             ),
                         };
                         break 'run;
-                    }
-                    let provider = self
-                        .providers
-                        .get(&self.current_model)
-                        .expect("checked contains_key");
+                    };
 
-                    // Obtain the stream with retry + per-attempt timeout, then
-                    // drain it (cancellable), accumulating output.
-                    let outcome = stream_step(
+                    // Acquire the provider stream with retry + per-attempt
+                    // timeout (no events have been yielded yet, so retry is
+                    // safe). Once events flow they are forwarded live below.
+                    let (first, mut stream) = match acquire_stream(
                         provider.as_ref(),
                         request,
                         &self.retry,
                         &self.cancel,
                     )
-                    .await;
+                    .await
+                    {
+                        AcquireOutcome::Cancelled => {
+                            finish = Finish::Cancelled;
+                            break 'run;
+                        }
+                        AcquireOutcome::Error(e) => {
+                            finish = Finish::Stopped {
+                                message: Some(format!("provider error: {e}")),
+                            };
+                            break 'run;
+                        }
+                        AcquireOutcome::Ready { first, stream } => (first, stream),
+                    };
 
-                    let StepStreamResult {
-                        first_error,
-                        cancelled,
+                    // Drain the stream, yielding each delta the instant it
+                    // arrives while accumulating text/reasoning/tool calls for the
+                    // step record + history. Cancellable mid-stream; no retry once
+                    // started.
+                    let mut acc = StepAccum::default();
+                    let mut step_error: Option<crate::error::ProviderError> = None;
+                    let mut cancelled = false;
+                    let mut pending = Some(first);
+                    loop {
+                        let event = match pending.take() {
+                            Some(ev) => ev,
+                            None => {
+                                tokio::select! {
+                                    biased;
+                                    () = self.cancel.cancelled() => {
+                                        cancelled = true;
+                                        break;
+                                    }
+                                    next = stream.next() => match next {
+                                        None => break,
+                                        Some(Ok(ev)) => ev,
+                                        Some(Err(e)) => {
+                                            step_error = Some(e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        if let Some(delta) = acc.apply(event) {
+                            yield delta;
+                        }
+                    }
+
+                    if cancelled {
+                        finish = Finish::Cancelled;
+                        break 'run;
+                    }
+                    if let Some(e) = step_error {
+                        finish = Finish::Stopped {
+                            message: Some(format!("provider error: {e}")),
+                        };
+                        break 'run;
+                    }
+
+                    let StepAccum {
                         text,
                         reasoning,
                         signature,
                         tool_calls,
                         step_usage,
                         stop,
-                        deltas,
-                    } = outcome;
-
-                    for ev in deltas {
-                        yield ev;
-                    }
-                    if cancelled {
-                        finish = Finish::Cancelled;
-                        break 'run;
-                    }
-                    if let Some(e) = first_error {
-                        finish = Finish::Stopped {
-                            message: Some(format!("provider error: {e}")),
-                        };
-                        break 'run;
-                    }
+                    } = acc;
 
                     // Assemble the assistant turn (thinking → text → tool calls).
                     let mut blocks: Vec<AssistantContent> = Vec::new();
@@ -436,19 +490,19 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                         if reasoning.is_empty() { None } else { Some(reasoning.clone()) };
                     if !reasoning.is_empty() {
                         blocks.push(AssistantContent::Thinking(Thinking::Visible {
-                            text: reasoning,
-                            signature,
+                            text: reasoning.into(),
+                            signature: signature.map(Into::into),
                         }));
                     }
                     if !text.is_empty() {
                         final_text = text.clone();
                         blocks.push(AssistantContent::Text(text.clone().into()));
                     }
-                    for (id, name, args) in &tool_calls {
+                    for call in &tool_calls {
                         blocks.push(AssistantContent::ToolUse {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: args.clone(),
+                            id: call.id.as_str().into(),
+                            name: call.name.as_str().into(),
+                            input: call.args.clone(),
                         });
                     }
                     self.messages.push(Message::Assistant(blocks));
@@ -463,7 +517,13 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                     // borrow — before the concurrent dispatch below.
                     let mut tool_stop: Option<Option<String>> = None;
                     let mut plans: Vec<ToolPlan> = Vec::with_capacity(tool_calls.len());
-                    for (id, name, args) in tool_calls {
+                    for ParsedCall {
+                        id,
+                        name,
+                        args,
+                        parse_error,
+                    } in tool_calls
+                    {
                         let pending = PendingToolCall {
                             id: id.clone(),
                             name: name.clone(),
@@ -484,6 +544,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                                 args,
                                 approval: Approval::Deny { message: message.clone() },
                                 denied: Some(message),
+                                parse_error,
                             }),
                             Ok(Approval::Allow) => plans.push(ToolPlan {
                                 id,
@@ -491,6 +552,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                                 args,
                                 approval: Approval::Allow,
                                 denied: None,
+                                parse_error,
                             }),
                             Err(e) => {
                                 tool_stop = Some(Some(format!("on_tool_approve error: {e}")));
@@ -502,24 +564,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                     // Pass 2 (concurrent): dispatch every allowed call at once
                     // (the model may request several), preserving order. Denied
                     // calls resolve immediately to their message.
-                    let executed = futures::future::join_all(plans.into_iter().map(|plan| {
-                        let agent = &*self;
-                        async move {
-                            let (outcome, elapsed) = if let Some(message) = &plan.denied {
-                                (
-                                    ToolOutcome::Denied { message: message.clone() },
-                                    Duration::ZERO,
-                                )
-                            } else {
-                                let start = Instant::now();
-                                let outcome =
-                                    agent.dispatch_tool(&plan.name, plan.args.clone()).await;
-                                (outcome, start.elapsed())
-                            };
-                            (plan, outcome, elapsed)
-                        }
-                    }))
-                    .await;
+                    let executed = dispatch_plans(&*self, plans).await;
 
                     let had_tool_calls = !executed.is_empty();
                     let mut records: Vec<ToolCallRecord> = Vec::with_capacity(executed.len());
@@ -531,8 +576,8 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                             ToolOutcome::Error(msg) => (json!(msg), true),
                         };
                         results.push(UserContent::ToolResult {
-                            id: plan.id.clone(),
-                            content: vec![ToolResultPart::Text(value_to_text(&payload))],
+                            id: plan.id.as_str().into(),
+                            content: vec![ToolResultPart::Text(value_to_text(&payload).into())],
                             is_error,
                         });
                         yield AgentEvent::ToolResult {
@@ -648,31 +693,49 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
         )
     }
 
-    /// Builds the provider request for the current step.
-    fn build_request(&self, skills_active: bool) -> ChatRequest {
+    /// Computes the parts of the request that are constant for the whole run:
+    /// the tool definitions and the cache-routing key. Tools and skills are
+    /// fixed once the run starts; the cache key derives only from the app
+    /// context. The system prompt is computed per-step (see
+    /// [`build_system`](Self::build_system)) so middleware can update it mid-run.
+    fn build_run_constants(&self, skills_active: bool) -> (Vec<ToolDef>, Option<Arc<str>>) {
         let mut tools: Vec<ToolDef> = self.tools.iter().map(|t| t.def()).collect();
-        tools.push(tool_search_def());
         if skills_active {
             tools.extend(skill_tool_defs());
         }
 
-        // Effective system prompt = base + skill manifest (if any). Either part
-        // may be absent.
-        let system = match (self.system.as_deref(), skills_active) {
+        // Derive the per-conversation cache-routing key from the app context.
+        let cache_key = self.cache_key.as_ref().and_then(|f| f(&self.ctx));
+
+        (tools, cache_key)
+    }
+
+    /// Builds the effective system prompt for one step.
+    ///
+    /// Called per-step (not once before the loop) so that
+    /// [`AgentCx::set_system`](crate::agent_cx::AgentCx::set_system) calls
+    /// from `on_step` take effect immediately on the next provider request.
+    fn build_system(&self, skills_active: bool) -> Option<SystemPrompt> {
+        match (self.system.as_deref(), skills_active) {
             (Some(base), false) => Some(base.to_owned()),
             (Some(base), true) => Some(format!("{base}\n\n{}", self.skill_manifest())),
             (None, true) => Some(self.skill_manifest()),
             (None, false) => None,
         }
-        .map(SystemPrompt::from);
+        .map(SystemPrompt::from)
+    }
 
-        // Derive the per-conversation cache-routing key from the app context.
-        let cache_key = self
-            .cache_key
-            .as_ref()
-            .and_then(|f| f(&self.ctx))
-            .map(|a| a.to_string());
-
+    /// Builds the provider request for the current step from the run-constant
+    /// pieces ([`build_run_constants`](Self::build_run_constants)) plus the
+    /// per-step conversation snapshot. The constants are cheap to clone (tool
+    /// defs and an `Arc`-backed system prompt / cache key); only the message
+    /// history is cloned afresh each step.
+    fn build_request(
+        &self,
+        tools: Vec<ToolDef>,
+        system: Option<SystemPrompt>,
+        cache_key: Option<Arc<str>>,
+    ) -> ChatRequest {
         ChatRequest {
             model: self.current_model.clone(),
             system,
@@ -710,11 +773,6 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
     where
         Ctx: Clone,
     {
-        if name == TOOL_SEARCH {
-            // Tool search is a no-op here (no deferred registry in the stateful
-            // agent); report no matches so the model can proceed.
-            return ToolOutcome::Ok(json!({ "matches": [] }));
-        }
         if name == SEARCH_SKILLS {
             return ToolOutcome::Ok(self.run_search_skills(&args));
         }
@@ -724,7 +782,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                 Err(e) => ToolOutcome::Error(e.to_string()),
             };
         }
-        match self.tools.iter().find(|t| t.def().name == name) {
+        match self.tools.iter().find(|t| t.name() == name) {
             Some(tool) => {
                 let cx = ToolCx::with_cancel(self.ctx.clone(), self.cancel.clone());
                 match tool.call_json(&cx, args).await {
@@ -763,6 +821,11 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
             .as_ref()
             .ok_or_else(|| AgentError::Skill("no skill loader configured".into()))?;
         let id = args.get("id").and_then(Value::as_str).unwrap_or_default();
+        // A missing/empty id is a model mistake, not a loader call — reject it so
+        // the model retries instead of the loader receiving "".
+        if id.is_empty() {
+            return Err(AgentError::Skill("missing required argument: id".into()));
+        }
         let content = loader.load(&self.ctx, id).await?;
         Ok(json!({ "body": content.body, "references": content.references }))
     }
@@ -800,6 +863,44 @@ const fn make_outcome(
     }
 }
 
+/// Max tool calls dispatched concurrently within one step. The model may batch
+/// many calls; this caps in-flight work (and thus host load) while
+/// [`buffered`](futures::stream::StreamExt::buffered) preserves result order.
+const MAX_CONCURRENT_TOOLS: usize = 8;
+
+/// Dispatches a step's tool plans with bounded concurrency, preserving order.
+///
+/// Denied calls resolve immediately to their message; calls whose arguments
+/// failed to parse short-circuit to a [`ToolOutcome::Error`] without invoking
+/// the tool. Everything else runs against the agent's context.
+async fn dispatch_plans<Ctx: Clone + Send + Sync + 'static>(
+    agent: &Agent<Ctx>,
+    plans: Vec<ToolPlan>,
+) -> Vec<(ToolPlan, ToolOutcome, Duration)> {
+    futures::stream::iter(plans.into_iter().map(|plan| async move {
+        let (outcome, elapsed) = if let Some(message) = &plan.denied {
+            (
+                ToolOutcome::Denied {
+                    message: message.clone(),
+                },
+                Duration::ZERO,
+            )
+        } else if let Some(message) = &plan.parse_error {
+            // Malformed arguments never reach the tool — surface the parse error
+            // so the model can correct and retry.
+            (ToolOutcome::Error(message.clone()), Duration::ZERO)
+        } else {
+            let start = Instant::now();
+            let outcome = agent.dispatch_tool(&plan.name, plan.args.clone()).await;
+            (outcome, start.elapsed())
+        };
+        (plan, outcome, elapsed)
+    }))
+    .buffered(MAX_CONCURRENT_TOOLS)
+    .collect()
+    .await
+}
+
 /// A tool call with its resolved approval, awaiting concurrent dispatch.
 struct ToolPlan {
     id: String,
@@ -808,6 +909,9 @@ struct ToolPlan {
     approval: Approval,
     /// `Some(message)` if denied (skip dispatch); `None` if allowed.
     denied: Option<String>,
+    /// `Some(message)` if the model's arguments were malformed JSON; such a call
+    /// short-circuits to a [`ToolOutcome::Error`] instead of being dispatched.
+    parse_error: Option<String>,
 }
 
 /// Resolves the tool approval across all middleware (Stop > Deny > Allow).
@@ -832,115 +936,88 @@ async fn resolve_approval<Ctx: Send + Sync + 'static>(
     Ok(decision)
 }
 
-/// Accumulated result of streaming one step.
-struct StepStreamResult {
-    first_error: Option<crate::error::ProviderError>,
-    cancelled: bool,
+/// One tool call from a step, with its arguments parsed once at the dispatch
+/// boundary. `parse_error` is `Some` when the model emitted malformed JSON; the
+/// loop short-circuits such a call to a [`ToolOutcome::Error`] so the model can
+/// retry, rather than silently invoking the tool with empty arguments.
+struct ParsedCall {
+    id: String,
+    name: String,
+    /// Parsed arguments (an empty object when `parse_error` is set).
+    args: Value,
+    /// The parse error message, if the raw arguments were not valid JSON.
+    parse_error: Option<String>,
+}
+
+impl ParsedCall {
+    /// Parses raw tool-call argument text once, capturing any error.
+    fn parse(id: String, name: String, arguments: &str) -> Self {
+        match serde_json::from_str::<Value>(arguments) {
+            Ok(args) => Self {
+                id,
+                name,
+                args,
+                parse_error: None,
+            },
+            Err(e) => Self {
+                id,
+                name,
+                args: json!({}),
+                parse_error: Some(format!("malformed tool arguments: {e}")),
+            },
+        }
+    }
+}
+
+/// Accumulates one step's streamed output. `apply` folds each provider
+/// [`StreamEvent`] into the running totals and returns the host-facing
+/// [`AgentEvent`] to yield immediately (if any), so deltas reach the caller live
+/// rather than buffered until the step ends.
+#[derive(Default)]
+struct StepAccum {
     text: String,
     reasoning: String,
     signature: Option<String>,
-    tool_calls: Vec<(String, String, Value)>,
+    tool_calls: Vec<ParsedCall>,
     step_usage: Usage,
     stop: StopReason,
-    /// Events to forward to the caller (deltas + tool calls), in order.
-    deltas: Vec<AgentEvent>,
 }
 
-/// Obtains the provider stream (with retry + per-attempt timeout) and drains it,
-/// cancellable mid-stream. Retries only before the first event is observed.
-async fn stream_step(
-    provider: &dyn Provider,
-    request: ChatRequest,
-    retry: &RetryPolicy,
-    cancel: &CancelToken,
-) -> StepStreamResult {
-    let mut result = StepStreamResult {
-        first_error: None,
-        cancelled: false,
-        text: String::new(),
-        reasoning: String::new(),
-        signature: None,
-        tool_calls: Vec::new(),
-        step_usage: Usage::default(),
-        stop: StopReason::EndTurn,
-        deltas: Vec::new(),
-    };
-
-    // Acquire the stream + first event with retry; no tokens have been emitted
-    // yet at this point, so retrying is safe.
-    let (first, mut stream) = match acquire_stream(provider, request, retry, cancel).await {
-        AcquireOutcome::Cancelled => {
-            result.cancelled = true;
-            return result;
-        }
-        AcquireOutcome::Error(e) => {
-            result.first_error = Some(e);
-            return result;
-        }
-        AcquireOutcome::Ready { first, stream } => (first, stream),
-    };
-
-    // Process the first event, then the rest. Once we are here, do not retry.
-    let mut pending = Some(first);
-    loop {
-        let event = match pending.take() {
-            Some(ev) => ev,
-            None => {
-                tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => {
-                        result.cancelled = true;
-                        return result;
-                    }
-                    next = stream.next() => match next {
-                        None => break,
-                        Some(Ok(ev)) => ev,
-                        Some(Err(e)) => {
-                            // Mid-stream error: surface it (no retry once started).
-                            result.first_error = Some(e);
-                            return result;
-                        }
-                    }
-                }
+impl StepAccum {
+    /// Folds one event into the accumulator, returning a delta to yield live.
+    fn apply(&mut self, event: StreamEvent) -> Option<AgentEvent> {
+        match event {
+            StreamEvent::Start { usage } => {
+                self.step_usage = usage;
+                None
             }
-        };
-        apply_event(&mut result, event);
-    }
-
-    result
-}
-
-/// Applies one stream event to the accumulator, recording forwardable deltas.
-fn apply_event(result: &mut StepStreamResult, event: StreamEvent) {
-    match event {
-        StreamEvent::Start { usage } => result.step_usage = usage,
-        StreamEvent::TextDelta(t) => {
-            result.text.push_str(&t);
-            result.deltas.push(AgentEvent::MessageDelta(t));
-        }
-        StreamEvent::ReasoningDelta(t) => {
-            result.reasoning.push_str(&t);
-            result.deltas.push(AgentEvent::ReasoningDelta(t));
-        }
-        StreamEvent::SignatureDelta(s) => {
-            result
-                .signature
-                .get_or_insert_with(String::new)
-                .push_str(&s);
-        }
-        StreamEvent::ToolCall { id, name, input } => {
-            result
-                .tool_calls
-                .push((id.clone(), name.clone(), input.clone()));
-            result.deltas.push(AgentEvent::ToolCall {
+            StreamEvent::TextDelta(t) => {
+                self.text.push_str(&t);
+                Some(AgentEvent::MessageDelta(t))
+            }
+            StreamEvent::ReasoningDelta(t) => {
+                self.reasoning.push_str(&t);
+                Some(AgentEvent::ReasoningDelta(t))
+            }
+            StreamEvent::SignatureDelta(s) => {
+                self.signature.get_or_insert_with(String::new).push_str(&s);
+                None
+            }
+            StreamEvent::ToolCall {
                 id,
                 name,
-                args: input,
-            });
-        }
-        StreamEvent::End { stop, usage } => {
-            result.stop = stop;
-            result.step_usage = usage;
+                arguments,
+            } => {
+                let call = ParsedCall::parse(id.clone(), name.clone(), &arguments);
+                let args = call.args.clone();
+                self.tool_calls.push(call);
+                Some(AgentEvent::ToolCall { id, name, args })
+            }
+            StreamEvent::End { stop, usage } => {
+                self.stop = stop;
+                self.step_usage = usage;
+                None
+            }
         }
     }
 }
@@ -966,17 +1043,20 @@ async fn acquire_stream(
 ) -> AcquireOutcome {
     let attempts = retry.max_retries.saturating_add(1);
     let mut last_err: Option<crate::error::ProviderError> = None;
+    // The classification of the most recent failure decides the next delay (so a
+    // 429's `Retry-After` is honored before the retry that follows it).
+    let mut last_class = crate::retry::Retryable::Transient;
 
     for attempt in 0..attempts {
         if cancel.is_cancelled() {
             return AcquireOutcome::Cancelled;
         }
         if attempt > 0 {
-            let backoff = retry.backoff(attempt - 1);
+            let delay = retry.retry_delay(attempt - 1, &last_class);
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => return AcquireOutcome::Cancelled,
-                () = tokio::time::sleep(backoff) => {}
+                () = tokio::time::sleep(delay) => {}
             }
         }
 
@@ -999,10 +1079,13 @@ async fn acquire_stream(
                 last_err = Some(crate::error::ProviderError::Transport(
                     "provider call timed out".into(),
                 ));
+                last_class = crate::retry::Retryable::Transient;
             }
             Ok(Err(e)) => {
-                let retryable = retry.is_retryable(&crate::retry::classify(&e));
+                let class = crate::retry::classify(&e);
+                let retryable = retry.is_retryable(&class);
                 last_err = Some(e);
+                last_class = class;
                 if !retryable {
                     break;
                 }
@@ -1021,8 +1104,10 @@ async fn acquire_stream(
                 }
                 Some(Ok(ev)) => return AcquireOutcome::Ready { first: ev, stream },
                 Some(Err(e)) => {
-                    let retryable = retry.is_retryable(&crate::retry::classify(&e));
+                    let class = crate::retry::classify(&e);
+                    let retryable = retry.is_retryable(&class);
                     last_err = Some(e);
+                    last_class = class;
                     if !retryable {
                         break;
                     }
@@ -1040,21 +1125,6 @@ fn value_to_text(value: &Value) -> String {
     value
         .as_str()
         .map_or_else(|| value.to_string(), ToOwned::to_owned)
-}
-
-/// The built-in tool-search tool definition.
-fn tool_search_def() -> ToolDef {
-    ToolDef::new(
-        TOOL_SEARCH,
-        "Search for additional tools by keyword. Matched tools become available to call on the next step.",
-        json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Keywords to match against tool names and descriptions" }
-            },
-            "required": ["query"]
-        }),
-    )
 }
 
 /// Built-in skill tool definitions, offered when a skill loader is set.

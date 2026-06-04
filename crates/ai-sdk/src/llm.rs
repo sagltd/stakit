@@ -135,7 +135,7 @@ impl<P: Provider> LLM<P> {
             .content
             .into_iter()
             .find_map(|block| match block {
-                AssistantContent::ToolUse { name, input, .. } if name == "extract" => Some(input),
+                AssistantContent::ToolUse { name, input, .. } if &*name == "extract" => Some(input),
                 _ => None,
             })
             .ok_or_else(|| {

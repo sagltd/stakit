@@ -13,18 +13,33 @@ use serde_json::{Map, Value, json};
 use crate::message::{AssistantContent, Image, Message, ToolResultPart, UserContent};
 use crate::provider::{
     ChatRequest, ChatResponse, EventStream, Provider, StopReason, StreamEvent, ToolChoice, ToolDef,
+    parse_retry_after,
 };
 use crate::usage::Usage;
 use crate::{ProviderError, SystemPrompt};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
+/// Upper bound on a single un-terminated SSE line. A stream that never sends a
+/// newline would otherwise grow `buf` without bound; past this we bail with a
+/// decode error rather than buffering unboundedly.
+const MAX_SSE_LINE: usize = 1024 * 1024;
 
 /// A handle to the `OpenAI` API. Cheap to clone; mints per-model handles.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiClient {
     api_key: String,
     base_url: String,
     http: reqwest::Client,
+}
+
+// Hand-written so the API key never leaks through `{:?}` (logs, panics, tests).
+impl std::fmt::Debug for OpenAiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiClient")
+            .field("api_key", &"[redacted]")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OpenAiClient {
@@ -85,12 +100,13 @@ impl Provider for OpenAiModel {
             let body = build_body(&self.pick_model(&request), &request, false);
             let resp = self.send(body).await?;
             let status = resp.status();
+            let retry_after = parse_retry_after(resp.headers());
             let text = resp
                 .text()
                 .await
                 .map_err(|e| ProviderError::Transport(e.to_string()))?;
             if !status.is_success() {
-                return Err(api_error(status.as_u16(), &text));
+                return Err(api_error(status.as_u16(), &text, retry_after));
             }
             let value: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Decode {
                 err: e.to_string(),
@@ -109,12 +125,17 @@ impl Provider for OpenAiModel {
             let resp = self.send(body).await?;
             let status = resp.status();
             if !status.is_success() {
+                let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                return Err(api_error(status.as_u16(), &text));
+                return Err(api_error(status.as_u16(), &text, retry_after));
             }
             let mut bytes = resp.bytes_stream();
             let stream = async_stream::stream! {
                 let mut buf = String::new();
+                // Bytes already scanned for a newline (the prefix is newline-free
+                // by the drain invariant below), so each chunk only scans the new
+                // tail — keeping the overflow guard O(1) amortized, not O(n²).
+                let mut scanned = 0usize;
                 let mut accum = Accum::default();
                 let mut started = false;
                 while let Some(chunk) = bytes.next().await {
@@ -126,6 +147,14 @@ impl Provider for OpenAiModel {
                         }
                     };
                     buf.push_str(&String::from_utf8_lossy(&chunk));
+                    // Guard against an SSE stream that never terminates a line.
+                    if sse_line_overflow(&buf, scanned) {
+                        yield Err(ProviderError::Decode {
+                            err: format!("SSE line exceeded {MAX_SSE_LINE} bytes without a newline"),
+                            body: String::new(),
+                        });
+                        return;
+                    }
                     while let Some(nl) = buf.find('\n') {
                         let line: String = buf.drain(..=nl).collect();
                         let line = line.trim();
@@ -150,6 +179,9 @@ impl Provider for OpenAiModel {
                             }
                         }
                     }
+                    // After draining whole lines, the remainder holds no newline,
+                    // so it is fully scanned — the next chunk starts from its end.
+                    scanned = buf.len();
                 }
                 for ev in accum.finish() {
                     yield Ok(ev);
@@ -181,16 +213,42 @@ impl OpenAiModel {
     }
 }
 
-fn api_error(status: u16, body: &str) -> ProviderError {
-    let kind = serde_json::from_str::<Value>(body)
-        .ok()
+/// Builds an [`ProviderError::Api`] from a 4xx/5xx response.
+///
+/// Extracts only the provider's structured `error.type` / `error.message`; the
+/// raw `body` is never stored, since it can echo back request material
+/// (including the API key) and would surface via `Display` into the run
+/// outcome. When the body lacks the expected shape, falls back to a concise,
+/// safe message.
+fn api_error(status: u16, body: &str, retry_after: Option<std::time::Duration>) -> ProviderError {
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let kind = parsed
+        .as_ref()
         .and_then(|v| v["error"]["type"].as_str().map(ToOwned::to_owned))
         .unwrap_or_else(|| "api_error".to_owned());
+    let message = parsed
+        .as_ref()
+        .and_then(|v| v["error"]["message"].as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("provider error: {status} {kind}"));
     ProviderError::Api {
         status,
         kind,
-        message: body.to_owned(),
+        message,
+        retry_after,
     }
+}
+
+/// Whether the SSE buffer holds a single, still-unterminated line longer than
+/// [`MAX_SSE_LINE`] — i.e. the peer is streaming an unbounded line.
+///
+/// `scanned` is the length already known to be newline-free (the buffer prefix),
+/// so only the new tail is scanned. Given the caller's invariant that
+/// `buf[..scanned]` contains no newline, this is equivalent to
+/// `!buf.contains('\n') && buf.len() > MAX_SSE_LINE` but amortized O(1) per
+/// chunk instead of O(n) — the whole stream is scanned once, not per chunk.
+fn sse_line_overflow(buf: &str, scanned: usize) -> bool {
+    let tail = buf.get(scanned..).unwrap_or("");
+    !tail.contains('\n') && buf.len() > MAX_SSE_LINE
 }
 
 // --- request mapping -------------------------------------------------------
@@ -226,7 +284,7 @@ fn build_body(model: &str, req: &ChatRequest, stream: bool) -> Value {
     // OpenAI auto-caches stable prefixes; the cache key only routes a
     // conversation to one cache shard (it does not enable caching itself).
     if let Some(key) = &req.cache_key {
-        body.insert("prompt_cache_key".into(), json!(key));
+        body.insert("prompt_cache_key".into(), json!(&**key));
     }
     if stream {
         body.insert("stream".into(), json!(true));
@@ -305,6 +363,10 @@ fn map_image_block(img: &Image) -> Value {
         }
         Image::Base64 { media_type, data } => {
             use base64::Engine as _;
+            // note: base64 is re-encoded on every step when the same inline image
+            // is replayed. Caching it would need an `OnceLock` inside
+            // `Image::Base64`, which breaks the enum's `PartialEq`/`Eq`/`Serialize`
+            // derives; prefer `Image::Url`/`Image::FileId` for repeated images.
             let b64 = base64::engine::general_purpose::STANDARD.encode(data);
             let data_uri = format!("data:{};base64,{b64}", &**media_type);
             json!({ "type": "image_url", "image_url": { "url": data_uri } })
@@ -321,8 +383,8 @@ fn tool_result_text(content: &[ToolResultPart]) -> String {
     content
         .iter()
         .map(|p| match p {
-            ToolResultPart::Text(t) => t.clone(),
-            ToolResultPart::Image(_) => "[image]".to_owned(),
+            ToolResultPart::Text(t) => &**t,
+            ToolResultPart::Image(_) => "[image]",
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -430,12 +492,17 @@ fn parse_tool_call(call: &Value) -> Option<AssistantContent> {
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or_default()
-            .to_owned(),
+            .into(),
         name: function
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or_default()
-            .to_owned(),
+            .into(),
+        // Non-streaming `complete()` builds a `ChatResponse` for direct callers
+        // (e.g. structured extraction); it performs no tool dispatch, so a
+        // malformed-args failure has no tool-result channel to surface on. The
+        // agentic path uses `stream()`, where the raw arguments flow through
+        // unparsed and the agent turns a parse failure into a tool error.
         input: serde_json::from_str(arguments).unwrap_or_else(|_| json!({})),
     })
 }
@@ -529,15 +596,18 @@ impl Accum {
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         for (_, buf) in std::mem::take(&mut self.tools) {
-            let input = if buf.args.trim().is_empty() {
-                json!({})
+            // Empty argument streams mean "no arguments"; normalize to an empty
+            // object. Otherwise forward the raw text and let the agent parse +
+            // validate it once at dispatch.
+            let arguments = if buf.args.trim().is_empty() {
+                "{}".to_owned()
             } else {
-                serde_json::from_str(&buf.args).unwrap_or_else(|_| json!({}))
+                buf.args
             };
             out.push(StreamEvent::ToolCall {
                 id: buf.id,
                 name: buf.name,
-                input,
+                arguments,
             });
         }
         out.push(StreamEvent::End {
@@ -628,7 +698,7 @@ mod tests {
             StreamEvent::ToolCall {
                 id: "call_1".into(),
                 name: "wx".into(),
-                input: json!({ "c": 1 }),
+                arguments: "{\"c\":1}".to_owned(),
             }
         );
         let StreamEvent::End { stop, usage } = &out[1] else {
@@ -643,5 +713,59 @@ mod tests {
         let mut accum = Accum::default();
         let out = accum.push(&json!({ "choices": [{ "delta": { "content": "Hi" } }] }));
         assert_eq!(out, vec![StreamEvent::TextDelta("Hi".into())]);
+    }
+
+    #[test]
+    fn api_error_does_not_surface_raw_body_secrets() {
+        let body = json!({
+            "error": { "type": "invalid_request_error", "message": "model not found" },
+            "request_echo": { "authorization": "Bearer sk-secret-LEAK" }
+        })
+        .to_string();
+        let err = api_error(400, &body, None);
+        let surfaced = err.to_string();
+        assert!(
+            !surfaced.contains("sk-secret-LEAK"),
+            "raw body leaked into Display: {surfaced}"
+        );
+        assert!(surfaced.contains("model not found"), "{surfaced}");
+    }
+
+    #[test]
+    fn api_error_falls_back_to_safe_message_for_opaque_body() {
+        let err = api_error(502, "sk-secret-LEAK upstream timeout", None);
+        let surfaced = err.to_string();
+        assert!(!surfaced.contains("sk-secret-LEAK"), "{surfaced}");
+        assert!(surfaced.contains("502"), "{surfaced}");
+    }
+
+    #[test]
+    fn client_debug_redacts_api_key() {
+        let client = OpenAiClient::new("sk-secret-LEAK");
+        let dbg = format!("{client:?}");
+        assert!(!dbg.contains("sk-secret-LEAK"), "{dbg}");
+        assert!(dbg.contains("[redacted]"), "{dbg}");
+        let model = client.model("gpt-4o");
+        let dbg = format!("{model:?}");
+        assert!(!dbg.contains("sk-secret-LEAK"), "{dbg}");
+    }
+
+    #[test]
+    fn sse_line_overflow_trips_only_past_the_cap_without_newline() {
+        assert!(!sse_line_overflow("data: partial", 0));
+        let mut delimited = "x".repeat(MAX_SSE_LINE + 10);
+        delimited.push('\n');
+        assert!(!sse_line_overflow(&delimited, 0));
+        assert!(sse_line_overflow(&"x".repeat(MAX_SSE_LINE + 1), 0));
+    }
+
+    #[test]
+    fn sse_line_overflow_scans_only_the_unscanned_tail() {
+        // A newline lies in the already-scanned prefix; the tail is newline-free
+        // and over the cap. With the prefix excluded this still must NOT trip.
+        let mut buf = String::from("\n");
+        buf.push_str(&"x".repeat(MAX_SSE_LINE + 1));
+        assert!(!sse_line_overflow(&buf, 0));
+        assert!(sse_line_overflow(&buf, 1));
     }
 }

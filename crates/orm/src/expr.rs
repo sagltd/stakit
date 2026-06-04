@@ -154,8 +154,10 @@ pub enum Predicate {
     Or(Box<Self>, Box<Self>),
     /// `NOT (inner)`.
     Not(Box<Self>),
-    /// Full-text match: FTS5 `column MATCH ?` (`SQLite`/Turso) or
-    /// `to_tsvector(column) @@ plainto_tsquery(?)` (Postgres).
+    /// Full-text match: FTS5 `column MATCH ?` (`SQLite`/Turso) or, on Postgres,
+    /// `to_tsvector(column) @@ plainto_tsquery(?)` when [`stored`](Self::Match::stored)
+    /// is `false`, or `column @@ plainto_tsquery(?)` against an already-stored
+    /// `tsvector` column when it is `true`.
     Match {
         /// Column table.
         table: &'static str,
@@ -166,6 +168,10 @@ pub enum Predicate {
         /// Postgres text-search config (e.g. `"simple"`, `"spanish"`); `None`
         /// uses the dialect default. Ignored by FTS5.
         config: Option<&'static str>,
+        /// Whether `column` is already a stored `tsvector` (Postgres): skip the
+        /// query-time `to_tsvector(..)` and match the column directly with `@@`, so a
+        /// GIN index on the stored column is usable. Ignored by FTS5 (no stored form).
+        stored: bool,
     },
     /// `"table"."name" LIKE $N ESCAPE '\'` with `%`/`_`/`\` escaped in the bound
     /// value — a literal substring match (see [`contains`]).
@@ -254,7 +260,8 @@ impl Predicate {
                 name,
                 query,
                 config,
-            } => write_match(writer, table, name, query, config),
+                stored,
+            } => write_match(writer, table, name, query, config, stored),
             Self::Like {
                 table,
                 name,
@@ -276,8 +283,10 @@ impl Predicate {
 }
 
 /// Render a full-text match per dialect: FTS5 `col MATCH ?`, or Postgres
-/// `to_tsvector('<cfg>', col) @@ plainto_tsquery('<cfg>', $1)`. `cfg` is a fixed
-/// `&'static` config name (no injection); the query text is always bound.
+/// `to_tsvector('<cfg>', col) @@ plainto_tsquery('<cfg>', $1)` — or, when `stored`,
+/// `col @@ plainto_tsquery('<cfg>', $1)` against an already-stored `tsvector` column
+/// (no query-time recompute, so a GIN index applies). `cfg` is a fixed `&'static`
+/// config name (no injection); the query text is always bound.
 ///
 /// An explicit `config` (e.g. `"spanish"`) overrides the dialect default for the
 /// Postgres `TsQuery` path; it is ignored by FTS5.
@@ -287,20 +296,27 @@ fn write_match(
     name: &'static str,
     query: String,
     config: Option<&'static str>,
+    stored: bool,
 ) -> Result<(), IdentError> {
     match writer.full_text() {
         crate::dialect::FullText::Fts5Match => {
+            // FTS5 has no stored-tsvector form; both spellings match the column.
             writer.push_qualified(table, name)?;
             writer.push(" match ");
             writer.push_bind(Value::Text(query));
         }
         crate::dialect::FullText::TsQuery(default_config) => {
             let config = config.unwrap_or(default_config);
-            writer.push("to_tsvector('");
-            writer.push(config);
-            writer.push("', ");
+            if !stored {
+                writer.push("to_tsvector('");
+                writer.push(config);
+                writer.push("', ");
+            }
             writer.push_qualified(table, name)?;
-            writer.push(") @@ plainto_tsquery('");
+            if !stored {
+                writer.push(")");
+            }
+            writer.push(" @@ plainto_tsquery('");
             writer.push(config);
             writer.push("', ");
             writer.push_bind(Value::Text(query));
@@ -541,6 +557,7 @@ pub fn matches<T, Ty>(column: crate::schema::Col<T, Ty>, query: impl Into<String
         name: column.name,
         query: query.into(),
         config: None,
+        stored: false,
     }
 }
 
@@ -562,6 +579,49 @@ pub fn matches_in<T, Ty>(
         name: column.name,
         query: query.into(),
         config: Some(config),
+        stored: false,
+    }
+}
+
+/// Full-text search against an **already-stored** `tsvector` column.
+///
+/// Point this at a `GENERATED ALWAYS AS (to_tsvector(..)) STORED` column (with a GIN
+/// index): on Postgres it renders `"<t>"."<col>" @@ plainto_tsquery('<cfg>', $1)` — the
+/// column is matched directly, with no query-time `to_tsvector` recompute, so the GIN
+/// index is usable. On `SQLite`/Turso it falls back to FTS5 `MATCH` (there is no stored
+/// `tsvector` form). The query text is always a bound parameter.
+#[must_use]
+pub fn matches_tsv<T, Ty>(
+    column: crate::schema::Col<T, Ty>,
+    query: impl Into<String>,
+) -> Predicate {
+    Predicate::Match {
+        table: column.table,
+        name: column.name,
+        query: query.into(),
+        config: None,
+        stored: true,
+    }
+}
+
+/// [`matches_tsv`] with an explicit Postgres text-search `config` (e.g. `"english"`).
+///
+/// `config` must match the configuration the stored `tsvector` was built with, so the
+/// query lexemes align with the stored ones. It overrides the dialect default and is
+/// ignored by `SQLite`/Turso FTS5. `config` is a developer-trusted `&'static str`
+/// (never user input) and is never parameter-bound.
+#[must_use]
+pub fn matches_tsv_in<T, Ty>(
+    column: crate::schema::Col<T, Ty>,
+    query: impl Into<String>,
+    config: &'static str,
+) -> Predicate {
+    Predicate::Match {
+        table: column.table,
+        name: column.name,
+        query: query.into(),
+        config: Some(config),
+        stored: true,
     }
 }
 
@@ -651,7 +711,7 @@ pub const fn desc<T, Ty>(column: Col<T, Ty>) -> Order {
 mod tests {
     use super::{
         Predicate, and, any_of, asc, contains, desc, eq, gt, gte, is_null, like, lt, lte, matches,
-        matches_in, ne, or, raw_pred,
+        matches_in, matches_tsv, matches_tsv_in, ne, or, raw_pred,
     };
     use crate::dialect::{Dialect, SqliteDialect};
     use crate::schema::Col;
@@ -812,5 +872,31 @@ mod tests {
         // FTS5 has no per-query config; `matches_in` renders identically to `matches`.
         let (sql, _) = render_with(&SqliteDialect, matches_in(NAME, "hello", "spanish"));
         assert_eq!(sql, r#""t"."name" match ?1"#);
+    }
+
+    #[test]
+    fn matches_tsv_queries_stored_column_without_recompute_on_postgres() {
+        // The stored tsvector is matched directly — no query-time `to_tsvector(..)`,
+        // so a GIN index on the column is usable.
+        assert_eq!(
+            render(matches_tsv(NAME, "hello")),
+            r#""t"."name" @@ plainto_tsquery('english', $1)"#
+        );
+    }
+
+    #[test]
+    fn matches_tsv_in_overrides_config_on_postgres() {
+        assert_eq!(
+            render(matches_tsv_in(NAME, "hola", "spanish")),
+            r#""t"."name" @@ plainto_tsquery('spanish', $1)"#
+        );
+    }
+
+    #[test]
+    fn matches_tsv_falls_back_to_fts5_on_sqlite() {
+        // SQLite has no stored-tsvector form; `matches_tsv` matches the column via FTS5.
+        let (sql, binds) = render_with(&SqliteDialect, matches_tsv(NAME, "hello"));
+        assert_eq!(sql, r#""t"."name" match ?1"#);
+        assert_eq!(binds, vec![Value::Text("hello".to_owned())]);
     }
 }

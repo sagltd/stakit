@@ -156,7 +156,11 @@ fn column_ddl(column: &Column) -> String {
     if column.unique {
         ddl.push_str(" unique");
     }
-    if let Some(default) = &column.default {
+    if let Some(expr) = &column.generated {
+        // A stored generated column (e.g. a tsvector) — the database computes it; it
+        // is mutually exclusive with a default.
+        let _ = write!(ddl, " generated always as ({expr}) stored");
+    } else if let Some(default) = &column.default {
         let _ = write!(ddl, " default {default}");
     }
     if let Some(fk) = &column.references {
@@ -176,13 +180,22 @@ fn index_name(table: &str, column: &str) -> String {
     format!("idx_{table}_{column}")
 }
 
-/// `create index "idx_t_c" on "t" ("c");` (portable across Postgres/SQLite/MySQL).
-fn create_index_sql(table: &str, column: &str) -> String {
+/// `create index "idx_t_c" on "t" using <method> ("c" <opclass>);` — the `using` and
+/// operator-class clauses are dropped when not set (the portable B-tree default).
+fn create_index_sql(table: &str, column: &Column) -> String {
+    let using = column
+        .index_method
+        .as_deref()
+        .map_or_else(String::new, |method| format!(" using {method}"));
+    let opclass = column
+        .opclass
+        .as_deref()
+        .map_or_else(String::new, |opclass| format!(" {opclass}"));
     format!(
-        "create index {} on {} ({});",
-        quote(&index_name(table, column)),
+        "create index {} on {}{using} ({}{opclass});",
+        quote(&index_name(table, &column.name)),
         quote(table),
-        quote(column)
+        quote(&column.name)
     )
 }
 
@@ -236,7 +249,7 @@ fn up(change: &Change) -> String {
             let mut sql = create_table_sql(table);
             for column in table.columns.iter().filter(|c| c.index) {
                 sql.push('\n');
-                sql.push_str(&create_index_sql(&table.name, &column.name));
+                sql.push_str(&create_index_sql(&table.name, column));
             }
             sql
         }
@@ -249,7 +262,7 @@ fn up(change: &Change) -> String {
             );
             if column.index {
                 sql.push('\n');
-                sql.push_str(&create_index_sql(table, &column.name));
+                sql.push_str(&create_index_sql(table, column));
             }
             sql
         }
@@ -337,6 +350,9 @@ mod tests {
             pk: name == "id",
             unique: false,
             index: false,
+            index_method: None,
+            opclass: None,
+            generated: None,
             default: None,
             references: None,
         }
@@ -369,6 +385,73 @@ mod tests {
         let mut column = col(name, ty);
         column.index = true;
         column
+    }
+
+    #[test]
+    fn create_index_emits_method_and_opclass() {
+        let mut embedding = indexed_col("embedding", "vector(3)");
+        embedding.index_method = Some("hnsw".to_owned());
+        embedding.opclass = Some("vector_cosine_ops".to_owned());
+        let new = table("docs", vec![col("id", "bigint"), embedding]);
+        let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
+        assert!(
+            up.contains(
+                r#"create index "idx_docs_embedding" on "docs" using hnsw ("embedding" vector_cosine_ops);"#
+            ),
+            "missing hnsw/opclass index, got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn create_index_emits_gin_method_without_opclass() {
+        let mut tsv = indexed_col("body_tsv", "tsvector");
+        tsv.index_method = Some("gin".to_owned());
+        let new = table("articles", vec![col("id", "bigint"), tsv]);
+        let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
+        assert!(
+            up.contains(
+                r#"create index "idx_articles_body_tsv" on "articles" using gin ("body_tsv");"#
+            ),
+            "missing gin index, got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn generated_tsvector_column_emits_stored_clause_and_gin_index() {
+        let mut tsv = indexed_col("body_tsv", "tsvector");
+        tsv.index_method = Some("gin".to_owned());
+        tsv.generated = Some("to_tsvector('english', body)".to_owned());
+        let new = table(
+            "articles",
+            vec![col("id", "bigint"), col("body", "text"), tsv],
+        );
+        let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
+        assert!(
+            up.contains(
+                r#""body_tsv" tsvector not null generated always as (to_tsvector('english', body)) stored"#
+            ),
+            "missing generated stored column, got:\n{up}"
+        );
+        assert!(
+            up.contains(
+                r#"create index "idx_articles_body_tsv" on "articles" using gin ("body_tsv");"#
+            ),
+            "missing gin index, got:\n{up}"
+        );
+    }
+
+    #[test]
+    fn bare_index_has_no_using_clause() {
+        let new = table(
+            "logs",
+            vec![col("id", "bigint"), indexed_col("user_id", "bigint")],
+        );
+        let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
+        assert!(up.contains(r#"create index "idx_logs_user_id" on "logs" ("user_id");"#));
+        assert!(
+            !up.contains("using"),
+            "bare index must be B-tree, got:\n{up}"
+        );
     }
 
     #[test]
@@ -406,6 +489,29 @@ mod tests {
         assert!(up.contains("create table \"users\""));
         assert!(up.contains("primary key (\"id\")"));
         assert_eq!(down_sql(&changes), "drop table \"users\";");
+    }
+
+    fn pk_col(name: &str, ty: &str) -> Column {
+        let mut column = col(name, ty);
+        column.pk = true;
+        column
+    }
+
+    #[test]
+    fn composite_primary_key_emits_combined_pk_clause() {
+        let new = table(
+            "goal_step",
+            vec![
+                pk_col("goal_id", "uuid"),
+                pk_col("step_id", "uuid"),
+                col("position", "int"),
+            ],
+        );
+        let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
+        assert!(
+            up.contains(r#"primary key ("goal_id", "step_id")"#),
+            "missing composite primary key, got:\n{up}"
+        );
     }
 
     #[test]

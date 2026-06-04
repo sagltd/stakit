@@ -12,9 +12,10 @@ use stakit_ai_sdk::ClaudeClient;
 use stakit_ai_sdk::OpenAiClient;
 use stakit_ai_sdk::{Agent, Message};
 
-/// A large stable system prompt that exceeds the 1024-token minimum for
-/// Anthropic prompt caching. The text is intentionally verbose and stable so
-/// caching can kick in on the second call.
+/// A stable system fragment, repeated `.repeat(6)` at each call site so the
+/// cached prefix clears the model's minimum cacheable size: 1024 tokens for
+/// Claude Sonnet/Opus and `OpenAI`, but **2048 tokens for Claude Haiku** (the cheap
+/// model used here). A prefix below the model's threshold is silently not cached.
 const LARGE_SYSTEM: &str = "You are a helpful, knowledgeable AI assistant specializing in \
     software engineering, system design, data structures, algorithms, and computer science \
     fundamentals. When answering questions, you provide thorough explanations with concrete \
@@ -51,12 +52,15 @@ async fn claude_second_call_reads_cache() {
     }
 
     let client = ClaudeClient::from_env().expect("ANTHROPIC_API_KEY must be set");
-    let model = "claude-haiku-4-5-20251001";
+    // Use a model that supports prompt caching. Verified via raw API: sonnet-4-5
+    // writes/reads the cache; `claude-haiku-4-5` did NOT cache on this account
+    // even for a hand-built request, so it is unsuitable for a caching assertion.
+    let model = "claude-sonnet-4-5";
 
     // First call — primes the cache.
     let mut agent = Agent::new(())
         .provider(client.model(model))
-        .system(LARGE_SYSTEM)
+        .system(LARGE_SYSTEM.repeat(6))
         .max_tokens(64)
         .with_context(vec![Message::user("What is 2 + 2?")]);
     let out1 = agent.run().await.expect("first call");
@@ -64,7 +68,7 @@ async fn claude_second_call_reads_cache() {
     // Second call — should read from cache.
     let mut agent2 = Agent::new(())
         .provider(client.model(model))
-        .system(LARGE_SYSTEM)
+        .system(LARGE_SYSTEM.repeat(6))
         .max_tokens(64)
         .with_context(vec![Message::user("What is 2 + 2?")]);
     let out2 = agent2.run().await.expect("second call");
@@ -93,7 +97,7 @@ async fn openai_second_call_reports_cached_tokens() {
     // First call — primes the cache.
     let mut agent = Agent::new(())
         .provider(client.model(model))
-        .system(LARGE_SYSTEM)
+        .system(LARGE_SYSTEM.repeat(6))
         .max_tokens(64)
         .with_context(vec![Message::user("What is 2 + 2?")]);
     let _out1 = agent.run().await.expect("first call");
@@ -101,7 +105,7 @@ async fn openai_second_call_reports_cached_tokens() {
     // Second call — should read from cache.
     let mut agent2 = Agent::new(())
         .provider(client.model(model))
-        .system(LARGE_SYSTEM)
+        .system(LARGE_SYSTEM.repeat(6))
         .max_tokens(64)
         .with_context(vec![Message::user("What is 2 + 2?")]);
     let out2 = agent2.run().await.expect("second call");

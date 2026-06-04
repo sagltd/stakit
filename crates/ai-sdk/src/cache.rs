@@ -14,8 +14,17 @@ use serde::{Deserialize, Serialize};
 pub enum CacheStrategy {
     /// No explicit caching.
     Off,
-    /// Place a single breakpoint on the last cacheable block (the default;
-    /// maximizes cache hits with zero configuration).
+    /// Automatically place cache breakpoints (the default; maximizes cache hits
+    /// with zero configuration).
+    ///
+    /// **Claude:** up to three breakpoints are placed in priority order — after
+    /// tool definitions (if any), after the system prompt (if any), and rolling
+    /// on the previous-turn boundary — subject to the provider's 4-breakpoint
+    /// cap.
+    ///
+    /// **`OpenAI`:** a stable `prompt_cache_key` is derived from the session and
+    /// the provider caches the prefix automatically; no explicit breakpoints are
+    /// written.
     #[default]
     Auto,
     /// Place explicit breakpoints at the given targets.

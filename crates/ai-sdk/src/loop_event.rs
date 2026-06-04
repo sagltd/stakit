@@ -7,15 +7,13 @@ use serde_json::Value;
 use crate::control::Approval;
 use crate::usage::Usage;
 
-/// A condition that ends the loop after a step (OR-ed together).
+/// A condition that ends the loop after a step.
+///
+/// Budget and tool-call stops are a middleware concern; see [`AgentMiddleware`].
 #[derive(Debug, Clone)]
 pub enum StopCond {
     /// Stop once this many steps have run.
     StepCountIs(u32),
-    /// Stop if a tool with this name was called.
-    HasToolCall(String),
-    /// Stop once cumulative estimated cost reaches this many USD.
-    BudgetUsd(f64),
 }
 
 /// A streamed event from a running agent.
@@ -142,7 +140,7 @@ pub struct Outcome {
 pub enum Finish {
     /// The model ended its turn.
     EndTurn,
-    /// A stop condition (max steps / budget) fired.
+    /// A stop condition fired (currently: step cap).
     Limit(StopCond),
     /// A middleware stopped the run.
     Stopped {

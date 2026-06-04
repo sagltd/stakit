@@ -126,7 +126,7 @@ fn openai_auto_sets_prompt_cache_key() {
     let mut req = ChatRequest::new("gpt-4o");
     req.system = Some(SystemPrompt::from("be brief"));
     req.messages = vec![Message::user("hi")];
-    req.cache_key = Some("sess-1".to_owned());
+    req.cache_key = Some("sess-1".into());
 
     let body = openai_body(&req);
     assert_eq!(body["prompt_cache_key"], "sess-1");
@@ -146,12 +146,12 @@ fn openai_auto_sets_prompt_cache_key() {
 #[test]
 fn claude_shared_prefix_identical_across_users() {
     let mut a = claude_request(3, vec![Message::user("user A question")]);
-    a.cache_key = Some("user-a".to_owned());
+    a.cache_key = Some("user-a".into());
     let mut b = claude_request(
         3,
         vec![Message::user("a totally different question from B")],
     );
-    b.cache_key = Some("user-b".to_owned());
+    b.cache_key = Some("user-b".into());
 
     let body_a = claude_body(&a);
     let body_b = claude_body(&b);

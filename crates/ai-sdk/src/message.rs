@@ -58,7 +58,7 @@ pub enum UserContent {
     /// The result of a tool call, referencing the originating [`AssistantContent::ToolUse`] by `id`.
     ToolResult {
         /// Correlates with the `id` of the assistant `ToolUse` block.
-        id: String,
+        id: Arc<str>,
         /// Result payload (text and/or images).
         content: Vec<ToolResultPart>,
         /// Whether this result represents a tool failure (the model may retry).
@@ -74,9 +74,9 @@ pub enum AssistantContent {
     /// A request to call a tool, with already-parsed arguments.
     ToolUse {
         /// Unique id for this call; the matching `ToolResult` references it.
-        id: String,
+        id: Arc<str>,
         /// Tool name.
-        name: String,
+        name: Arc<str>,
         /// Parsed tool arguments (conform to the tool's JSON Schema).
         input: Value,
     },
@@ -91,14 +91,14 @@ pub enum Thinking {
     /// Visible reasoning text, with an optional integrity signature.
     Visible {
         /// The reasoning text.
-        text: String,
+        text: Arc<str>,
         /// Provider integrity signature (Anthropic), replayed verbatim.
-        signature: Option<String>,
+        signature: Option<Arc<str>>,
     },
     /// Encrypted/redacted reasoning (opaque blob, replayed verbatim).
     Redacted {
         /// Opaque provider data.
-        data: String,
+        data: Arc<str>,
     },
 }
 
@@ -106,7 +106,7 @@ pub enum Thinking {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolResultPart {
     /// Text output.
-    Text(String),
+    Text(Arc<str>),
     /// Image output.
     Image(Image),
 }

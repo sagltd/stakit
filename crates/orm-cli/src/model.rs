@@ -33,6 +33,18 @@ pub struct Column {
     /// Whether a (non-unique) secondary index should be created on this column.
     #[serde(default)]
     pub index: bool,
+    /// Index access method (e.g. `hnsw`, `gin`, `gist`), if requested. `None` is the
+    /// backend default (B-tree). Only meaningful when [`index`](Self::index) is set.
+    #[serde(default)]
+    pub index_method: Option<String>,
+    /// Operator class on the indexed column (e.g. `vector_cosine_ops`), if requested.
+    /// Only meaningful when [`index`](Self::index) is set.
+    #[serde(default)]
+    pub opclass: Option<String>,
+    /// `GENERATED ALWAYS AS (<expr>) STORED` expression, if any (e.g. a stored
+    /// tsvector). The database computes the value, so it is omitted from inserts.
+    #[serde(default)]
+    pub generated: Option<String>,
     /// SQL `DEFAULT` expression, if any.
     pub default: Option<String>,
     /// Foreign-key reference, if any.

@@ -47,6 +47,9 @@ pub trait Tool<Ctx>: Send + Sync + 'static {
 
 /// The object-safe, JSON-in/JSON-out erasure of [`Tool`], stored in the registry.
 pub trait ToolDyn<Ctx>: Send + Sync {
+    /// The tool's name. Cheaper than [`def`](ToolDyn::def) for lookups, which
+    /// would otherwise rebuild the whole [`ToolDef`] (schema included) per call.
+    fn name(&self) -> &str;
     /// The provider-facing definition (name, description, JSON Schema).
     fn def(&self) -> ToolDef;
     /// Deserializes + validates the arguments, runs, and serializes the output.
@@ -68,6 +71,10 @@ where
     T: Tool<Ctx>,
     Ctx: Send + Sync,
 {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef::new(
             self.0.name(),

@@ -48,17 +48,23 @@ pub struct Column {
     pub name: &'static str,
     /// SQL type (e.g. `uuid`, `text`).
     pub sql_type: &'static str,
-    /// Whether this column is the (single-column) primary key. Composite primary
-    /// keys are rejected by the derive.
+    /// Whether this column participates in the primary key. A composite key sets this
+    /// on more than one column; the migration then emits `primary key (a, b, …)`.
     pub is_pk: bool,
     /// Whether a `UNIQUE` constraint applies.
     pub is_unique: bool,
     /// Whether a (non-unique) secondary index should be created on this column.
     pub is_index: bool,
     /// The index access method, when one was requested explicitly (e.g. `"gist"`
-    /// for a `PostGIS` geometry column via `#[column(index = "gist")]`). `None` uses
-    /// the backend default (B-tree). Only meaningful when [`is_index`](Self::is_index).
+    /// for a `PostGIS` geometry column via `#[column(index = "gist")]`, or `"hnsw"`
+    /// for a pgvector column via `#[column(index_method = "hnsw")]`). `None` uses the
+    /// backend default (B-tree). Only meaningful when [`is_index`](Self::is_index).
     pub index_method: Option<&'static str>,
+    /// The operator class applied to the indexed column (e.g. `"vector_cosine_ops"`
+    /// for a pgvector HNSW index, `"gin_trgm_ops"` for a trigram GIN index) via
+    /// `#[column(opclass = "…")]`. `None` uses the type's default operator class.
+    /// Only meaningful when [`is_index`](Self::is_index).
+    pub index_opclass: Option<&'static str>,
     /// Whether the column is nullable.
     pub is_nullable: bool,
     /// Verbatim SQL `DEFAULT` expression, if any.
@@ -76,22 +82,35 @@ impl Column {
     /// Render the `CREATE INDEX` DDL for this column on `table`, or `None` when the
     /// column has no secondary index ([`is_index`](Self::is_index) is `false`).
     ///
-    /// Emits `create index "idx_<table>_<name>" on "<table>" using <method> ("<name>")`
-    /// when an [`index_method`](Self::index_method) is set (e.g. `gist` for a `PostGIS`
-    /// geometry column), or the same without the `using` clause for the default
-    /// B-tree. Identifiers are quoted; the method is a developer-supplied
-    /// `&'static str` written verbatim.
+    /// Emits `create index "idx_<table>_<name>" on "<table>" using <method> ("<name>" <opclass>)`,
+    /// dropping the `using <method>` clause when no [`index_method`](Self::index_method)
+    /// is set (default B-tree) and the trailing `<opclass>` when no
+    /// [`index_opclass`](Self::index_opclass) is set. Identifiers are quoted; the method
+    /// and operator class are developer-supplied `&'static str`s written verbatim.
     ///
     /// ```
     /// # use stakit_orm::Column;
     /// let geo = Column {
     ///     name: "location", sql_type: "geometry(Point,4326)", is_pk: false,
     ///     is_unique: false, is_index: true, index_method: Some("gist"),
-    ///     is_nullable: false, default: None, references: None, read_cast: None,
+    ///     index_opclass: None, is_nullable: false, default: None, references: None,
+    ///     read_cast: None,
     /// };
     /// assert_eq!(
     ///     geo.create_index_sql("places").as_deref(),
     ///     Some(r#"create index "idx_places_location" on "places" using gist ("location")"#),
+    /// );
+    ///
+    /// // A pgvector HNSW index carries an operator class.
+    /// let embedding = Column {
+    ///     name: "embedding", sql_type: "vector(3)", is_pk: false, is_unique: false,
+    ///     is_index: true, index_method: Some("hnsw"),
+    ///     index_opclass: Some("vector_cosine_ops"), is_nullable: false, default: None,
+    ///     references: None, read_cast: None,
+    /// };
+    /// assert_eq!(
+    ///     embedding.create_index_sql("docs").as_deref(),
+    ///     Some(r#"create index "idx_docs_embedding" on "docs" using hnsw ("embedding" vector_cosine_ops)"#),
     /// );
     /// ```
     #[must_use]
@@ -102,8 +121,11 @@ impl Column {
         let using = self
             .index_method
             .map_or_else(String::new, |method| format!(" using {method}"));
+        let opclass = self
+            .index_opclass
+            .map_or_else(String::new, |opclass| format!(" {opclass}"));
         Some(format!(
-            r#"create index "idx_{table}_{name}" on "{table}"{using} ("{name}")"#,
+            r#"create index "idx_{table}_{name}" on "{table}"{using} ("{name}"{opclass})"#,
             name = self.name,
         ))
     }

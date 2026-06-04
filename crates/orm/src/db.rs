@@ -307,7 +307,9 @@ impl Db {
 
     /// Fetch by primary key: `SELECT * FROM T WHERE <pk> = $1`, output inferred as
     /// `T`. Finish with `.one()` → `Option<T>`. Tables without a primary key match
-    /// nothing (the filter renders as always-false).
+    /// nothing (the filter renders as always-false). A composite-key table's `Pk` is a
+    /// tuple, which has no `ToValue`, so this is a compile error there — query those
+    /// with `find().filter(..)`.
     #[must_use]
     pub fn get<T: Table>(&self, pk: T::Pk) -> Select<crate::projection::All<T>>
     where
@@ -544,6 +546,10 @@ async fn enable_libsql_foreign_keys(connection: &libsql::Connection) -> Result<(
 /// Build the `WHERE <pk> = $1` predicate for `T::get`. Falls back to the
 /// always-false `1 = 0` for a primary-key-less table (so `get` matches nothing
 /// rather than every row).
+///
+/// Only ever instantiated for a **single-column** key: the `T::Pk: ToValue` bound is
+/// unsatisfiable for a composite key's tuple `Pk`, so `find(is_pk)` taking the first
+/// key column is correct here (a composite-key table can never reach this).
 fn pk_filter<T: Table>(pk: T::Pk) -> crate::expr::Predicate
 where
     T::Pk: crate::value::ToValue,

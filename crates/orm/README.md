@@ -109,11 +109,18 @@ struct Post {
 - compile-time **foreign-key type checks** (`author_id` must match `User`'s PK type)
 - compile-time identifier validation (empty / NUL / 63-byte limit)
 
-Column attributes: `pk`, `unique`, `index`, `nullable`, `default = "<sql>"`,
+Column attributes: `pk`, `unique`, `index`, `index_method = "<am>"`,
+`opclass = "<opclass>"`, `nullable`, `default = "<sql>"`, `generated = "<expr>"`,
 `name = "<col>"`, `sql_type = "<type>"`, `references = Type::col`,
-`on_delete = "cascade|restrict|set null|no action"`. Composite primary keys are
-rejected (use exactly one `#[column(pk)]`). `#[column(index)]` makes the CLI emit a
-`CREATE INDEX` for that column.
+`on_delete = "cascade|restrict|set null|no action"`. Mark two or more fields
+`#[column(pk)]` for a **composite primary key** (the migration emits
+`primary key (a, b)`); such a table's `Pk` is a tuple, so `db.get` is unavailable —
+query it with `find().filter(..)`. `#[column(index)]` makes the CLI emit a
+`CREATE INDEX`; add `index_method`/`opclass` for an access method + operator class
+(e.g. `index_method = "hnsw", opclass = "vector_cosine_ops"` for pgvector, or
+`index_method = "gin"` for a tsvector/JSONB GIN index). `generated = "<expr>"`
+emits a `GENERATED ALWAYS AS (<expr>) STORED` column (database-computed, so it is
+omitted from the insert companion).
 
 ### Foreign keys & `ON DELETE CASCADE`
 
@@ -190,7 +197,7 @@ let u = db.find::<User>().filter(eq(User::id, 1)).one().await?;
 // partial projection -> tuple, inferred as (i64, String)
 let pairs = db.select((User::id, User::email)).from::<User>().all().await?;
 
-// filters: eq ne gt lt gte lte like contains is_null and or not any_of matches matches_in
+// filters: eq ne gt lt gte lte like contains is_null and or not any_of matches matches_in matches_tsv matches_tsv_in
 let some = db.find::<User>()
     .filter(and(gt(User::age, 18), not(like(User::email, "%@spam.com"))))
     .order_by(asc(User::age))
@@ -613,13 +620,15 @@ let scored = db.select((Doc::id, distance(Doc::embedding, &q, Distance::Cosine))
 `Vector` binds correctly on insert too (pg `$1::vector`, Turso `vector32($1)`). Setup
 and caveats per backend:
 
-| Backend     | Column DDL              | ANN index (you create it)                              | Notes |
+| Backend     | Column DDL              | ANN index                                              | Notes |
 |-------------|-------------------------|--------------------------------------------------------|-------|
-| Postgres    | `vector(N)` (pgvector)  | `CREATE INDEX … USING hnsw (embedding vector_cosine_ops)` | reading the column back needs `embedding::text`; metric must match the index opclass |
-| Turso/libSQL| `blob`                  | `libsql_vector_idx(embedding)`                          | works in-process; round-trips as LE-f32 blob |
+| Postgres    | `vector(N)` (pgvector)  | `#[column(index, index_method = "hnsw", opclass = "vector_cosine_ops")]` → `CREATE INDEX … USING hnsw (embedding vector_cosine_ops)` | reading the column back needs `embedding::text`; metric must match the index opclass |
+| Turso/libSQL| `blob`                  | `libsql_vector_idx(embedding)` (create manually)       | works in-process; round-trips as LE-f32 blob |
 | sqlite-vec  | `vec0` virtual table    | built into `vec0`                                      | needs the `sqlite-vec` loadable extension |
 
-Without an ANN index `nearest()` is an exact full scan. `Distance` is L2/Cosine/Inner­Product;
+The Postgres HNSW index is now emitted by the CLI from the column attributes;
+elsewhere create the ANN index yourself. Without an ANN index `nearest()` is an exact
+full scan. `Distance` is L2/Cosine/Inner­Product;
 for any other metric use `sql_expr`/`raw`. (Verified e2e on Turso; pgvector/sqlite-vec
 need their extensions, which aren't bundled.)
 
@@ -723,8 +732,28 @@ always a bound parameter.
 let hits = db.find::<Article>().filter(matches(Article::body, "systems")).all().await?;
 ```
 
-Relevance ranking (`ts_rank` / `bm25`) is not yet a typed projection — order by it via
-`raw_pred`/`db.raw` for now. `MySQL` full-text (`MATCH … AGAINST`) is not supported.
+For large tables, store a `tsvector` and match it directly so a **GIN index** applies
+(no per-query `to_tsvector` recompute). Declare a generated column + GIN index, then
+query it with `matches_tsv` (or `matches_tsv_in` to pin the config):
+
+```rust
+#[derive(Table)]
+#[table(name = "articles")]
+struct Article {
+    #[column(pk)] id: i64,
+    body: String,
+    #[column(sql_type = "tsvector", generated = "to_tsvector('english', body)", index = "gin")]
+    body_tsv: String,   // GENERATED ALWAYS AS (…) STORED — omitted from `ArticleNew`
+}
+
+// "articles"."body_tsv" @@ plainto_tsquery('english', $1) — GIN-backed, no recompute
+let hits = db.find::<Article>().filter(matches_tsv(Article::body_tsv, "systems")).all().await?;
+```
+
+`matches_tsv` falls back to FTS5 `MATCH` on SQLite/Turso (no stored-tsvector form
+there). Relevance ranking (`ts_rank` / `bm25`) is not yet a typed projection — order by
+it via `raw_pred`/`db.raw` for now. `MySQL` full-text (`MATCH … AGAINST`) is not
+supported.
 
 ## Custom backends
 

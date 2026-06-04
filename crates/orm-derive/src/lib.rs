@@ -522,10 +522,12 @@ struct ColumnModel {
     is_unique: bool,
     is_index: bool,
     index_method: Option<String>,
+    opclass: Option<String>,
     is_nullable: bool,
     default: Option<String>,
     references: Option<(Path, String)>,
     on_delete: Option<String>,
+    generated: Option<String>,
 }
 
 fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -554,18 +556,15 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         columns.push(parse_column(&ident, field)?);
     }
 
-    // A single-column primary key is assumed by `type Pk`, `get()`/`pk_filter`, and
-    // the FK type-equality check. Reject composite PKs up front rather than silently
-    // filtering on only the first key column.
-    if columns.iter().filter(|column| column.is_pk).count() > 1 {
-        return Err(syn::Error::new_spanned(
-            name,
-            "composite primary keys are not supported: mark exactly one field \
-             #[column(pk)]",
-        ));
-    }
+    // A `GENERATED ALWAYS AS … STORED` column is database-computed, not stored data:
+    // it is excluded from `COLUMNS` (so whole-row `SELECT`/decode skips it — a Postgres
+    // `tsvector`, say, has no scalar decode), while still getting a `Col` token so it can
+    // be referenced in predicates such as `matches_tsv`. Its struct field is filled with
+    // `Default` on read, like a relation.
+    let stored: Vec<&ColumnModel> = columns.iter().filter(|c| c.generated.is_none()).collect();
+    let generated: Vec<&ColumnModel> = columns.iter().filter(|c| c.generated.is_some()).collect();
 
-    let column_literals = columns.iter().map(column_literal);
+    let column_literals = stored.iter().map(|c| column_literal(c));
     let col_consts = columns.iter().map(|column| {
         let field = &column.field;
         let field_ty = &column.field_ty;
@@ -576,22 +575,40 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 ::stakit_orm::Col::new(#table_name, #col_name);
         }
     });
-    let from_row_at_fields = columns.iter().enumerate().map(|(index, column)| {
+    let from_row_at_fields = stored.iter().enumerate().map(|(index, column)| {
         let field = &column.field;
         let field_ty = &column.field_ty;
         quote! {
             #field: ::stakit_orm::driver::decode_cell::<#field_ty>(row, start + #index)?
         }
     });
+    let from_row_at_generated = generated.iter().map(|column| {
+        let field = &column.field;
+        quote! { #field: ::core::default::Default::default() }
+    });
     let from_row_at_relations = relations.iter().map(|ident| {
         quote! { #ident: ::core::default::Default::default() }
     });
     let fk_checks = columns.iter().filter_map(fk_check);
 
-    let pk_ty = columns
+    // `type Pk` mirrors the primary key's shape: `()` when there is none, the field
+    // type for a single key, or a tuple for a composite key. A tuple `Pk` has no
+    // `ToValue` impl, so `Db::get::<T>(..)` won't compile for a composite-key table —
+    // those are queried with `find().filter(..)`, and a scalar FK can't reference one
+    // (the FK type-equality check rejects the tuple). The DDL emits `primary key (a, b)`.
+    let pk_columns: Vec<&ColumnModel> = stored
         .iter()
-        .find(|column| column.is_pk)
-        .map_or_else(|| quote! { () }, |column| column.field_ty.to_token_stream());
+        .copied()
+        .filter(|column| column.is_pk)
+        .collect();
+    let pk_ty = match pk_columns.as_slice() {
+        [] => quote! { () },
+        [single] => single.field_ty.to_token_stream(),
+        many => {
+            let types = many.iter().map(|column| &column.field_ty);
+            quote! { ( #(#types),* ) }
+        }
+    };
 
     let insertable = emit_insertable(name, &table_name, &columns);
 
@@ -607,6 +624,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             ) -> ::stakit_orm::Result<Self> {
                 Ok(Self {
                     #(#from_row_at_fields,)*
+                    #(#from_row_at_generated,)*
                     #(#from_row_at_relations,)*
                 })
             }
@@ -631,6 +649,10 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 fn emit_insertable(name: &Ident, table: &str, columns: &[ColumnModel]) -> proc_macro2::TokenStream {
     let new_ident = quote::format_ident!("{}New", name);
 
+    // A `GENERATED ALWAYS AS … STORED` column is computed by the database and cannot
+    // be written, so it is omitted from the insert companion entirely.
+    let columns: Vec<&ColumnModel> = columns.iter().filter(|c| c.generated.is_none()).collect();
+
     let new_fields = columns.iter().map(|column| {
         let field = &column.field;
         let ty = &column.field_ty;
@@ -642,8 +664,16 @@ fn emit_insertable(name: &Ident, table: &str, columns: &[ColumnModel]) -> proc_m
         }
     });
 
-    let required: Vec<&ColumnModel> = columns.iter().filter(|c| c.default.is_none()).collect();
-    let optional: Vec<&ColumnModel> = columns.iter().filter(|c| c.default.is_some()).collect();
+    let required: Vec<&ColumnModel> = columns
+        .iter()
+        .copied()
+        .filter(|c| c.default.is_none())
+        .collect();
+    let optional: Vec<&ColumnModel> = columns
+        .iter()
+        .copied()
+        .filter(|c| c.default.is_some())
+        .collect();
 
     let required_names = required.iter().map(|c| &c.col_name);
     let optional_names = optional.iter().map(|c| &c.col_name);
@@ -730,10 +760,12 @@ fn parse_column(ident: &Ident, field: &syn::Field) -> syn::Result<ColumnModel> {
         is_unique: false,
         is_index: false,
         index_method: None,
+        opclass: None,
         is_nullable: unwrap_generic(&field.ty, "Option").is_some(),
         default: None,
         references: None,
         on_delete: None,
+        generated: None,
     };
     let mut explicit_sql_type = None;
     for attr in &field.attrs {
@@ -752,25 +784,58 @@ fn parse_column(ident: &Ident, field: &syn::Field) -> syn::Result<ColumnModel> {
                 if let Ok(value) = meta.value() {
                     model.index_method = Some(value.parse::<LitStr>()?.value());
                 }
+            } else if meta.path.is_ident("index_method") {
+                // Keyword spelling of the access method (e.g. `index_method = "hnsw"`
+                // for pgvector); equivalent to `index = "hnsw"`.
+                model.index_method = Some(meta.value()?.parse::<LitStr>()?.value());
+            } else if meta.path.is_ident("opclass") {
+                // Operator class on the indexed column (e.g. `vector_cosine_ops`).
+                model.opclass = Some(meta.value()?.parse::<LitStr>()?.value());
             } else if meta.path.is_ident("nullable") {
                 model.is_nullable = true;
             } else if meta.path.is_ident("name") {
                 model.col_name = meta.value()?.parse::<LitStr>()?.value();
             } else if meta.path.is_ident("default") {
                 model.default = Some(meta.value()?.parse::<LitStr>()?.value());
+            } else if meta.path.is_ident("generated") {
+                // A `GENERATED ALWAYS AS (<expr>) STORED` column (e.g. a stored
+                // tsvector). The database computes it, so it is omitted from inserts.
+                model.generated = Some(meta.value()?.parse::<LitStr>()?.value());
             } else if meta.path.is_ident("sql_type") {
                 explicit_sql_type = Some(meta.value()?.parse::<LitStr>()?.value());
             } else if meta.path.is_ident("references") {
                 model.references = Some(parse_references(&meta)?);
             } else if meta.path.is_ident("on_delete") {
                 model.on_delete = Some(meta.value()?.parse::<LitStr>()?.value());
+            } else {
+                // Reject unknown keys rather than silently dropping them — a typo like
+                // `index_methd = "hnsw"` must fail loudly, not produce a B-tree.
+                return Err(meta.error("unknown #[column(...)] attribute"));
             }
             Ok(())
         })?;
     }
 
     validate_ident(&model.col_name, ident)?;
+    validate_column(&model, ident)?;
 
+    let base_ty = unwrap_generic(&field.ty, "Option").unwrap_or(&field.ty);
+    model.sql_type = match explicit_sql_type {
+        Some(explicit) => explicit,
+        None => sql_type(base_ty)
+            .ok_or_else(|| {
+                syn::Error::new_spanned(
+                    base_ty,
+                    "unknown SQL type for this Rust type; add #[column(sql_type = \"...\")]",
+                )
+            })?
+            .to_owned(),
+    };
+    Ok(model)
+}
+
+/// Reject contradictory `#[column(...)]` flag combinations at expansion time.
+fn validate_column(model: &ColumnModel, ident: &Ident) -> syn::Result<()> {
     // on_delete is only valid with references, must be a known keyword, and
     // `set null` requires a nullable column (matches the spec's compile checks).
     if let Some(action) = &model.on_delete {
@@ -797,19 +862,59 @@ fn parse_column(ident: &Ident, field: &syn::Field) -> syn::Result<ColumnModel> {
         }
     }
 
-    let base_ty = unwrap_generic(&field.ty, "Option").unwrap_or(&field.ty);
-    model.sql_type = match explicit_sql_type {
-        Some(explicit) => explicit,
-        None => sql_type(base_ty)
-            .ok_or_else(|| {
-                syn::Error::new_spanned(
-                    base_ty,
-                    "unknown SQL type for this Rust type; add #[column(sql_type = \"...\")]",
-                )
-            })?
-            .to_owned(),
-    };
-    Ok(model)
+    // An access method / operator class only means something on an indexed column.
+    if !model.is_index && (model.index_method.is_some() || model.opclass.is_some()) {
+        return Err(syn::Error::new_spanned(
+            ident,
+            "index_method/opclass require #[column(index)] on the same column",
+        ));
+    }
+
+    // The access method and operator class are written verbatim into `CREATE INDEX …
+    // USING <method> (col <opclass>)`. They are SQL *identifiers* (e.g. `hnsw`,
+    // `vector_cosine_ops`), so require them to be bare identifiers — this keeps a stray
+    // value from breaking out of the index clause.
+    if let Some(method) = &model.index_method {
+        if !is_sql_identifier(method, false) {
+            return Err(syn::Error::new_spanned(
+                ident,
+                "index_method must be a bare SQL identifier (e.g. \"hnsw\", \"gin\")",
+            ));
+        }
+    }
+    if let Some(opclass) = &model.opclass {
+        if !is_sql_identifier(opclass, true) {
+            return Err(syn::Error::new_spanned(
+                ident,
+                "opclass must be a (optionally schema-qualified) SQL identifier",
+            ));
+        }
+    }
+
+    // A column is either database-generated or has a default — never both.
+    if model.generated.is_some() && model.default.is_some() {
+        return Err(syn::Error::new_spanned(
+            ident,
+            "a #[column(generated = ...)] column cannot also have a default",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Whether `value` is a SQL identifier: a non-empty run of ASCII letters, digits, and
+/// underscores starting with a letter or underscore. When `allow_qualified`, a single
+/// `schema.name` qualification is accepted (each part validated the same way).
+fn is_sql_identifier(value: &str, allow_qualified: bool) -> bool {
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.len() > 1 && !allow_qualified {
+        return false;
+    }
+    parts.iter().all(|part| {
+        let mut chars = part.chars();
+        matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// Reject identifiers Postgres cannot store safely (matches `ident::validate`).
@@ -866,6 +971,10 @@ fn column_literal(column: &ColumnModel) -> proc_macro2::TokenStream {
         || quote! { ::core::option::Option::None },
         |method| quote! { ::core::option::Option::Some(#method) },
     );
+    let index_opclass = column.opclass.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |opclass| quote! { ::core::option::Option::Some(#opclass) },
+    );
     let is_nullable = column.is_nullable;
     let default = column.default.as_ref().map_or_else(
         || quote! { ::core::option::Option::None },
@@ -893,6 +1002,7 @@ fn column_literal(column: &ColumnModel) -> proc_macro2::TokenStream {
             is_unique: #is_unique,
             is_index: #is_index,
             index_method: #index_method,
+            index_opclass: #index_opclass,
             is_nullable: #is_nullable,
             default: #default,
             references: #references,

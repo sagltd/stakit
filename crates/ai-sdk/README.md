@@ -37,59 +37,51 @@ compile only the provider you use.
 
 ```rust
 use futures::StreamExt;
-use stakit_ai_sdk::{Agent, CancelToken, ClaudeClient, LoopEvent, Message};
+use stakit_ai_sdk::{Agent, AgentEvent, ClaudeClient, Message};
 
 #[tokio::main]
 async fn main() {
     let client = ClaudeClient::from_env().expect("ANTHROPIC_API_KEY");
-    let agent = Agent::<_, ()>::builder(client.model("claude-haiku-4-5-20251001"))
-        .build();
+    let provider = stakit_ai_sdk::provider::claude::ClaudeModel::new(client, "claude-haiku-4-5-20251001");
+    let mut agent = Agent::new(())
+        .provider(provider)
+        .with_context(vec![Message::user("Say hello in five words.")]);
 
-    let mut stream = Box::pin(agent.run(
-        vec![Message::user_text("Say hello in five words.")],
-        (),                  // your context (here: nothing)
-        CancelToken::new(),
-    ));
-
-    while let Some(event) = stream.next().await {
+    let mut run = agent.run();
+    while let Some(event) = run.next().await {
         match event {
-            LoopEvent::TextDelta(t) => print!("{t}"),
-            LoopEvent::Done { usage, cost, .. } =>
-                println!("\n[{} in / {} out, ~${:.6}]", usage.input_tokens, usage.output_tokens, cost.unwrap_or(0.0)),
+            AgentEvent::MessageDelta(t) => print!("{t}"),
+            AgentEvent::Done(out) =>
+                println!("\n[{} in / {} out]", out.usage.input_tokens, out.usage.output_tokens),
             _ => {}
         }
     }
 }
 ```
 
-The model is named **once** (on the provider handle). `OpenAiClient` is identical:
-`OpenAiClient::from_env()` + `.model("gpt-4o-mini")`.
+`OpenAiClient` is identical: `OpenAiClient::from_env()` + the appropriate model id.
 
 ## The loop & events
 
-`agent.run(history, ctx, cancel)` returns a `Stream<Item = LoopEvent>`:
+`agent.run()` returns an `AgentRun` which is both a `Stream<Item = AgentEvent>` and
+an `IntoFuture<Output = Result<Outcome, AgentError>>`:
 
 ```rust
-pub enum LoopEvent {
-    StepStart { step: u32 },
-    TextDelta(String),
+pub enum AgentEvent {
+    StepStart  { index: u32 },
     ReasoningDelta(String),
-    ToolCall   { id: String, name: String, input: Value },
-    ToolResult { id: String, output: Value, is_error: bool },
-    Usage      { step: u32, usage: Usage, cost: Option<f64> }, // per-step tokens + $
-    StepEnd    { step: u32, stop: StopReason },
-    Done       { text: String, usage: Usage, cost: Option<f64>, reason: FinishReason },
+    MessageDelta(String),
+    ToolCall   { id: String, name: String, args: Value },
+    ToolResult { id: String, name: String, result: ToolOutcome },
+    StepEnd    { index: u32, text: String, reasoning: Option<String>, usage: Usage, cost: Option<f64> },
+    Done(Outcome),
 }
 ```
 
 The loop: call model → stream output → run any requested tools (concurrently) →
-append results → repeat, until the model ends its turn or a `stop_when` matches.
-
-Stop conditions (OR-ed; default `StepCountIs(20)`):
-
-```rust
-.stop_when(vec![StopCond::StepCountIs(10), StopCond::BudgetUsd(0.50), StopCond::HasToolCall("done".into())])
-```
+append results → repeat, until the model ends its turn, a middleware stops, or the
+default step cap (`StepCountIs(16)`) fires. Budget / custom stop conditions are a
+[`AgentMiddleware`] concern (return `Flow::Stop` from `on_step`).
 
 ## Tools
 
@@ -115,7 +107,7 @@ async fn get_weather(args: WeatherArgs) -> Result<String, ToolError> {
     Ok(format!("21°C and sunny in {}.", args.city))
 }
 
-let agent = Agent::<_, ()>::builder(provider).register(get_weather).build();
+let agent = Agent::new(()).provider(provider).register_tool(get_weather);
 ```
 
 Accepted `#[tool]` signatures (sync or async): `(cx, args)`, `(args)`, `(cx)`, `()`.
@@ -133,8 +125,8 @@ async fn lookup(cx: &ToolCx<App>, args: LookupArgs) -> Result<Row, ToolError> {
     Ok(cx.ctx().db.get(&args.id).await?)   // `?` works on any std error
 }
 
-let agent = Agent::<_, App>::builder(provider).register(lookup).build();
-agent.run(history, App { db }, CancelToken::new());
+let mut agent = Agent::new(App { db }).provider(provider).register_tool(lookup);
+let _ = agent.run().await;
 ```
 
 This is also how **client-side tools** and **human approval** wire in — through
@@ -159,31 +151,11 @@ impl Tool<()> for Reverse {
 }
 ```
 
-### Add / remove tools at runtime
-
-The registry is internally synchronized — mutate a live (even cloned) agent:
-
-```rust
-agent.register_tool(get_weather);
-agent.register_tool_set(my_bundle);   // any `ToolSet` (e.g. an MCP server)
-agent.remove_tool("get_weather");
-let names: Vec<String> = agent.tool_names();
-```
-
 ### Parallel tool calls
 
 When the model requests several tools in one turn, the loop runs them
 **concurrently** (`join_all`) and returns all results in one turn. Enabled by
 default (both APIs allow parallel tool use unless told otherwise).
-
-### Tool search at scale
-
-Register large tool sets as **deferred** — withheld from the prompt until the
-built-in `tool_search` tool surfaces them (Anthropic-style, provider-agnostic):
-
-```rust
-.register_deferred(big_tool)   // name+desc not sent until searched
-```
 
 ## Add your own provider
 
@@ -200,107 +172,105 @@ use stakit_ai_sdk::{
 struct MyProvider { model: String, /* http client, key, … */ }
 
 impl Provider for MyProvider {
-    type Raw = serde_json::Value;             // native body, kept on ChatResponse.raw
+    fn model_id(&self) -> &str { &self.model }
 
-    fn model_id(&self) -> &str { &self.model } // agent reads the model from here
-
-    async fn complete(&self, req: ChatRequest) -> Result<ChatResponse<Self::Raw>, ProviderError> {
+    fn complete(&self, req: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
         // 1. map `req` (system, messages, tools, tool_choice, cache, thinking) to your wire format
         // 2. POST, parse response into unified `AssistantContent` blocks
-        Ok(ChatResponse {
-            content: vec![/* AssistantContent::Text(...) / ToolUse {...} */],
-            stop: StopReason::EndTurn,
-            usage: Usage { input_tokens: 10, output_tokens: 5, ..Usage::default() },
-            raw: serde_json::Value::Null,
+        Box::pin(async move {
+            Ok(ChatResponse {
+                content: vec![/* AssistantContent::Text(...) / ToolUse {...} */],
+                stop: StopReason::EndTurn,
+                usage: Usage { input_tokens: 10, output_tokens: 5, ..Usage::default() },
+            })
         })
     }
 
-    async fn stream(&self, req: ChatRequest) -> Result<EventStream, ProviderError> {
-        // map your SSE/byte stream to `StreamEvent`s, accumulating tool-call
-        // argument fragments so a whole `ToolCall` is emitted once complete.
-        // `event_stream(...)` builds the stream without a direct `futures` dep:
-        Ok(event_stream(vec![
-            Ok(StreamEvent::TextDelta("hi".into())),
-            Ok(StreamEvent::End { stop: StopReason::EndTurn, usage: Usage::default() }),
-        ]))
+    fn stream(&self, _req: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
+        // map your SSE/byte stream to `StreamEvent`s; `event_stream(...)` builds it:
+        Box::pin(async move {
+            Ok(event_stream(vec![
+                Ok(StreamEvent::TextDelta("hi".into())),
+                Ok(StreamEvent::End { stop: StopReason::EndTurn, usage: Usage::default() }),
+            ]))
+        })
     }
 }
 
 // use it exactly like the built-ins:
-let agent = Agent::<_, ()>::builder(MyProvider { model: "my-model".into() }).build();
+let mut agent = Agent::new(()).provider(MyProvider { model: "my-model".into() });
 ```
 
 Map your provider's usage into the unified `Usage`
 (`input_tokens` / `output_tokens` / `cache_create_tokens` / `cache_read_tokens` /
 `reasoning_tokens`) so cost telemetry works.
 
-## Inject user input mid-loop
+## Tool approval (human-in-the-loop)
 
-Hold the sender; send any time — drained at the next step boundary:
+Gate every tool call by implementing `AgentMiddleware::on_tool_approve`:
 
 ```rust
-let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-let mut stream = Box::pin(agent.run_with_input(history, ctx, cancel.clone(), Some(rx)));
+struct GuardMiddleware;
 
-while let Some(ev) = stream.next().await {
-    if let LoopEvent::StepEnd { .. } = ev {
-        tx.send(Message::user_text("also check Tokyo")).ok(); // applied before next call
+#[async_trait]
+impl AgentMiddleware<MyCtx> for GuardMiddleware {
+    async fn on_tool_approve(&self, cx: &AgentCx<MyCtx>, call: &PendingToolCall)
+        -> Result<Approval, AgentError>
+    {
+        if is_dangerous(&call.name) {
+            // Ask the user via the app context; halt the run if they say no.
+            if cx.ctx().client.confirm(&call.name, &call.args).await {
+                Ok(Approval::Allow)
+            } else {
+                Ok(Approval::Stop { message: Some("user rejected".into()) })
+            }
+        } else {
+            Ok(Approval::Allow)
+        }
     }
 }
 ```
 
-`run(...)` is `run_with_input(..., None)`. Cancel mid-run with `cancel.cancel()`.
-
-## Tool approval (human-in-the-loop)
-
-`can_use_tool` runs before every tool call; `Ask` routes to `on_ask` (e.g. a
-human via your `Ctx`):
-
-```rust
-.can_use_tool(|name, args, _cx| Box::pin(async move {
-    if is_dangerous(name) { Permission::Ask } else { Permission::Allow }
-}))
-.on_ask(|name, args, cx| Box::pin(async move {
-    if cx.ctx().client.confirm(name, args).await { Permission::Allow }
-    else { Permission::Deny { reason: "rejected".into() } }
-}))
-```
-
-`Deny` synthesizes an `is_error` tool result (the tool never runs); the model sees
-the reason and can recover.
+`Deny { message }` feeds the reason to the model as a tool result and lets the loop
+continue. `Stop` halts the entire run.
 
 ## Skills (progressive disclosure)
 
-Only skill `name` + `description` enter the prompt; full bodies load on demand via
-the built-in `load_skill` / `search_skills` tools.
+Only skill `name` + `description` enter the system prompt; full bodies load on
+demand via the built-in `load_skill` / `search_skills` tools. Implement `SkillLoader`
+to source skills from anywhere — a database, a folder, a remote API:
 
 ```rust
-.skills(FsSkillLoader::new(".agents/skills"))   // <root>/<name>/SKILL.md
-```
-
-Bring your own source by implementing `SkillLoader` (DB, server, embedded):
-
-```rust
-impl SkillLoader<Ctx> for MyLoader {
-    fn list<'a>(&'a self, cx: &'a ToolCx<Ctx>) -> BoxFuture<'a, Result<Vec<SkillManifest>, AiError>> { … }
-    fn load<'a>(&'a self, name: &'a str, cx: &'a ToolCx<Ctx>) -> BoxFuture<'a, Result<SkillContent, AiError>> { … }
+#[async_trait]
+impl SkillLoader<MyCtx> for MyLoader {
+    async fn list(&self, ctx: &MyCtx) -> Result<Vec<Skill>, AgentError> {
+        Ok(ctx.db.list_skills().await?)
+    }
+    async fn load(&self, ctx: &MyCtx, id: &str) -> Result<SkillContent, AgentError> {
+        let body = ctx.db.load_skill(id).await?;
+        Ok(SkillContent { body, references: vec![] })
+    }
 }
+
+let mut agent = Agent::new(ctx).provider(provider).skills(MyLoader);
 ```
 
-## Context loaders
+## Conversation load / save
 
-Seed the system prompt / history from anywhere (file, DB, HTTP, RAG). Register
-many — all run before the loop and merge:
-
-```rust
-.context_loader(FsContextLoader::new("PROMPT.md"))
-.context_loader(MyRagLoader)        // impl ContextLoader<Ctx>
-```
+Seed the conversation and persist it via `AgentMiddleware::on_start` /
+`on_step_done` — no separate context-loader trait:
 
 ```rust
-impl ContextLoader<Ctx> for MyRagLoader {
-    fn load<'a>(&'a self, cx: &'a ToolCx<Ctx>) -> BoxFuture<'a, Result<LoadedContext, AiError>> {
-        Box::pin(async move { Ok(LoadedContext { system: Some(text), messages: vec![] }) })
+#[async_trait]
+impl AgentMiddleware<ReqCtx> for DbConversation {
+    async fn on_start(&self, cx: &mut AgentCx<ReqCtx>) -> Result<Flow, AgentError> {
+        let prior = cx.ctx().db.load(&cx.ctx().session).await?;
+        cx.messages_mut().splice(0..0, prior);
+        Ok(Flow::Continue)
+    }
+    async fn on_step_done(&self, cx: &mut AgentCx<ReqCtx>) -> Result<Flow, AgentError> {
+        cx.ctx().db.save(&cx.ctx().session, cx.messages()).await?;
+        Ok(Flow::Continue)
     }
 }
 ```
@@ -325,7 +295,7 @@ agent.register_tool_set(set);
 - **Caching**: keep a stable, append-only prefix; Anthropic gets explicit
   `cache_control` breakpoints, OpenAI auto-caches. Controlled by `CacheStrategy`
   (default `Auto`). Savings show up uniformly as `Usage::cache_read_tokens`.
-- **Cost**: set a `Pricing` table; each step's `LoopEvent::Usage` carries the
+- **Cost**: set a `Pricing` table; each step's `AgentEvent::StepEnd` carries the
   estimated dollar cost (a client-side estimate — don't bill from it).
 
 ```rust

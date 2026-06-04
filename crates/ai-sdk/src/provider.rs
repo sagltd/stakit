@@ -9,6 +9,8 @@
 //! tool-call argument fragments internally so a [`StreamEvent::ToolCall`] is
 //! only emitted once whole.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -76,9 +78,10 @@ pub enum ThinkingConfig {
 }
 
 /// Why generation stopped.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum StopReason {
     /// Natural end of the assistant turn.
+    #[default]
     EndTurn,
     /// Hit the `max_tokens` limit.
     MaxTokens,
@@ -122,7 +125,7 @@ pub struct ChatRequest {
     /// to pin one conversation to a single cache shard so a shared prefix keeps
     /// hitting across many concurrent users. `None` lets the provider route by
     /// content alone.
-    pub cache_key: Option<String>,
+    pub cache_key: Option<Arc<str>>,
     /// Raw per-provider passthrough merged into the request body.
     pub extra: serde_json::Map<String, Value>,
 }
@@ -179,8 +182,12 @@ pub enum StreamEvent {
         id: String,
         /// Tool name.
         name: String,
-        /// Parsed arguments.
-        input: Value,
+        /// Raw, unparsed JSON argument text exactly as the model emitted it.
+        ///
+        /// Parsing is deferred to the agent's dispatch so a single site decides
+        /// what malformed arguments mean (a tool error the model can retry),
+        /// rather than each provider silently coercing them to `{}`.
+        arguments: String,
     },
     /// Stream finished; carries the stop reason and final cumulative usage.
     End {
@@ -202,6 +209,23 @@ pub type EventStream = futures::stream::BoxStream<'static, Result<StreamEvent, P
 pub fn event_stream(events: Vec<Result<StreamEvent, ProviderError>>) -> EventStream {
     use futures::StreamExt as _;
     futures::stream::iter(events).boxed()
+}
+
+/// Parses the `Retry-After` response header (delta-seconds form) into a
+/// [`Duration`](std::time::Duration). HTTP-date forms and unparseable values
+/// yield `None`. Shared by the built-in providers when building a 429 error.
+#[cfg(any(feature = "claude", feature = "openai"))]
+pub(crate) fn parse_retry_after(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<std::time::Duration> {
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(std::time::Duration::from_secs(secs))
 }
 
 /// A chat-completion backend. Object-safe so the agent can hold

@@ -13,20 +13,40 @@ use crate::cache::{CacheStrategy, CacheTarget};
 use crate::message::{AssistantContent, Image, Message, Thinking, ToolResultPart, UserContent};
 use crate::provider::{
     ChatRequest, ChatResponse, EventStream, Provider, StopReason, StreamEvent, ThinkingConfig,
-    ToolChoice, ToolDef,
+    ToolChoice, ToolDef, parse_retry_after,
 };
 use crate::usage::Usage;
 use crate::{ProviderError, SystemPrompt};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Upper bound on a single un-terminated SSE line. A stream that never sends a
+/// newline would otherwise grow `buf` without bound; past this we bail with a
+/// decode error rather than buffering unboundedly.
+const MAX_SSE_LINE: usize = 1024 * 1024;
+/// Max in-flight tool-call buffers a stream may open. A hostile stream could
+/// otherwise allocate `content_block_start` entries without bound.
+const MAX_INFLIGHT_TOOLS: usize = 64;
+/// Max accumulated argument bytes for a single tool call. A hostile stream could
+/// otherwise grow one tool's argument buffer past the per-line SSE cap.
+const MAX_TOOL_ARGS: usize = 1024 * 1024;
 
 /// A handle to the Anthropic API. Cheap to clone; mints per-model handles.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClaudeClient {
     api_key: String,
     base_url: String,
     http: reqwest::Client,
+}
+
+// Hand-written so the API key never leaks through `{:?}` (logs, panics, tests).
+impl std::fmt::Debug for ClaudeClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaudeClient")
+            .field("api_key", &"[redacted]")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClaudeClient {
@@ -88,12 +108,13 @@ impl Provider for ClaudeModel {
             let body = build_body(&model, &request, false);
             let resp = self.send(body).await?;
             let status = resp.status();
+            let retry_after = parse_retry_after(resp.headers());
             let text = resp
                 .text()
                 .await
                 .map_err(|e| ProviderError::Transport(e.to_string()))?;
             if !status.is_success() {
-                return Err(api_error(status.as_u16(), &text));
+                return Err(api_error(status.as_u16(), &text, retry_after));
             }
             let value: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Decode {
                 err: e.to_string(),
@@ -113,12 +134,17 @@ impl Provider for ClaudeModel {
             let resp = self.send(body).await?;
             let status = resp.status();
             if !status.is_success() {
+                let retry_after = parse_retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
-                return Err(api_error(status.as_u16(), &text));
+                return Err(api_error(status.as_u16(), &text, retry_after));
             }
             let mut bytes = resp.bytes_stream();
             let stream = async_stream::stream! {
                 let mut buf = String::new();
+                // Bytes already scanned for a newline (the prefix is newline-free
+                // by the drain invariant below), so each chunk only scans the new
+                // tail — keeping the overflow guard O(1) amortized, not O(n²).
+                let mut scanned = 0usize;
                 let mut accum = Accum::default();
                 while let Some(chunk) = bytes.next().await {
                     let chunk = match chunk {
@@ -129,6 +155,14 @@ impl Provider for ClaudeModel {
                         }
                     };
                     buf.push_str(&String::from_utf8_lossy(&chunk));
+                    // Guard against an SSE stream that never terminates a line.
+                    if sse_line_overflow(&buf, scanned) {
+                        yield Err(ProviderError::Decode {
+                            err: format!("SSE line exceeded {MAX_SSE_LINE} bytes without a newline"),
+                            body: String::new(),
+                        });
+                        return;
+                    }
                     while let Some(nl) = buf.find('\n') {
                         let line: String = buf.drain(..=nl).collect();
                         let line = line.trim_end();
@@ -138,11 +172,22 @@ impl Provider for ClaudeModel {
                             continue;
                         }
                         if let Ok(event) = serde_json::from_str::<Value>(data) {
-                            for ev in accum.push(&event) {
-                                yield Ok(ev);
+                            match accum.push(&event) {
+                                Ok(evs) => {
+                                    for ev in evs {
+                                        yield Ok(ev);
+                                    }
+                                }
+                                Err(e) => {
+                                    yield Err(e);
+                                    return;
+                                }
                             }
                         }
                     }
+                    // After draining whole lines, the remainder holds no newline,
+                    // so it is fully scanned — the next chunk starts from its end.
+                    scanned = buf.len();
                 }
             };
             Ok(stream.boxed())
@@ -173,16 +218,42 @@ impl ClaudeModel {
     }
 }
 
-fn api_error(status: u16, body: &str) -> ProviderError {
-    let kind = serde_json::from_str::<Value>(body)
-        .ok()
+/// Builds an [`ProviderError::Api`] from a 4xx/5xx response.
+///
+/// Extracts only the provider's structured `error.type` / `error.message`; the
+/// raw `body` is never stored, since it can echo back request material
+/// (including the API key) and would surface via `Display` into the run
+/// outcome. When the body lacks the expected shape, falls back to a concise,
+/// safe message.
+fn api_error(status: u16, body: &str, retry_after: Option<std::time::Duration>) -> ProviderError {
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let kind = parsed
+        .as_ref()
         .and_then(|v| v["error"]["type"].as_str().map(ToOwned::to_owned))
         .unwrap_or_else(|| "api_error".to_owned());
+    let message = parsed
+        .as_ref()
+        .and_then(|v| v["error"]["message"].as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("provider error: {status} {kind}"));
     ProviderError::Api {
         status,
         kind,
-        message: body.to_owned(),
+        message,
+        retry_after,
     }
+}
+
+/// Whether the SSE buffer holds a single, still-unterminated line longer than
+/// [`MAX_SSE_LINE`] — i.e. the peer is streaming an unbounded line.
+///
+/// `scanned` is the length already known to be newline-free (the buffer prefix),
+/// so only the new tail is scanned. Given the caller's invariant that
+/// `buf[..scanned]` contains no newline, this is equivalent to
+/// `!buf.contains('\n') && buf.len() > MAX_SSE_LINE` but amortized O(1) per
+/// chunk instead of O(n) — the whole stream is scanned once, not per chunk.
+fn sse_line_overflow(buf: &str, scanned: usize) -> bool {
+    let tail = buf.get(scanned..).unwrap_or("");
+    !tail.contains('\n') && buf.len() > MAX_SSE_LINE
 }
 
 // --- request mapping -------------------------------------------------------
@@ -525,6 +596,10 @@ fn map_image(img: &Image) -> Value {
         Image::Url { url } => json!({ "type": "url", "url": &**url }),
         Image::Base64 { media_type, data } => {
             use base64::Engine as _;
+            // note: base64 is re-encoded on every step when the same inline image
+            // is replayed. Caching it would need an `OnceLock` inside
+            // `Image::Base64`, which breaks the enum's `PartialEq`/`Eq`/`Serialize`
+            // derives; prefer `Image::Url`/`Image::FileId` for repeated images.
             let b64 = base64::engine::general_purpose::STANDARD.encode(data);
             json!({ "type": "base64", "media_type": &**media_type, "data": b64 })
         }
@@ -562,8 +637,8 @@ fn parse_assistant_block(block: &Value) -> Option<AssistantContent> {
             block.get("text").and_then(Value::as_str)?.into(),
         )),
         "tool_use" => Some(AssistantContent::ToolUse {
-            id: block.get("id").and_then(Value::as_str)?.to_owned(),
-            name: block.get("name").and_then(Value::as_str)?.to_owned(),
+            id: block.get("id").and_then(Value::as_str)?.into(),
+            name: block.get("name").and_then(Value::as_str)?.into(),
             input: block.get("input").cloned().unwrap_or_else(|| json!({})),
         }),
         "thinking" => Some(AssistantContent::Thinking(Thinking::Visible {
@@ -571,18 +646,18 @@ fn parse_assistant_block(block: &Value) -> Option<AssistantContent> {
                 .get("thinking")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .to_owned(),
+                .into(),
             signature: block
                 .get("signature")
                 .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
+                .map(Into::into),
         })),
         "redacted_thinking" => Some(AssistantContent::Thinking(Thinking::Redacted {
             data: block
                 .get("data")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .to_owned(),
+                .into(),
         })),
         _ => None,
     }
@@ -631,18 +706,29 @@ struct ToolBuf {
 }
 
 impl Accum {
-    fn push(&mut self, event: &Value) -> Vec<StreamEvent> {
+    fn push(&mut self, event: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 if let Some(u) = event.get("message").and_then(|m| m.get("usage")) {
                     self.usage = map_usage(u);
                 }
-                vec![StreamEvent::Start { usage: self.usage }]
+                Ok(vec![StreamEvent::Start { usage: self.usage }])
             }
             Some("content_block_start") => {
                 if let Some(block) = event.get("content_block") {
                     if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                         if let Some(idx) = event.get("index").and_then(Value::as_u64) {
+                            // Bound in-flight tool buffers against a hostile stream.
+                            if !self.tools.contains_key(&idx)
+                                && self.tools.len() >= MAX_INFLIGHT_TOOLS
+                            {
+                                return Err(ProviderError::Decode {
+                                    err: format!(
+                                        "stream opened more than {MAX_INFLIGHT_TOOLS} concurrent tool calls"
+                                    ),
+                                    body: String::new(),
+                                });
+                            }
                             self.tools.insert(
                                 idx,
                                 ToolBuf {
@@ -662,24 +748,28 @@ impl Accum {
                         }
                     }
                 }
-                Vec::new()
+                Ok(Vec::new())
             }
             Some("content_block_delta") => self.on_delta(event),
             Some("content_block_stop") => {
                 let idx = event.get("index").and_then(Value::as_u64);
-                idx.and_then(|i| self.tools.remove(&i))
+                Ok(idx
+                    .and_then(|i| self.tools.remove(&i))
                     .map_or_else(Vec::new, |buf| {
-                        let input = if buf.json.trim().is_empty() {
-                            json!({})
+                        // Empty argument streams mean "no arguments"; normalize to
+                        // an empty object. Otherwise forward the raw text and let
+                        // the agent parse + validate it once at dispatch.
+                        let arguments = if buf.json.trim().is_empty() {
+                            "{}".to_owned()
                         } else {
-                            serde_json::from_str(&buf.json).unwrap_or_else(|_| json!({}))
+                            buf.json
                         };
                         vec![StreamEvent::ToolCall {
                             id: buf.id,
                             name: buf.name,
-                            input,
+                            arguments,
                         }]
-                    })
+                    }))
             }
             Some("message_delta") => {
                 if let Some(u) = event.get("usage") {
@@ -704,48 +794,58 @@ impl Accum {
                         .and_then(Value::as_str);
                     self.stop = Some(map_stop_reason(reason, seq));
                 }
-                Vec::new()
+                Ok(Vec::new())
             }
-            Some("message_stop") => vec![StreamEvent::End {
+            Some("message_stop") => Ok(vec![StreamEvent::End {
                 stop: self.stop.clone().unwrap_or(StopReason::EndTurn),
                 usage: self.usage,
-            }],
-            _ => Vec::new(),
+            }]),
+            _ => Ok(Vec::new()),
         }
     }
 
-    fn on_delta(&mut self, event: &Value) -> Vec<StreamEvent> {
+    fn on_delta(&mut self, event: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
         let Some(delta) = event.get("delta") else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         match delta.get("type").and_then(Value::as_str) {
-            Some("text_delta") => delta
+            Some("text_delta") => Ok(delta
                 .get("text")
                 .and_then(Value::as_str)
                 .map(|t| vec![StreamEvent::TextDelta(t.to_owned())])
-                .unwrap_or_default(),
-            Some("thinking_delta") => delta
+                .unwrap_or_default()),
+            Some("thinking_delta") => Ok(delta
                 .get("thinking")
                 .and_then(Value::as_str)
                 .map(|t| vec![StreamEvent::ReasoningDelta(t.to_owned())])
-                .unwrap_or_default(),
-            Some("signature_delta") => delta
+                .unwrap_or_default()),
+            Some("signature_delta") => Ok(delta
                 .get("signature")
                 .and_then(Value::as_str)
                 .map(|s| vec![StreamEvent::SignatureDelta(s.to_owned())])
-                .unwrap_or_default(),
+                .unwrap_or_default()),
             Some("input_json_delta") => {
                 if let (Some(idx), Some(partial)) = (
                     event.get("index").and_then(Value::as_u64),
                     delta.get("partial_json").and_then(Value::as_str),
                 ) {
                     if let Some(buf) = self.tools.get_mut(&idx) {
+                        // Bound one tool's argument buffer against a hostile stream
+                        // (this path bypasses the per-line SSE cap).
+                        if buf.json.len().saturating_add(partial.len()) > MAX_TOOL_ARGS {
+                            return Err(ProviderError::Decode {
+                                err: format!(
+                                    "tool-call arguments exceeded {MAX_TOOL_ARGS} bytes"
+                                ),
+                                body: String::new(),
+                            });
+                        }
                         buf.json.push_str(partial);
                     }
                 }
-                Vec::new()
+                Ok(Vec::new())
             }
-            _ => Vec::new(),
+            _ => Ok(Vec::new()),
         }
     }
 }
@@ -843,7 +943,7 @@ mod tests {
         ];
         let mut out = Vec::new();
         for e in &events {
-            out.extend(accum.push(e));
+            out.extend(accum.push(e).expect("push ok"));
         }
         assert!(matches!(out[0], StreamEvent::Start { .. }));
         let tool_call = out
@@ -855,7 +955,7 @@ mod tests {
             StreamEvent::ToolCall {
                 id: "toolu_1".into(),
                 name: "wx".into(),
-                input: json!({ "city": "Paris" }),
+                arguments: "{\"city\":\"Paris\"}".to_owned(),
             }
         );
         let StreamEvent::End { stop, usage } = out.last().expect("end") else {
@@ -874,5 +974,73 @@ mod tests {
             "delta": { "type": "text_delta", "text": "Hel" }
         }));
         assert_eq!(evs, vec![StreamEvent::TextDelta("Hel".into())]);
+    }
+
+    #[test]
+    fn api_error_does_not_surface_raw_body_secrets() {
+        // The raw body echoes back request material (here a fake key); only the
+        // provider's structured error.message must reach Display.
+        let body = json!({
+            "error": {
+                "type": "invalid_request_error",
+                "message": "model not found"
+            },
+            "request_echo": { "x-api-key": "sk-secret-LEAK" }
+        })
+        .to_string();
+        let err = api_error(400, &body, None);
+        let surfaced = err.to_string();
+        assert!(
+            !surfaced.contains("sk-secret-LEAK"),
+            "raw body leaked into Display: {surfaced}"
+        );
+        assert!(surfaced.contains("model not found"), "{surfaced}");
+    }
+
+    #[test]
+    fn api_error_falls_back_to_safe_message_for_opaque_body() {
+        // An HTML/plain body (no JSON error.message) must not be surfaced verbatim.
+        let err = api_error(502, "<html>sk-secret-LEAK gateway</html>", None);
+        let surfaced = err.to_string();
+        assert!(!surfaced.contains("sk-secret-LEAK"), "{surfaced}");
+        assert!(surfaced.contains("502"), "{surfaced}");
+    }
+
+    #[test]
+    fn client_debug_redacts_api_key() {
+        let client = ClaudeClient::new("sk-secret-LEAK");
+        let dbg = format!("{client:?}");
+        assert!(!dbg.contains("sk-secret-LEAK"), "{dbg}");
+        assert!(dbg.contains("[redacted]"), "{dbg}");
+        // The model handle embeds the client and must inherit redaction.
+        let model = client.model("claude-opus-4-8");
+        let dbg = format!("{model:?}");
+        assert!(!dbg.contains("sk-secret-LEAK"), "{dbg}");
+    }
+
+    #[test]
+    fn sse_line_overflow_trips_only_past_the_cap_without_newline() {
+        // A short un-terminated line is fine.
+        assert!(!sse_line_overflow("data: partial", 0));
+        // A huge line with a newline has been delimited — not an overflow.
+        let mut delimited = "x".repeat(MAX_SSE_LINE + 10);
+        delimited.push('\n');
+        assert!(!sse_line_overflow(&delimited, 0));
+        // A huge line with no newline is the pathological case we guard.
+        assert!(sse_line_overflow(&"x".repeat(MAX_SSE_LINE + 1), 0));
+    }
+
+    #[test]
+    fn sse_line_overflow_scans_only_the_unscanned_tail() {
+        // A newline lies in the already-scanned prefix; the tail is newline-free
+        // and over the cap. With the prefix excluded this still must NOT trip,
+        // matching `!buf.contains('\n')` under the caller's drain invariant.
+        let mut buf = String::from("\n");
+        buf.push_str(&"x".repeat(MAX_SSE_LINE + 1));
+        // scanned = 0 sees the leading newline → no overflow.
+        assert!(!sse_line_overflow(&buf, 0));
+        // Even scanning only the tail (after the newline), the result is the same
+        // boolean the O(n) form would have produced for this whole buffer.
+        assert!(sse_line_overflow(&buf, 1));
     }
 }

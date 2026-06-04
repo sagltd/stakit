@@ -243,6 +243,9 @@ fn parse_column(
     let mut pk = false;
     let mut unique = false;
     let mut index = false;
+    let mut index_method = None;
+    let mut opclass = None;
+    let mut generated = None;
     let mut nullable = unwrap_generic(&field.ty, "Option").is_some();
     let mut default = None;
     let mut explicit_type = None;
@@ -260,18 +263,31 @@ fn parse_column(
                 unique = true;
             } else if meta.path.is_ident("index") {
                 index = true;
+                // `index = "hnsw"` is the access-method value form.
+                if let Ok(value) = meta.value() {
+                    index_method = Some(value.parse::<syn::LitStr>()?.value());
+                }
+            } else if meta.path.is_ident("index_method") {
+                index_method = Some(meta.value()?.parse::<syn::LitStr>()?.value());
+            } else if meta.path.is_ident("opclass") {
+                opclass = Some(meta.value()?.parse::<syn::LitStr>()?.value());
             } else if meta.path.is_ident("nullable") {
                 nullable = true;
             } else if meta.path.is_ident("name") {
                 name = meta.value()?.parse::<syn::LitStr>()?.value();
             } else if meta.path.is_ident("default") {
                 default = Some(meta.value()?.parse::<syn::LitStr>()?.value());
+            } else if meta.path.is_ident("generated") {
+                generated = Some(meta.value()?.parse::<syn::LitStr>()?.value());
             } else if meta.path.is_ident("sql_type") {
                 explicit_type = Some(meta.value()?.parse::<syn::LitStr>()?.value());
             } else if meta.path.is_ident("references") {
                 references = Some(parse_reference(&meta, table_of_ident)?);
             } else if meta.path.is_ident("on_delete") {
                 on_delete = Some(meta.value()?.parse::<syn::LitStr>()?.value());
+            } else {
+                // Match the derive: an unknown key must fail, not be dropped.
+                return Err(meta.error("unknown #[column(...)] attribute"));
             }
             Ok(())
         })
@@ -280,6 +296,33 @@ fn parse_column(
 
     if let (Some(fk), Some(action)) = (references.as_mut(), on_delete) {
         fk.on_delete = action;
+    }
+
+    // Mirror the derive's compile-time checks so the CLI rejects the same source the
+    // macro would (otherwise it could emit DDL the compiler refuses to build against).
+    if !index && (index_method.is_some() || opclass.is_some()) {
+        return Err(format!(
+            "{name}: index_method/opclass require #[column(index)] on the same column"
+        ));
+    }
+    if let Some(method) = &index_method {
+        if !is_sql_identifier(method, false) {
+            return Err(format!(
+                "{name}: index_method must be a bare SQL identifier"
+            ));
+        }
+    }
+    if let Some(opclass) = &opclass {
+        if !is_sql_identifier(opclass, true) {
+            return Err(format!(
+                "{name}: opclass must be a (optionally schema-qualified) SQL identifier"
+            ));
+        }
+    }
+    if generated.is_some() && default.is_some() {
+        return Err(format!(
+            "{name}: a #[column(generated = ...)] column cannot also have a default"
+        ));
     }
 
     let base = unwrap_generic(&field.ty, "Option").unwrap_or(&field.ty);
@@ -297,6 +340,9 @@ fn parse_column(
         pk,
         unique,
         index,
+        index_method,
+        opclass,
+        generated,
         default,
         references,
     })
@@ -315,6 +361,21 @@ fn parse_reference(
         table,
         column,
         on_delete: "no action".to_owned(),
+    })
+}
+
+/// Whether `value` is a SQL identifier: a non-empty run of ASCII letters, digits, and
+/// underscores starting with a letter or underscore. When `allow_qualified`, a single
+/// `schema.name` qualification is accepted (each part validated the same way).
+fn is_sql_identifier(value: &str, allow_qualified: bool) -> bool {
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.len() > 1 && !allow_qualified {
+        return false;
+    }
+    parts.iter().all(|part| {
+        let mut chars = part.chars();
+        matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
     })
 }
 
@@ -446,6 +507,97 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         let error = result.unwrap_err();
         assert!(error.contains("module `nope`"), "got: {error}");
+    }
+
+    #[test]
+    fn parses_index_method_and_opclass() {
+        let source = r#"
+            #[derive(Table)]
+            #[table(name = "docs")]
+            struct Doc {
+                #[column(pk)] id: i64,
+                #[column(sql_type = "vector(3)", index, index_method = "hnsw", opclass = "vector_cosine_ops")]
+                embedding: Vector,
+            }
+        "#;
+        let schema = parse_schema(source).unwrap();
+        let embedding = schema.table("docs").unwrap().column("embedding").unwrap();
+        assert!(embedding.index);
+        assert_eq!(embedding.index_method.as_deref(), Some("hnsw"));
+        assert_eq!(embedding.opclass.as_deref(), Some("vector_cosine_ops"));
+    }
+
+    #[test]
+    fn index_value_form_sets_method() {
+        let source = r#"
+            #[derive(Table)]
+            #[table(name = "places")]
+            struct Place {
+                #[column(pk)] id: i64,
+                #[column(sql_type = "geometry", index = "gist")] location: GeoPoint,
+            }
+        "#;
+        let schema = parse_schema(source).unwrap();
+        let location = schema.table("places").unwrap().column("location").unwrap();
+        assert_eq!(location.index_method.as_deref(), Some("gist"));
+    }
+
+    #[test]
+    fn unknown_column_attribute_is_rejected() {
+        let source = r#"
+            #[derive(Table)]
+            #[table(name = "docs")]
+            struct Doc {
+                #[column(pk)] id: i64,
+                #[column(index_methd = "hnsw")] body: String,
+            }
+        "#;
+        let error = parse_schema(source).unwrap_err();
+        assert!(error.contains("unknown"), "got: {error}");
+    }
+
+    #[test]
+    fn opclass_without_index_is_rejected() {
+        let source = r#"
+            #[derive(Table)]
+            #[table(name = "docs")]
+            struct Doc {
+                #[column(pk)] id: i64,
+                #[column(opclass = "vector_cosine_ops")] embedding: Vector,
+            }
+        "#;
+        let error = parse_schema(source).unwrap_err();
+        assert!(error.contains("require #[column(index)]"), "got: {error}");
+    }
+
+    #[test]
+    fn generated_with_default_is_rejected() {
+        let source = r#"
+            #[derive(Table)]
+            #[table(name = "docs")]
+            struct Doc {
+                #[column(pk)] id: i64,
+                #[column(sql_type = "tsvector", generated = "to_tsvector('english', body)", default = "''")]
+                body_tsv: String,
+            }
+        "#;
+        let error = parse_schema(source).unwrap_err();
+        assert!(error.contains("cannot also have a default"), "got: {error}");
+    }
+
+    #[test]
+    fn index_method_with_sql_breakout_is_rejected() {
+        let source = r#"
+            #[derive(Table)]
+            #[table(name = "docs")]
+            struct Doc {
+                #[column(pk)] id: i64,
+                #[column(sql_type = "vector(3)", index, index_method = "gin); drop table users; --")]
+                embedding: Vector,
+            }
+        "#;
+        let error = parse_schema(source).unwrap_err();
+        assert!(error.contains("bare SQL identifier"), "got: {error}");
     }
 
     #[test]

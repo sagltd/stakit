@@ -72,7 +72,7 @@ impl Provider for TaggedProvider {
                     Ok(StreamEvent::ToolCall {
                         id: "noop1".into(),
                         name: "noop".into(),
-                        input: serde_json::json!({}),
+                        arguments: "{}".into(),
                     }),
                     Ok(StreamEvent::End {
                         stop: StopReason::ToolUse,

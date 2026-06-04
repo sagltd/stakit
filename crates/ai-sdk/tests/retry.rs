@@ -110,7 +110,51 @@ impl Provider for FatalProvider {
                 status: 400,
                 kind: "invalid_request_error".into(),
                 message: "bad request".into(),
+                retry_after: None,
             })
+        })
+    }
+}
+
+// ── RateLimitedOnce: a 429 with Retry-After on the first call, then success ───
+
+struct RateLimitedOnce {
+    calls: Arc<AtomicU32>,
+    retry_after: Duration,
+}
+
+impl Provider for RateLimitedOnce {
+    #[allow(
+        clippy::unnecessary_literal_bound,
+        reason = "trait method must return &str"
+    )]
+    fn model_id(&self) -> &str {
+        "ratelimited"
+    }
+
+    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Cancelled) })
+    }
+
+    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let retry_after = self.retry_after;
+        Box::pin(async move {
+            if n == 0 {
+                return Err(ProviderError::Api {
+                    status: 429,
+                    kind: "rate_limit_error".into(),
+                    message: "slow down".into(),
+                    retry_after: Some(retry_after),
+                });
+            }
+            Ok(event_stream(vec![
+                Ok(StreamEvent::TextDelta("recovered".into())),
+                Ok(StreamEvent::End {
+                    stop: StopReason::EndTurn,
+                    usage: Usage::default(),
+                }),
+            ]))
         })
     }
 }
@@ -202,6 +246,42 @@ async fn fatal_4xx_not_retried() {
         calls.load(Ordering::SeqCst),
         1,
         "fatal 4xx must not be retried — expected exactly 1 call"
+    );
+}
+
+/// A 429 carrying `Retry-After` must delay the retry by at least that long.
+///
+/// The server asks for 600 ms — well above the default 250 ms first backoff —
+/// so the loop must wait ~600 ms before the (successful) retry. Real wall-clock
+/// (no `tokio/test-util`), kept short to stay fast.
+#[tokio::test]
+async fn retry_after_is_honored_on_rate_limit() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let mut agent = Agent::new(())
+        .provider(RateLimitedOnce {
+            calls: Arc::clone(&calls),
+            retry_after: Duration::from_millis(600),
+        })
+        .model("ratelimited")
+        .with_retries(2)
+        .with_context(vec![Message::user("hi")]);
+
+    let start = std::time::Instant::now();
+    let out = agent.run().await.expect("outcome");
+    let elapsed = start.elapsed();
+
+    assert_eq!(out.text, "recovered");
+    assert!(
+        matches!(out.finish, Finish::EndTurn),
+        "expected EndTurn after honoring Retry-After, got {:?}",
+        out.finish
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "one 429 + one success");
+    // Must have waited at least most of the server-requested delay (default
+    // backoff alone would be only 250 ms, so >550 ms proves Retry-After won).
+    assert!(
+        elapsed >= Duration::from_millis(550),
+        "expected to wait ~600ms for Retry-After, waited {elapsed:?}"
     );
 }
 

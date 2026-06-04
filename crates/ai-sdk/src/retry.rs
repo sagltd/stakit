@@ -56,6 +56,21 @@ impl RetryPolicy {
             .saturating_mul(factor)
             .min(self.max_backoff)
     }
+
+    /// The delay to wait before retry attempt `n` (0-based) given the failure's
+    /// classification. Honors a server-provided `Retry-After` for rate limits by
+    /// taking the larger of it and the exponential [`backoff`](Self::backoff), so
+    /// a 429 is never retried sooner than the server asked.
+    #[must_use]
+    pub fn retry_delay(&self, n: u32, classification: &Retryable) -> Duration {
+        let backoff = self.backoff(n);
+        match classification {
+            Retryable::RateLimited {
+                retry_after: Some(after),
+            } => backoff.max(*after),
+            _ => backoff,
+        }
+    }
 }
 
 /// Classify a provider error for retry decisions.
@@ -70,9 +85,13 @@ impl RetryPolicy {
 pub const fn classify(err: &ProviderError) -> Retryable {
     match err {
         ProviderError::Transport(_) => Retryable::Transient,
-        ProviderError::Api { status, .. } if *status == 429 => {
-            Retryable::RateLimited { retry_after: None }
-        }
+        ProviderError::Api {
+            status,
+            retry_after,
+            ..
+        } if *status == 429 => Retryable::RateLimited {
+            retry_after: *retry_after,
+        },
         ProviderError::Api { status, .. } if *status >= 500 => Retryable::Transient,
         // Cancelled, 4xx≠429, Decode, InvalidArgument — do not retry
         _ => Retryable::Fatal,
@@ -105,10 +124,27 @@ mod tests {
             status: 429,
             kind: "rate_limit_error".into(),
             message: "too many requests".into(),
+            retry_after: None,
         };
         assert!(matches!(
             classify(&err),
             Retryable::RateLimited { retry_after: None }
+        ));
+    }
+
+    #[test]
+    fn classify_429_surfaces_retry_after() {
+        let err = ProviderError::Api {
+            status: 429,
+            kind: "rate_limit_error".into(),
+            message: "too many requests".into(),
+            retry_after: Some(Duration::from_secs(2)),
+        };
+        assert!(matches!(
+            classify(&err),
+            Retryable::RateLimited {
+                retry_after: Some(d)
+            } if d == Duration::from_secs(2)
         ));
     }
 
@@ -118,6 +154,7 @@ mod tests {
             status: 503,
             kind: "overloaded_error".into(),
             message: "service unavailable".into(),
+            retry_after: None,
         };
         assert!(matches!(classify(&err), Retryable::Transient));
     }
@@ -128,6 +165,7 @@ mod tests {
             status: 400,
             kind: "invalid_request_error".into(),
             message: "bad request".into(),
+            retry_after: None,
         };
         assert!(matches!(classify(&err), Retryable::Fatal));
     }
@@ -154,5 +192,37 @@ mod tests {
         assert_eq!(p.backoff(1), Duration::from_millis(500));
         assert_eq!(p.backoff(2), Duration::from_secs(1));
         assert_eq!(p.backoff(100), p.max_backoff);
+    }
+
+    #[test]
+    fn retry_delay_honors_retry_after_over_backoff() {
+        let p = RetryPolicy::default();
+        // backoff(0) is 250ms; a 2s Retry-After must win.
+        let delay = p.retry_delay(
+            0,
+            &Retryable::RateLimited {
+                retry_after: Some(Duration::from_secs(2)),
+            },
+        );
+        assert_eq!(delay, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn retry_delay_uses_backoff_when_retry_after_smaller() {
+        let p = RetryPolicy::default();
+        // backoff(2) is 1s; a tiny Retry-After must not shrink the delay.
+        let delay = p.retry_delay(
+            2,
+            &Retryable::RateLimited {
+                retry_after: Some(Duration::from_millis(10)),
+            },
+        );
+        assert_eq!(delay, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn retry_delay_falls_back_to_backoff_for_transient() {
+        let p = RetryPolicy::default();
+        assert_eq!(p.retry_delay(1, &Retryable::Transient), p.backoff(1));
     }
 }

@@ -92,7 +92,7 @@ impl Provider for ScriptedProvider {
                     Ok(StreamEvent::ToolCall {
                         id: "t1".into(),
                         name: "echo".into(),
-                        input: serde_json::json!({ "text": "hi" }),
+                        arguments: r#"{ "text": "hi" }"#.into(),
                     }),
                     Ok(StreamEvent::End {
                         stop: StopReason::ToolUse,
@@ -342,12 +342,12 @@ impl Provider for ParallelProvider {
                     Ok(StreamEvent::ToolCall {
                         id: "a".into(),
                         name: "barrier".into(),
-                        input: serde_json::json!({}),
+                        arguments: "{}".into(),
                     }),
                     Ok(StreamEvent::ToolCall {
                         id: "b".into(),
                         name: "barrier".into(),
-                        input: serde_json::json!({}),
+                        arguments: "{}".into(),
                     }),
                     Ok(StreamEvent::End {
                         stop: StopReason::ToolUse,
@@ -492,4 +492,385 @@ async fn provider_sets_default_model() {
         calls: Arc::new(AtomicU32::new(0)),
     });
     assert_eq!(agent.current_model(), "scripted");
+}
+
+// ── Step cap: a tool-looping model stops at exactly DEFAULT_MAX_STEPS ────────
+
+/// The library's default step cap. Kept in sync with `agent::DEFAULT_MAX_STEPS`;
+/// asserted here so the loop runs exactly this many model calls (no off-by-one).
+const DEFAULT_MAX_STEPS: u32 = 16;
+
+/// Always emits a tool call (never ends its turn), forcing the step cap to fire.
+#[derive(Clone)]
+struct AlwaysToolProvider {
+    calls: Arc<AtomicU32>,
+}
+
+impl Provider for AlwaysToolProvider {
+    #[allow(
+        clippy::unnecessary_literal_bound,
+        reason = "trait method must return &str"
+    )]
+    fn model_id(&self) -> &str {
+        "always"
+    }
+    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Cancelled) })
+    }
+    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            Ok(futures::stream::iter(vec![
+                Ok(StreamEvent::ToolCall {
+                    id: "x".into(),
+                    name: "echo".into(),
+                    arguments: r#"{"text":"x"}"#.into(),
+                }),
+                Ok(StreamEvent::End {
+                    stop: StopReason::ToolUse,
+                    usage: Usage::default(),
+                }),
+            ])
+            .boxed())
+        })
+    }
+}
+
+#[tokio::test]
+async fn step_cap_runs_exactly_default_max_steps() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let mut agent = Agent::new(())
+        .provider(AlwaysToolProvider {
+            calls: Arc::clone(&calls),
+        })
+        .model("always")
+        .register_tool(EchoTool)
+        .with_context(vec![Message::user("hi")]);
+    let out = agent.run().await.expect("outcome");
+
+    // Exactly DEFAULT_MAX_STEPS model calls and steps — no off-by-one.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        DEFAULT_MAX_STEPS,
+        "provider must be called exactly DEFAULT_MAX_STEPS times"
+    );
+    assert_eq!(out.steps, DEFAULT_MAX_STEPS);
+    assert!(
+        matches!(
+            out.finish,
+            Finish::Limit(stakit_ai_sdk::StopCond::StepCountIs(n)) if n == DEFAULT_MAX_STEPS
+        ),
+        "expected Finish::Limit(StepCountIs({DEFAULT_MAX_STEPS})), got {:?}",
+        out.finish
+    );
+}
+
+// ── Malformed tool arguments → ToolOutcome::Error, never a silent {} call ────
+
+/// Records every argument set its tool body actually received (to prove a
+/// malformed-args call never reaches the body).
+#[derive(Clone, Default)]
+struct ArgSpy {
+    seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+#[derive(serde::Deserialize, Model, JsonSchema)]
+struct AnyArgs {
+    /// A required string field.
+    text: String,
+}
+
+struct SpyTool {
+    spy: ArgSpy,
+}
+
+impl Tool<()> for SpyTool {
+    type Args = AnyArgs;
+    type Output = String;
+
+    fn name(&self) -> &'static str {
+        "spy"
+    }
+    fn description(&self) -> &'static str {
+        "Records the args it was called with"
+    }
+    fn run<'a>(
+        &'a self,
+        _cx: &'a ToolCx<()>,
+        args: Self::Args,
+    ) -> BoxFuture<'a, Result<Self::Output, ToolError>> {
+        let spy = self.spy.clone();
+        Box::pin(async move {
+            spy.seen
+                .lock()
+                .unwrap()
+                .push(serde_json::json!({ "text": args.text }));
+            Ok("ok".into())
+        })
+    }
+}
+
+/// Emits a tool call whose argument text is invalid JSON on the first step.
+#[derive(Clone)]
+struct MalformedArgsProvider {
+    calls: Arc<AtomicU32>,
+}
+
+impl Provider for MalformedArgsProvider {
+    #[allow(
+        clippy::unnecessary_literal_bound,
+        reason = "trait method must return &str"
+    )]
+    fn model_id(&self) -> &str {
+        "malformed"
+    }
+    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Cancelled) })
+    }
+    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let events = if n == 0 {
+                vec![
+                    // Truncated / invalid JSON — must NOT become `{}` silently.
+                    Ok(StreamEvent::ToolCall {
+                        id: "bad".into(),
+                        name: "spy".into(),
+                        arguments: r#"{"text": "oo"#.into(),
+                    }),
+                    Ok(StreamEvent::End {
+                        stop: StopReason::ToolUse,
+                        usage: Usage::default(),
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::End {
+                        stop: StopReason::EndTurn,
+                        usage: Usage::default(),
+                    }),
+                ]
+            };
+            Ok(futures::stream::iter(events).boxed())
+        })
+    }
+}
+
+#[tokio::test]
+async fn malformed_tool_args_yield_error_not_empty_call() {
+    let spy = ArgSpy::default();
+    let mut agent = Agent::new(())
+        .provider(MalformedArgsProvider {
+            calls: Arc::new(AtomicU32::new(0)),
+        })
+        .model("malformed")
+        .register_tool(SpyTool { spy: spy.clone() })
+        .with_context(vec![Message::user("hi")]);
+
+    let mut run = agent.run();
+    let mut tool_result = None;
+    while let Some(ev) = run.next().await {
+        if let AgentEvent::ToolResult { result, .. } = ev {
+            tool_result = Some(result);
+        }
+    }
+
+    match tool_result.expect("a tool result was produced") {
+        ToolOutcome::Error(msg) => assert!(
+            msg.contains("malformed tool arguments"),
+            "expected a malformed-args error, got: {msg}"
+        ),
+        other => panic!("expected ToolOutcome::Error, got {other:?}"),
+    }
+    // The tool body must never have been invoked with coerced `{}` args.
+    assert!(
+        spy.seen.lock().unwrap().is_empty(),
+        "tool body must not be called when arguments are malformed"
+    );
+}
+
+// ── Live streaming: deltas reach the host as they are produced ───────────────
+
+/// Emits text deltas one at a time, bumping a shared counter as each leaves the
+/// provider. The consumer compares "how many the provider has produced" against
+/// "how many it has received" at the moment of the first delta — proving the
+/// loop forwards each event live, not buffered until the turn ends.
+#[derive(Clone)]
+struct DrippleProvider {
+    produced: Arc<AtomicU32>,
+}
+
+impl Provider for DrippleProvider {
+    #[allow(
+        clippy::unnecessary_literal_bound,
+        reason = "trait method must return &str"
+    )]
+    fn model_id(&self) -> &str {
+        "ripple"
+    }
+    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Cancelled) })
+    }
+    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
+        let produced = Arc::clone(&self.produced);
+        Box::pin(async move {
+            let s = async_stream::stream! {
+                for part in ["a", "b", "c"] {
+                    // Yield so the consumer can run between each emission; a
+                    // buffered loop would still drain all three before the host
+                    // sees the first one.
+                    tokio::task::yield_now().await;
+                    produced.fetch_add(1, Ordering::SeqCst);
+                    yield Ok(StreamEvent::TextDelta(part.into()));
+                }
+                produced.fetch_add(1, Ordering::SeqCst);
+                yield Ok(StreamEvent::End {
+                    stop: StopReason::EndTurn,
+                    usage: Usage::default(),
+                });
+            };
+            Ok(s.boxed())
+        })
+    }
+}
+
+#[tokio::test]
+async fn streaming_deltas_are_yielded_live_and_in_order() {
+    let produced = Arc::new(AtomicU32::new(0));
+    let mut agent = Agent::new(())
+        .provider(DrippleProvider {
+            produced: Arc::clone(&produced),
+        })
+        .model("ripple")
+        .with_context(vec![Message::user("hi")]);
+
+    let mut run = agent.run();
+    let mut deltas = Vec::new();
+    let mut produced_at_first_delta = None;
+    let mut delta_count_at_step_end = None;
+    let mut assembled = String::new();
+    while let Some(ev) = run.next().await {
+        match ev {
+            AgentEvent::MessageDelta(d) => {
+                if produced_at_first_delta.is_none() {
+                    produced_at_first_delta = Some(produced.load(Ordering::SeqCst));
+                }
+                assembled.push_str(&d);
+                deltas.push(d);
+            }
+            AgentEvent::StepEnd { text, .. } => {
+                delta_count_at_step_end = Some(deltas.len());
+                assert_eq!(text, "abc", "StepEnd text is the assembled deltas");
+            }
+            _ => {}
+        }
+    }
+
+    // Liveness: when the host saw the first delta, the provider had produced
+    // exactly one event. A buffered loop would have drained all four (a, b, c,
+    // End) before yielding anything, so this would be 4.
+    assert_eq!(
+        produced_at_first_delta,
+        Some(1),
+        "first delta must reach the host before the provider produces the rest"
+    );
+    assert_eq!(deltas, vec!["a", "b", "c"], "deltas must arrive in order");
+    assert_eq!(assembled, "abc");
+    assert_eq!(delta_count_at_step_end, Some(3));
+}
+
+// ── load_skill with a missing id short-circuits to an error ──────────────────
+
+struct EmptyLoader;
+
+#[async_trait::async_trait]
+impl stakit_ai_sdk::SkillLoader<()> for EmptyLoader {
+    async fn list(&self, _ctx: &()) -> Result<Vec<stakit_ai_sdk::Skill>, AgentError> {
+        Ok(vec![stakit_ai_sdk::Skill {
+            id: "s1".into(),
+            name: "Skill One".into(),
+            description: "first".into(),
+        }])
+    }
+    async fn load(&self, _ctx: &(), id: &str) -> Result<stakit_ai_sdk::SkillContent, AgentError> {
+        // Should never be reached with an empty id.
+        assert!(!id.is_empty(), "loader must not be called with an empty id");
+        Ok(stakit_ai_sdk::SkillContent {
+            body: format!("body for {id}"),
+            references: Vec::new(),
+        })
+    }
+}
+
+/// Calls `load_skill` with no `id` argument on the first step.
+#[derive(Clone)]
+struct LoadSkillNoIdProvider {
+    calls: Arc<AtomicU32>,
+}
+
+impl Provider for LoadSkillNoIdProvider {
+    #[allow(
+        clippy::unnecessary_literal_bound,
+        reason = "trait method must return &str"
+    )]
+    fn model_id(&self) -> &str {
+        "loadskill"
+    }
+    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Cancelled) })
+    }
+    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let events = if n == 0 {
+                vec![
+                    Ok(StreamEvent::ToolCall {
+                        id: "ls".into(),
+                        name: "load_skill".into(),
+                        arguments: "{}".into(),
+                    }),
+                    Ok(StreamEvent::End {
+                        stop: StopReason::ToolUse,
+                        usage: Usage::default(),
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::End {
+                        stop: StopReason::EndTurn,
+                        usage: Usage::default(),
+                    }),
+                ]
+            };
+            Ok(futures::stream::iter(events).boxed())
+        })
+    }
+}
+
+#[tokio::test]
+async fn load_skill_without_id_errors() {
+    let mut agent = Agent::new(())
+        .provider(LoadSkillNoIdProvider {
+            calls: Arc::new(AtomicU32::new(0)),
+        })
+        .model("loadskill")
+        .skills(EmptyLoader)
+        .with_context(vec![Message::user("hi")]);
+
+    let mut run = agent.run();
+    let mut tool_result = None;
+    while let Some(ev) = run.next().await {
+        if let AgentEvent::ToolResult { result, .. } = ev {
+            tool_result = Some(result);
+        }
+    }
+    match tool_result.expect("a tool result was produced") {
+        ToolOutcome::Error(msg) => assert!(
+            msg.contains("missing required argument: id"),
+            "expected a missing-id error, got: {msg}"
+        ),
+        other => panic!("expected ToolOutcome::Error, got {other:?}"),
+    }
 }

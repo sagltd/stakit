@@ -493,6 +493,78 @@ struct PgArticle {
     body: String,
 }
 
+// ----- stored-tsvector FTS against real Postgres (GIN-backed, no recompute) -----
+
+#[derive(Table, Debug)]
+#[table(name = "pg_fts_articles")]
+#[allow(dead_code)]
+struct PgFtsArticle {
+    #[column(pk)]
+    id: i64,
+    body: String,
+    #[column(
+        sql_type = "tsvector",
+        generated = "to_tsvector('english', body)",
+        index = "gin"
+    )]
+    body_tsv: String,
+}
+
+#[tokio::test]
+async fn stored_tsvector_search_matches_on_postgres() {
+    let (postgres, db) = setup().await;
+    // The shape the CLI now emits: a generated stored tsvector column + a GIN index.
+    db.raw(
+        "create table pg_fts_articles (id bigint primary key, body text not null, \
+         body_tsv tsvector generated always as (to_tsvector('english', body)) stored)",
+    )
+    .exec()
+    .await
+    .expect("create pg_fts_articles");
+    db.raw("create index idx_pg_fts_articles_body_tsv on pg_fts_articles using gin (body_tsv)")
+        .exec()
+        .await
+        .expect("create gin index");
+
+    // `body_tsv` is generated, so it is absent from the insert companion.
+    db.insert(PgFtsArticleNew {
+        id: 1,
+        body: "fast systems programming language".to_owned(),
+    })
+    .exec()
+    .await
+    .unwrap();
+    db.insert(PgFtsArticleNew {
+        id: 2,
+        body: "a recipe for tomato soup".to_owned(),
+    })
+    .exec()
+    .await
+    .unwrap();
+
+    // Match the stored tsvector directly — no query-time `to_tsvector(..)` recompute.
+    let hits: Vec<i64> = db
+        .select(PgFtsArticle::id)
+        .from::<PgFtsArticle>()
+        .filter(matches_tsv(PgFtsArticle::body_tsv, "systems"))
+        .all()
+        .await
+        .expect("stored tsv search");
+    assert_eq!(hits, vec![1]);
+
+    // The config-explicit variant matches the other row.
+    let soup: Vec<i64> = db
+        .select(PgFtsArticle::id)
+        .from::<PgFtsArticle>()
+        .filter(matches_tsv_in(PgFtsArticle::body_tsv, "soup", "english"))
+        .all()
+        .await
+        .expect("stored tsv search (config)");
+    assert_eq!(soup, vec![2]);
+
+    postgres.stop().await.ok();
+}
+
 // ----- PostGIS SQL rendering (no extension needed; checks the generated SQL) -----
 //
 // The embedded Postgres has no PostGIS, so these are render-only tests: they
@@ -741,6 +813,74 @@ async fn upsert_composite_key_coalesce_remembers_device_on_postgres() {
         "RETURNING yields the existing row id on conflict-update"
     );
     assert_eq!(db.find::<PgLoginDevice>().count().await.unwrap(), 1);
+
+    postgres.stop().await.ok();
+}
+
+// ----- composite PRIMARY KEY table against real Postgres (the goal_step shape) -----
+
+#[derive(Table, Debug, PartialEq, Eq)]
+#[table(name = "pg_goal_step")]
+#[allow(dead_code)]
+struct PgGoalStep {
+    #[column(pk)]
+    goal_id: i64,
+    #[column(pk)]
+    step_id: i64,
+    position: i32,
+}
+
+#[tokio::test]
+async fn composite_primary_key_table_round_trips_on_postgres() {
+    let (postgres, db) = setup().await;
+    // The DDL shape the CLI now emits for a two-`#[column(pk)]` struct.
+    db.raw(
+        "create table pg_goal_step (goal_id bigint not null, step_id bigint not null, \
+         position int not null, primary key (goal_id, step_id))",
+    )
+    .exec()
+    .await
+    .expect("create pg_goal_step");
+
+    for (goal_id, step_id, position) in [(1_i64, 1_i64, 10_i32), (1, 2, 20), (2, 1, 30)] {
+        db.insert(PgGoalStepNew {
+            goal_id,
+            step_id,
+            position,
+        })
+        .exec()
+        .await
+        .unwrap();
+    }
+
+    // The same composite key violates the primary key.
+    let duplicate = db
+        .insert(PgGoalStepNew {
+            goal_id: 1,
+            step_id: 1,
+            position: 99,
+        })
+        .exec()
+        .await;
+    assert!(
+        duplicate.is_err(),
+        "a duplicate (goal_id, step_id) must violate the composite primary key"
+    );
+
+    // A composite-key table is queried by `find().filter(..)` — `get()` won't compile
+    // for it. Fetch one junction row by both key columns.
+    let row = db
+        .find::<PgGoalStep>()
+        .filter(and(
+            eq(PgGoalStep::goal_id, 1_i64),
+            eq(PgGoalStep::step_id, 2_i64),
+        ))
+        .one()
+        .await
+        .unwrap()
+        .expect("row present");
+    assert_eq!(row.position, 20);
+    assert_eq!(db.find::<PgGoalStep>().count().await.unwrap(), 3);
 
     postgres.stop().await.ok();
 }

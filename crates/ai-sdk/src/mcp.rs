@@ -219,6 +219,10 @@ struct McpToolDyn<T> {
 }
 
 impl<Ctx, T: McpTransport> ToolDyn<Ctx> for McpToolDyn<T> {
+    fn name(&self) -> &str {
+        &self.def.name
+    }
+
     fn def(&self) -> ToolDef {
         self.def.clone()
     }

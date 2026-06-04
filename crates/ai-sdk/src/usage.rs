@@ -43,18 +43,28 @@ impl Usage {
     }
 
     /// Total input tokens across all tiers (uncached + cache write + cache read).
+    ///
+    /// Saturating so adversarial provider token counts can never overflow-panic
+    /// (debug) or silently wrap (release).
     #[must_use]
     pub const fn total_input(&self) -> u64 {
-        self.input_tokens + self.cache_create_tokens + self.cache_read_tokens
+        self.input_tokens
+            .saturating_add(self.cache_create_tokens)
+            .saturating_add(self.cache_read_tokens)
     }
 
-    /// Adds another tally into this one, field by field.
+    /// Adds another tally into this one, field by field. Saturating so a long
+    /// accumulated run can never overflow-panic in debug builds.
     pub const fn merge(&mut self, other: &Self) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cache_create_tokens += other.cache_create_tokens;
-        self.cache_read_tokens += other.cache_read_tokens;
-        self.reasoning_tokens += other.reasoning_tokens;
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_create_tokens = self
+            .cache_create_tokens
+            .saturating_add(other.cache_create_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
     }
 }
 
@@ -140,6 +150,23 @@ mod tests {
     }
 
     #[test]
+    fn merge_saturates_instead_of_overflowing() {
+        // A near-max tally plus more must clamp at u64::MAX, never panic.
+        let mut a = Usage {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX - 1,
+            ..Usage::default()
+        };
+        a.merge(&Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            ..Usage::default()
+        });
+        assert_eq!(a.input_tokens, u64::MAX);
+        assert_eq!(a.output_tokens, u64::MAX);
+    }
+
+    #[test]
     fn total_input_sums_all_tiers() {
         let u = Usage {
             input_tokens: 100,
@@ -148,6 +175,18 @@ mod tests {
             ..Usage::default()
         };
         assert_eq!(u.total_input(), 150);
+    }
+
+    #[test]
+    fn total_input_saturates_instead_of_overflowing() {
+        // Adversarial provider token counts near u64::MAX must clamp, not panic.
+        let u = Usage {
+            input_tokens: u64::MAX,
+            cache_create_tokens: u64::MAX,
+            cache_read_tokens: u64::MAX,
+            ..Usage::default()
+        };
+        assert_eq!(u.total_input(), u64::MAX);
     }
 
     #[test]
