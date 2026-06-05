@@ -51,7 +51,7 @@ fn claude_request(n: usize, messages: Vec<Message>) -> ChatRequest {
     req.system = Some(SystemPrompt::from(
         "You are a helpful assistant.\n\n## Available skills\n- foo (foo): does foo",
     ));
-    req.tools = tools(n);
+    req.tools = tools(n).into();
     req.messages = messages;
     req
 }

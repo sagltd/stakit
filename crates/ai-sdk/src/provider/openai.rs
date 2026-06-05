@@ -23,6 +23,12 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 /// newline would otherwise grow `buf` without bound; past this we bail with a
 /// decode error rather than buffering unboundedly.
 const MAX_SSE_LINE: usize = 1024 * 1024;
+/// Max in-flight tool-call buffers a stream may open. A hostile stream could
+/// otherwise allocate per-index entries without bound.
+const MAX_INFLIGHT_TOOLS: usize = 64;
+/// Max accumulated argument bytes for a single tool call. A hostile stream could
+/// otherwise grow one tool's argument buffer past the per-line SSE cap.
+const MAX_TOOL_ARGS: usize = 1024 * 1024;
 
 /// A handle to the `OpenAI` API. Cheap to clone; mints per-model handles.
 #[derive(Clone)]
@@ -174,8 +180,16 @@ impl Provider for OpenAiModel {
                                 started = true;
                                 yield Ok(StreamEvent::Start { usage: Usage::default() });
                             }
-                            for ev in accum.push(&event) {
-                                yield Ok(ev);
+                            match accum.push(&event) {
+                                Ok(evs) => {
+                                    for ev in evs {
+                                        yield Ok(ev);
+                                    }
+                                }
+                                Err(e) => {
+                                    yield Err(e);
+                                    return;
+                                }
                             }
                         }
                     }
@@ -553,18 +567,18 @@ struct ToolBuf {
 }
 
 impl Accum {
-    fn push(&mut self, event: &Value) -> Vec<StreamEvent> {
+    fn push(&mut self, event: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
         if let Some(usage) = event.get("usage").filter(|u| !u.is_null()) {
             self.usage = map_usage(usage);
         }
         let Some(choice) = event.get("choices").and_then(|c| c.get(0)) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             self.stop = Some(map_finish_reason(reason));
         }
         let Some(delta) = choice.get("delta") else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut out = Vec::new();
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
@@ -575,6 +589,15 @@ impl Accum {
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                // Bound in-flight tool buffers against a hostile stream.
+                if !self.tools.contains_key(&index) && self.tools.len() >= MAX_INFLIGHT_TOOLS {
+                    return Err(ProviderError::Decode {
+                        err: format!(
+                            "stream opened more than {MAX_INFLIGHT_TOOLS} concurrent tool calls"
+                        ),
+                        body: String::new(),
+                    });
+                }
                 let buf = self.tools.entry(index).or_default();
                 if let Some(id) = call.get("id").and_then(Value::as_str) {
                     id.clone_into(&mut buf.id);
@@ -584,12 +607,20 @@ impl Accum {
                         buf.name.push_str(name);
                     }
                     if let Some(args) = function.get("arguments").and_then(Value::as_str) {
+                        // Bound one tool's argument buffer against a hostile stream
+                        // (this path bypasses the per-line SSE cap).
+                        if buf.args.len().saturating_add(args.len()) > MAX_TOOL_ARGS {
+                            return Err(ProviderError::Decode {
+                                err: format!("tool-call arguments exceeded {MAX_TOOL_ARGS} bytes"),
+                                body: String::new(),
+                            });
+                        }
                         buf.args.push_str(args);
                     }
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Emits the accumulated tool calls and the terminal `End` event.
@@ -686,12 +717,14 @@ mod tests {
     fn accumulator_builds_tool_call_from_chunks() {
         let mut accum = Accum::default();
         accum.push(&json!({ "choices": [{ "delta": { "tool_calls": [{
-            "index": 0, "id": "call_1", "function": { "name": "wx", "arguments": "{\"c\":" } } ] } }] }));
+            "index": 0, "id": "call_1", "function": { "name": "wx", "arguments": "{\"c\":" } } ] } }] })).expect("push ok");
         accum.push(&json!({ "choices": [{ "delta": { "tool_calls": [{
-            "index": 0, "function": { "arguments": "1}" } } ] }, "finish_reason": "tool_calls" }] }));
-        accum.push(
-            &json!({ "choices": [], "usage": { "prompt_tokens": 5, "completion_tokens": 2 } }),
-        );
+            "index": 0, "function": { "arguments": "1}" } } ] }, "finish_reason": "tool_calls" }] })).expect("push ok");
+        accum
+            .push(
+                &json!({ "choices": [], "usage": { "prompt_tokens": 5, "completion_tokens": 2 } }),
+            )
+            .expect("push ok");
         let out = accum.finish();
         assert_eq!(
             out[0],
@@ -711,8 +744,39 @@ mod tests {
     #[test]
     fn text_deltas_stream() {
         let mut accum = Accum::default();
-        let out = accum.push(&json!({ "choices": [{ "delta": { "content": "Hi" } }] }));
+        let out = accum
+            .push(&json!({ "choices": [{ "delta": { "content": "Hi" } }] }))
+            .expect("push ok");
         assert_eq!(out, vec![StreamEvent::TextDelta("Hi".into())]);
+    }
+
+    #[test]
+    fn accumulator_caps_inflight_tool_count() {
+        let mut accum = Accum::default();
+        // Opening MAX_INFLIGHT_TOOLS distinct tool indices is fine.
+        for index in 0..MAX_INFLIGHT_TOOLS as u64 {
+            let ev = json!({ "choices": [{ "delta": { "tool_calls": [{
+                "index": index, "id": format!("c{index}"),
+                "function": { "name": "wx", "arguments": "" } }] } }] });
+            accum.push(&ev).expect("under cap");
+        }
+        // One more distinct index must trip the decode error.
+        let over = json!({ "choices": [{ "delta": { "tool_calls": [{
+            "index": MAX_INFLIGHT_TOOLS as u64, "id": "cX",
+            "function": { "name": "wx", "arguments": "" } }] } }] });
+        let err = accum.push(&over).expect_err("over cap must error");
+        assert!(matches!(err, ProviderError::Decode { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn accumulator_caps_single_tool_arg_buffer() {
+        let mut accum = Accum::default();
+        let huge = "x".repeat(MAX_TOOL_ARGS + 1);
+        let err = accum
+            .push(&json!({ "choices": [{ "delta": { "tool_calls": [{
+                "index": 0, "id": "c0", "function": { "name": "wx", "arguments": huge } }] } }] }))
+            .expect_err("oversized args must error");
+        assert!(matches!(err, ProviderError::Decode { .. }), "{err:?}");
     }
 
     #[test]

@@ -834,9 +834,7 @@ impl Accum {
                         // (this path bypasses the per-line SSE cap).
                         if buf.json.len().saturating_add(partial.len()) > MAX_TOOL_ARGS {
                             return Err(ProviderError::Decode {
-                                err: format!(
-                                    "tool-call arguments exceeded {MAX_TOOL_ARGS} bytes"
-                                ),
+                                err: format!("tool-call arguments exceeded {MAX_TOOL_ARGS} bytes"),
                                 body: String::new(),
                             });
                         }
@@ -969,11 +967,45 @@ mod tests {
     #[test]
     fn accumulator_streams_text() {
         let mut accum = Accum::default();
-        let evs = accum.push(&json!({
-            "type": "content_block_delta", "index": 0,
-            "delta": { "type": "text_delta", "text": "Hel" }
-        }));
+        let evs = accum
+            .push(&json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": { "type": "text_delta", "text": "Hel" }
+            }))
+            .expect("push ok");
         assert_eq!(evs, vec![StreamEvent::TextDelta("Hel".into())]);
+    }
+
+    #[test]
+    fn accumulator_caps_inflight_tool_count() {
+        let mut accum = Accum::default();
+        // Opening MAX_INFLIGHT_TOOLS distinct tool blocks is fine.
+        for idx in 0..MAX_INFLIGHT_TOOLS as u64 {
+            let ev = json!({ "type": "content_block_start", "index": idx,
+                "content_block": { "type": "tool_use", "id": format!("t{idx}"), "name": "wx", "input": {} } });
+            accum.push(&ev).expect("under cap");
+        }
+        // One more distinct tool index must trip the decode error.
+        let over = json!({ "type": "content_block_start", "index": MAX_INFLIGHT_TOOLS as u64,
+            "content_block": { "type": "tool_use", "id": "tX", "name": "wx", "input": {} } });
+        let err = accum.push(&over).expect_err("over cap must error");
+        assert!(matches!(err, ProviderError::Decode { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn accumulator_caps_single_tool_arg_buffer() {
+        let mut accum = Accum::default();
+        accum
+            .push(&json!({ "type": "content_block_start", "index": 0,
+                "content_block": { "type": "tool_use", "id": "t0", "name": "wx", "input": {} } }))
+            .expect("start ok");
+        // A single oversized argument fragment must trip the decode error.
+        let huge = "x".repeat(MAX_TOOL_ARGS + 1);
+        let err = accum
+            .push(&json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "input_json_delta", "partial_json": huge } }))
+            .expect_err("oversized args must error");
+        assert!(matches!(err, ProviderError::Decode { .. }), "{err:?}");
     }
 
     #[test]

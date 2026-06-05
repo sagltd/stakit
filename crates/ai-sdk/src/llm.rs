@@ -86,7 +86,7 @@ impl<P: Provider> LLM<P> {
     /// Returns an error when no user message has been set.
     fn build_request(
         &self,
-        tools: Vec<ToolDef>,
+        tools: Arc<[ToolDef]>,
         tool_choice: ToolChoice,
     ) -> Result<ChatRequest, AgentError> {
         let user_text = self.user.clone().ok_or_else(|| {
@@ -126,7 +126,7 @@ impl<P: Provider> LLM<P> {
         self,
     ) -> Result<T, AgentError> {
         let tool = ToolDef::new("extract", "Return the structured result.", T::schema());
-        let req = self.build_request(vec![tool], ToolChoice::Tool("extract".into()))?;
+        let req = self.build_request(Arc::from([tool]), ToolChoice::Tool("extract".into()))?;
 
         let resp = self.provider.complete(req).await?;
 
@@ -155,7 +155,7 @@ impl<P: Provider> LLM<P> {
     /// Returns [`AgentError::Schema`] when the user message is absent, or
     /// [`AgentError::Provider`] on a provider failure.
     pub async fn text(self) -> Result<String, AgentError> {
-        let req = self.build_request(vec![], ToolChoice::None)?;
+        let req = self.build_request(Arc::from([]), ToolChoice::None)?;
 
         let resp = self.provider.complete(req).await?;
 

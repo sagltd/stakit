@@ -16,6 +16,45 @@ pub struct AgentCx<'a, Ctx> {
 }
 
 impl<'a, Ctx> AgentCx<'a, Ctx> {
+    /// Public constructor for use in middleware unit tests outside this crate.
+    ///
+    /// Provides the minimum viable set of borrows needed to drive an
+    /// `AgentMiddleware` implementation in a test without running the full agent
+    /// loop. The `usage` and `cancel` arguments are typically ephemeral values
+    /// created in the test function.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut msgs = vec![Message::user("hello")];
+    /// let mut model = "test-model".to_string();
+    /// let mut system = None;
+    /// let usage = Usage::default();
+    /// let cancel = CancelToken::new();
+    /// let mut cx = AgentCx::for_test(&ctx, &mut msgs, &mut model, &mut system, &usage, &cancel);
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_test(
+        ctx: &'a Ctx,
+        messages: &'a mut Vec<Message>,
+        model: &'a mut String,
+        system: &'a mut Option<String>,
+        usage: &'a Usage,
+        cancel: &'a CancelToken,
+    ) -> Self {
+        Self {
+            ctx,
+            messages,
+            model,
+            system,
+            usage,
+            cost: None,
+            index: 0,
+            last_step: None,
+            cancel,
+        }
+    }
+
     /// Internal constructor used by the run loop (borrow-split of the agent).
     #[allow(clippy::too_many_arguments, dead_code)]
     pub(crate) const fn new(
@@ -106,6 +145,24 @@ impl<'a, Ctx> AgentCx<'a, Ctx> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn for_test_constructor_builds_usable_cx() {
+        let mut msgs = vec![Message::user("hello")];
+        let mut model = String::from("test-model");
+        let mut system: Option<String> = None;
+        let usage = Usage::default();
+        let cancel = CancelToken::new();
+        let mut cx = AgentCx::for_test(&42u32, &mut msgs, &mut model, &mut system, &usage, &cancel);
+        assert_eq!(*cx.ctx(), 42);
+        assert_eq!(cx.messages().len(), 1);
+        assert_eq!(cx.model(), "test-model");
+        assert_eq!(cx.index(), 0);
+        assert!(cx.step().is_none());
+        assert!(!cx.is_cancelled());
+        cx.messages_mut().push(Message::user("world"));
+        assert_eq!(cx.messages().len(), 2);
+    }
 
     #[test]
     fn agentcx_exposes_ctx_messages_and_model() {

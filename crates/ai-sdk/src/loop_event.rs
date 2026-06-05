@@ -1,5 +1,6 @@
 //! Events emitted by the agent loop, and the loop's stop conditions.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -51,9 +52,9 @@ pub enum AgentEvent {
         /// Zero-based step index.
         index: u32,
         /// Assistant answer text for this step.
-        text: String,
+        text: Arc<str>,
         /// Reasoning text, if any.
-        reasoning: Option<String>,
+        reasoning: Option<Arc<str>>,
         /// Token usage for this step.
         usage: Usage,
         /// Estimated USD cost for this step, if pricing is known.
@@ -69,9 +70,9 @@ pub struct Step {
     /// Zero-based step index.
     pub index: u32,
     /// Reasoning text, if the model produced any.
-    pub reasoning: Option<String>,
+    pub reasoning: Option<Arc<str>>,
     /// Assistant answer text for this step.
-    pub text: String,
+    pub text: Arc<str>,
     /// Tool calls resolved in this step.
     pub tool_calls: Vec<ToolCallRecord>,
     /// Why the model ended this step.

@@ -43,6 +43,9 @@ const LOAD_SKILL: &str = "load_skill";
 const SEARCH_SKILLS: &str = "search_skills";
 /// Default cap on steps when no [`StopCond::StepCountIs`] is configured.
 const DEFAULT_MAX_STEPS: u32 = 16;
+/// Synthetic `tool_result` text for a `tool_use` cancelled by a mid-batch
+/// `Approval::Stop`, so the persisted turn has no dangling `tool_use` block.
+const CANCELLED_TOOL_RESULT: &str = "tool call cancelled: run stopped";
 
 /// A closure producing a prompt-cache key from the app context.
 type CacheKeyFn<Ctx> = Arc<dyn Fn(&Ctx) -> Option<Arc<str>> + Send + Sync>;
@@ -59,6 +62,10 @@ pub struct Agent<Ctx> {
     tools: Vec<Box<dyn ToolDyn<Ctx>>>,
     /// Cached `name + description` after the first `list()`.
     skills: Vec<Skill>,
+    /// The skill manifest, rendered once after `skills` are listed. The manifest
+    /// is invariant for the run (skills are fixed once listed), so it is cached
+    /// here rather than re-rendered every step in [`build_system`](Self::build_system).
+    skill_manifest: Option<Arc<str>>,
     skill_loader: Option<Box<dyn SkillLoader<Ctx>>>,
     middleware: Vec<Box<dyn AgentMiddleware<Ctx>>>,
     system: Option<String>,
@@ -84,6 +91,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
             current_model: String::new(),
             tools: Vec::new(),
             skills: Vec::new(),
+            skill_manifest: None,
             skill_loader: None,
             middleware: Vec::new(),
             system: None,
@@ -319,6 +327,12 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                 }
             }
             let skills_active = !self.skills.is_empty();
+            // Render the skill manifest once now that the skill list is known; it
+            // is invariant for the rest of the run, so `build_system` reuses this
+            // cached `Arc<str>` each step instead of re-rendering it.
+            if skills_active && self.skill_manifest.is_none() {
+                self.skill_manifest = Some(Arc::from(self.render_skill_manifest()));
+            }
 
             // Tool defs and the cache key are constant for the whole run (tools
             // and skills are fixed once it starts; the cache key derives only
@@ -387,7 +401,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                     // (constant for the run). The system prompt is rebuilt each
                     // step from `self.system` so that `set_system` calls from
                     // `on_step` take effect on the immediately following request.
-                    let step_system = self.build_system(skills_active);
+                    let step_system = self.build_system();
                     let request = self.build_request(
                         run_tools.clone(),
                         step_system,
@@ -484,19 +498,26 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                         stop,
                     } = acc;
 
+                    // Convert the accumulated text/reasoning to `Arc<str>` ONCE,
+                    // then share that `Arc` across the assistant block, the `Step`
+                    // record, and the `StepEnd` event (clone the pointer, not the
+                    // string).
+                    let text_arc: Option<Arc<str>> =
+                        (!text.is_empty()).then(|| Arc::from(text.as_str()));
+                    let reasoning_arc: Option<Arc<str>> =
+                        (!reasoning.is_empty()).then(|| Arc::from(reasoning.as_str()));
+
                     // Assemble the assistant turn (thinking → text → tool calls).
                     let mut blocks: Vec<AssistantContent> = Vec::new();
-                    let reasoning_opt =
-                        if reasoning.is_empty() { None } else { Some(reasoning.clone()) };
-                    if !reasoning.is_empty() {
+                    if let Some(reasoning) = &reasoning_arc {
                         blocks.push(AssistantContent::Thinking(Thinking::Visible {
-                            text: reasoning.into(),
+                            text: Arc::clone(reasoning),
                             signature: signature.map(Into::into),
                         }));
                     }
-                    if !text.is_empty() {
-                        final_text = text.clone();
-                        blocks.push(AssistantContent::Text(text.clone().into()));
+                    if let Some(text) = &text_arc {
+                        final_text = text.to_string();
+                        blocks.push(AssistantContent::Text(Arc::clone(text)));
                     }
                     for call in &tool_calls {
                         blocks.push(AssistantContent::ToolUse {
@@ -505,12 +526,25 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                             input: call.args.clone(),
                         });
                     }
-                    self.messages.push(Message::Assistant(blocks));
+                    // Persist the assistant turn only when it has content. An empty
+                    // step (no text/reasoning/tool calls) would otherwise push
+                    // `Assistant(vec![])`, which an `on_step_done` checkpoint would
+                    // persist — some providers 400 on resending an empty turn.
+                    if !blocks.is_empty() {
+                        self.messages.push(Message::Assistant(blocks));
+                    }
 
                     self.usage.merge(&step_usage);
                     let step_cost = self.pricing.cost(&self.current_model, &step_usage);
 
                     // ── Tool calls ─────────────────────────────────────────
+                    // Every `tool_use` id in this assistant turn, captured before
+                    // the approval pass consumes `tool_calls`. A mid-batch `Stop`
+                    // uses this to synthesize a `tool_result` for any call that did
+                    // not run, so the persisted history never has a dangling
+                    // `tool_use` (which Claude rejects on resume).
+                    let all_tool_ids: Vec<String> =
+                        tool_calls.iter().map(|c| c.id.clone()).collect();
                     // Pass 1 (sequential): resolve each call's approval, which
                     // borrows the agent (via `AgentCx`). A `Stop` halts further
                     // collection. This pass must finish — releasing the mutable
@@ -595,15 +629,41 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                         });
                     }
 
+                    // A mid-batch `Stop` leaves the calls at/after the stopping
+                    // call without results. Append a synthetic "cancelled" result
+                    // for every such `tool_use` id so the persisted assistant turn
+                    // has a matching `tool_result` for each id (Claude rejects a
+                    // resumed turn with dangling `tool_use` blocks).
+                    if tool_stop.is_some() {
+                        for id in &all_tool_ids {
+                            if records.iter().any(|r| r.id == *id) {
+                                continue;
+                            }
+                            results.push(UserContent::ToolResult {
+                                id: id.as_str().into(),
+                                content: vec![ToolResultPart::Text(CANCELLED_TOOL_RESULT.into())],
+                                is_error: true,
+                            });
+                            yield AgentEvent::ToolResult {
+                                id: id.clone(),
+                                name: String::new(),
+                                result: ToolOutcome::Error(CANCELLED_TOOL_RESULT.to_owned()),
+                            };
+                        }
+                    }
+
                     if !results.is_empty() {
                         self.messages.push(Message::User(results));
                     }
 
-                    // Build the step record and run on_step_done.
+                    // Build the step record and run on_step_done. Reuse the
+                    // step's `Arc<str>` for both the record and the `StepEnd`
+                    // event (empty text becomes a shared empty `Arc`).
+                    let step_text: Arc<str> = text_arc.unwrap_or_else(|| Arc::from(""));
                     let step = Step {
                         index,
-                        reasoning: reasoning_opt.clone(),
-                        text: text.clone(),
+                        reasoning: reasoning_arc.clone(),
+                        text: Arc::clone(&step_text),
                         tool_calls: records,
                         stop: stop.clone(),
                     };
@@ -611,8 +671,8 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
 
                     yield AgentEvent::StepEnd {
                         index,
-                        text,
-                        reasoning: reasoning_opt,
+                        text: step_text,
+                        reasoning: reasoning_arc,
                         usage: step_usage,
                         cost: step_cost,
                     };
@@ -698,7 +758,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
     /// fixed once the run starts; the cache key derives only from the app
     /// context. The system prompt is computed per-step (see
     /// [`build_system`](Self::build_system)) so middleware can update it mid-run.
-    fn build_run_constants(&self, skills_active: bool) -> (Vec<ToolDef>, Option<Arc<str>>) {
+    fn build_run_constants(&self, skills_active: bool) -> (Arc<[ToolDef]>, Option<Arc<str>>) {
         let mut tools: Vec<ToolDef> = self.tools.iter().map(|t| t.def()).collect();
         if skills_active {
             tools.extend(skill_tool_defs());
@@ -707,20 +767,22 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
         // Derive the per-conversation cache-routing key from the app context.
         let cache_key = self.cache_key.as_ref().and_then(|f| f(&self.ctx));
 
-        (tools, cache_key)
+        (Arc::from(tools), cache_key)
     }
 
     /// Builds the effective system prompt for one step.
     ///
     /// Called per-step (not once before the loop) so that
-    /// [`AgentCx::set_system`](crate::agent_cx::AgentCx::set_system) calls
-    /// from `on_step` take effect immediately on the next provider request.
-    fn build_system(&self, skills_active: bool) -> Option<SystemPrompt> {
-        match (self.system.as_deref(), skills_active) {
-            (Some(base), false) => Some(base.to_owned()),
-            (Some(base), true) => Some(format!("{base}\n\n{}", self.skill_manifest())),
-            (None, true) => Some(self.skill_manifest()),
-            (None, false) => None,
+    /// [`AgentCx::set_system`](crate::agent_cx::AgentCx::set_system) calls from
+    /// `on_step` take effect immediately on the next provider request. The skill
+    /// manifest is taken from the cached `skill_manifest` (rendered once), so only
+    /// `self.system` is read fresh each step — a cheap concat when both are set.
+    fn build_system(&self) -> Option<SystemPrompt> {
+        match (self.system.as_deref(), self.skill_manifest.as_deref()) {
+            (Some(base), None) => Some(base.to_owned()),
+            (Some(base), Some(manifest)) => Some(format!("{base}\n\n{manifest}")),
+            (None, Some(manifest)) => Some(manifest.to_owned()),
+            (None, None) => None,
         }
         .map(SystemPrompt::from)
     }
@@ -732,7 +794,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
     /// history is cloned afresh each step.
     fn build_request(
         &self,
-        tools: Vec<ToolDef>,
+        tools: Arc<[ToolDef]>,
         system: Option<SystemPrompt>,
         cache_key: Option<Arc<str>>,
     ) -> ChatRequest {
@@ -752,8 +814,9 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
         }
     }
 
-    /// Renders the cached skills as a system-prompt manifest block.
-    fn skill_manifest(&self) -> String {
+    /// Renders the cached skills as a system-prompt manifest block. Called once
+    /// per run (the result is cached in `skill_manifest`).
+    fn render_skill_manifest(&self) -> String {
         use std::fmt::Write as _;
         let mut s = String::from(
             "## Available skills\nUse `load_skill(id)` to load a skill's full instructions, or \

@@ -135,3 +135,48 @@ fn single_key_pk_type_is_the_scalar() {
     fn assert_pk_is<T: stakit_orm::Table<Pk = P>, P>() {}
     assert_pk_is::<SingleKey, i64>();
 }
+
+// ---- Row-level security: the derives compile through the public API ----
+
+#[derive(stakit_orm::Role)]
+#[role(name = "app_user", login)]
+struct AppUser;
+
+#[derive(stakit_orm::Table, Debug)]
+#[table(
+    name = "rls_posts",
+    rls,
+    force_rls,
+    grant(app_user(select, insert, update, delete)),
+    policy(
+        rls_posts_owner(
+            select,
+            to = "app_user",
+            using = "author_id = current_setting('app.user_id')::uuid"
+        ),
+        rls_posts_insert(
+            insert,
+            to = "app_user",
+            check = "author_id = current_setting('app.user_id')::uuid"
+        )
+    )
+)]
+#[allow(dead_code)]
+struct RlsPost {
+    #[column(pk)]
+    id: i64,
+    author_id: String,
+    title: String,
+}
+
+#[test]
+fn role_derive_exposes_role_name() {
+    assert_eq!(AppUser::ROLE, "app_user");
+}
+
+#[test]
+fn rls_table_columns_are_unaffected_by_policies_and_grants() {
+    // RLS attributes are migration-only: they must not perturb the runtime column set.
+    let names: Vec<&str> = RlsPost::COLUMNS.iter().map(|c| c.name).collect();
+    assert_eq!(names, vec!["id", "author_id", "title"]);
+}

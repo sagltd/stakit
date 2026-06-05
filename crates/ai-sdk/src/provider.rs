@@ -107,7 +107,11 @@ pub struct ChatRequest {
     /// Conversation history.
     pub messages: Vec<Message>,
     /// Tools available this turn (the active set; see deferred tools).
-    pub tools: Vec<ToolDef>,
+    ///
+    /// An `Arc<[ToolDef]>` so the agent loop can hoist the (run-constant) tool
+    /// set once and clone a pointer into each step's request instead of
+    /// deep-copying the `Vec` every step.
+    pub tools: Arc<[ToolDef]>,
     /// Tool-choice policy.
     pub tool_choice: ToolChoice,
     /// Maximum tokens to generate.
@@ -138,7 +142,7 @@ impl ChatRequest {
             model: model.into(),
             system: None,
             messages: Vec::new(),
-            tools: Vec::new(),
+            tools: Arc::from([]),
             tool_choice: ToolChoice::Auto,
             max_tokens: 4096,
             temperature: None,

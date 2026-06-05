@@ -13,10 +13,33 @@ use syn::{Data, DeriveInput, Fields, Ident, LitInt, LitStr, Path, Type, parse_ma
 use types::{is_relation, sql_type, unwrap_generic};
 
 /// Derive [`Table`](stakit_orm::Table) for a struct.
+///
+/// Row-level security is declared inside `#[table(...)]`: `rls` (and optionally
+/// `force_rls`) enables it, and nested `grant(<role>(<privileges>))` /
+/// `policy(<name>(<command>, to = "...", using/check = "..."))` items declare grants
+/// and policies — e.g. `#[table(name = "posts", rls, grant(app_user(select, insert)),
+/// policy(owner(select, to = "app_user", using = "...")))]`. Role and policy names are
+/// identifiers (each policy is its own nested list, so two policies for one role do not
+/// trip clippy's `duplicated_attributes`). These are validated at compile time and
+/// consumed by the migration CLI; they emit no runtime code.
 #[proc_macro_derive(Table, attributes(table, column, has_many, belongs_to))]
 pub fn derive_table(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(&input)
+        .unwrap_or_else(|error| error.to_compile_error())
+        .into()
+}
+
+/// Derive a database **role** marker for a unit struct.
+///
+/// `#[role(name = "app_user", login, createdb, createrole, bypassrls)]` declares a
+/// role the migration CLI emits as `CREATE ROLE`. The struct gains a `Self::ROLE`
+/// constant (the role name) for use in code (e.g. `SET ROLE`). Attributes are
+/// validated at compile time.
+#[proc_macro_derive(Role, attributes(role))]
+pub fn derive_role(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    expand_role(&input)
         .unwrap_or_else(|error| error.to_compile_error())
         .into()
 }
@@ -532,7 +555,9 @@ struct ColumnModel {
 
 fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let name = &input.ident;
-    let table_name = table_name(input)?;
+    // Parses + validates `#[table(...)]`, including nested RLS grants/policies (which
+    // emit no runtime code; the migration CLI consumes them from the source).
+    let table_name = table_attrs(input)?;
     validate_ident(&table_name, name)?;
 
     let Data::Struct(data) = &input.data else {
@@ -728,26 +753,55 @@ fn emit_insertable(name: &Ident, table: &str, columns: &[ColumnModel]) -> proc_m
     }
 }
 
-fn table_name(input: &DeriveInput) -> syn::Result<String> {
+/// Parse and validate `#[table(name = "...", rls, force_rls, grant(...), policy(...))]`,
+/// returning the table name. Row-level-security config is nested inside `#[table(...)]`
+/// (not separate `#[policy]`/`#[grant]` attributes) so that two policies sharing a role
+/// don't trip clippy's `duplicated_attributes` across separate attributes. RLS config is
+/// validated here and consumed by the migration CLI; it emits no runtime code.
+fn table_attrs(input: &DeriveInput) -> syn::Result<String> {
+    let mut name = None;
+    let mut rls = false;
+    let mut force_rls = false;
+    let mut has_policy = false;
     for attr in &input.attrs {
         if !attr.path().is_ident("table") {
             continue;
         }
-        let mut found = None;
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("name") {
-                found = Some(meta.value()?.parse::<LitStr>()?.value());
+                name = Some(meta.value()?.parse::<LitStr>()?.value());
+            } else if meta.path.is_ident("rls") {
+                rls = true;
+            } else if meta.path.is_ident("force_rls") {
+                force_rls = true;
+            } else if meta.path.is_ident("grant") {
+                meta.parse_nested_meta(|entry| validate_grant_entry(&entry))?;
+            } else if meta.path.is_ident("policy") {
+                has_policy = true;
+                meta.parse_nested_meta(|entry| validate_policy_entry(&entry))?;
+            } else {
+                // Reject typos rather than silently disabling RLS (a `rsl` typo would
+                // otherwise leave the table unprotected).
+                return Err(meta.error("unknown #[table(...)] attribute"));
             }
             Ok(())
         })?;
-        if let Some(name) = found {
-            return Ok(name);
-        }
     }
-    Err(syn::Error::new_spanned(
-        input,
-        "missing #[table(name = \"...\")]",
-    ))
+    let name =
+        name.ok_or_else(|| syn::Error::new_spanned(input, "missing #[table(name = \"...\")]"))?;
+    if force_rls && !rls {
+        return Err(syn::Error::new_spanned(
+            input,
+            "force_rls requires rls on the same table",
+        ));
+    }
+    if has_policy && !rls {
+        return Err(syn::Error::new_spanned(
+            input,
+            "policy(...) requires RLS — add `rls` to #[table(name = \"...\", rls, …)]",
+        ));
+    }
+    Ok(name)
 }
 
 fn parse_column(ident: &Ident, field: &syn::Field) -> syn::Result<ColumnModel> {
@@ -917,24 +971,241 @@ fn is_sql_identifier(value: &str, allow_qualified: bool) -> bool {
     })
 }
 
-/// Reject identifiers Postgres cannot store safely (matches `ident::validate`).
-fn validate_ident(name: &str, span: &Ident) -> syn::Result<()> {
+/// The reason `name` is unsafe as a Postgres identifier, or `None` if it is fine.
+/// Identifiers are quoted on emit, so only empties, NUL bytes, and over-NAMEDATALEN
+/// lengths are rejected.
+fn ident_error(name: &str) -> Option<&'static str> {
     if name.is_empty() {
-        return Err(syn::Error::new_spanned(span, "identifier is empty"));
+        Some("identifier is empty")
+    } else if name.as_bytes().contains(&0) {
+        Some("identifier contains a NUL byte")
+    } else if name.len() > 63 {
+        Some("identifier exceeds Postgres NAMEDATALEN (63 bytes)")
+    } else {
+        None
     }
-    if name.as_bytes().contains(&0) {
-        return Err(syn::Error::new_spanned(
-            span,
-            "identifier contains a NUL byte",
-        ));
+}
+
+/// Reject identifiers Postgres cannot store safely (matches `ident::validate`). The
+/// `span` is whatever should carry the error (a struct ident, or an attribute).
+fn validate_ident(name: &str, span: impl ToTokens) -> syn::Result<()> {
+    ident_error(name).map_or(Ok(()), |message| {
+        Err(syn::Error::new_spanned(span, message))
+    })
+}
+
+/// Expand `#[derive(Role)]`: validate `#[role(...)]` and emit a `Self::ROLE` const
+/// (the role name). The boolean attributes are validated here and consumed by the
+/// migration CLI; they produce no runtime code.
+fn expand_role(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let name = &input.ident;
+    let mut role_name = None;
+    for attr in &input.attrs {
+        if !attr.path().is_ident("role") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("name") {
+                role_name = Some(meta.value()?.parse::<LitStr>()?.value());
+            } else if meta.path.is_ident("login")
+                || meta.path.is_ident("createdb")
+                || meta.path.is_ident("createrole")
+                || meta.path.is_ident("bypassrls")
+            {
+                // Recognized boolean attribute (consumed by the migration CLI).
+            } else {
+                return Err(meta.error("unknown #[role(...)] attribute"));
+            }
+            Ok(())
+        })?;
     }
-    if name.len() > 63 {
-        return Err(syn::Error::new_spanned(
-            span,
-            "identifier exceeds Postgres NAMEDATALEN (63 bytes)",
-        ));
+    let role_name = role_name
+        .ok_or_else(|| syn::Error::new_spanned(name, "missing #[role(name = \"...\")]"))?;
+    validate_ident(&role_name, name)?;
+    Ok(quote! {
+        impl #name {
+            #[doc = concat!("The SQL role name (`", #role_name, "`).")]
+            pub const ROLE: &'static str = #role_name;
+        }
+    })
+}
+
+/// A policy's `FOR <command>` (local to the derive; the derive emits no code for it,
+/// so it does not reuse the CLI's model enum).
+#[derive(Clone, Copy)]
+enum PolicyCmd {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl PolicyCmd {
+    const fn keyword(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Select => "select",
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// Validate one `policy(<name>(<command>, to = "...", using = "...", check = "..."))`
+/// entry. The policy name is the entry's head identifier (so two policies are distinct
+/// nested lists — clippy's `duplicated_attributes` never sees a repeated `to = "role"`).
+/// Consumed by the migration CLI; emits no code.
+fn validate_policy_entry(entry: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<()> {
+    let name = entry.path.require_ident()?.to_string();
+    if let Some(message) = ident_error(&name) {
+        return Err(entry.error(message));
+    }
+    let mut command = None;
+    let mut roles = Vec::new();
+    let mut to_present = false;
+    let mut using = None;
+    let mut check = None;
+    entry.parse_nested_meta(|inner| {
+        if inner.path.is_ident("to") {
+            to_present = true;
+            roles = split_roles(&inner.value()?.parse::<LitStr>()?.value());
+        } else if inner.path.is_ident("using") {
+            using = Some(inner.value()?.parse::<LitStr>()?.value());
+        } else if inner.path.is_ident("check") {
+            check = Some(inner.value()?.parse::<LitStr>()?.value());
+        } else if let Some(parsed) = policy_command_flag(&inner.path) {
+            if command.is_some() {
+                return Err(inner
+                    .error("policy has more than one command (all/select/insert/update/delete)"));
+            }
+            command = Some(parsed);
+        } else {
+            return Err(inner
+                .error("unknown policy entry attribute (expected a command, to, using, check)"));
+        }
+        Ok(())
+    })?;
+
+    // `to = ""` would silently broaden the policy to PUBLIC — reject it. PUBLIC is
+    // reachable only by omitting `to` entirely.
+    if to_present && roles.is_empty() {
+        return Err(entry.error(format!(
+            "policy `{name}`: `to` was specified but lists no roles (omit `to` for PUBLIC)"
+        )));
+    }
+    for role in &roles {
+        if let Some(message) = ident_error(role) {
+            return Err(entry.error(message));
+        }
+    }
+    let command = command.unwrap_or(PolicyCmd::All);
+    validate_policy_clauses(entry, &name, command, using.as_deref(), check.as_deref())
+}
+
+/// Validate one `grant(<role>(<privilege>...))` entry. The role is the entry's head
+/// identifier, so two grants are distinct nested lists (lint-safe, like policies).
+fn validate_grant_entry(entry: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<()> {
+    let role = entry.path.require_ident()?.to_string();
+    if let Some(message) = ident_error(&role) {
+        return Err(entry.error(message));
+    }
+    let mut privilege_count = 0usize;
+    entry.parse_nested_meta(|inner| {
+        if is_grant_privilege_flag(&inner.path) {
+            privilege_count += 1;
+            Ok(())
+        } else {
+            Err(inner.error("expected a privilege (select/insert/update/delete/all)"))
+        }
+    })?;
+    if privilege_count == 0 {
+        return Err(entry
+            .error("grant role needs at least one privilege (select/insert/update/delete/all)"));
     }
     Ok(())
+}
+
+/// Mirror Postgres's command/clause rules (matches the CLI's `validate_policy_clauses`).
+fn validate_policy_clauses(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    name: &str,
+    command: PolicyCmd,
+    using: Option<&str>,
+    check: Option<&str>,
+) -> syn::Result<()> {
+    let keyword = command.keyword();
+    match command {
+        PolicyCmd::Select | PolicyCmd::Delete => {
+            if check.is_some() {
+                return Err(meta.error(format!(
+                    "policy `{name}`: a {keyword} policy cannot have check = \"...\""
+                )));
+            }
+            if using.is_none() {
+                return Err(meta.error(format!(
+                    "policy `{name}`: a {keyword} policy needs using = \"...\""
+                )));
+            }
+        }
+        PolicyCmd::Insert => {
+            if using.is_some() {
+                return Err(meta.error(format!(
+                    "policy `{name}`: an insert policy cannot have using = \"...\""
+                )));
+            }
+            if check.is_none() {
+                return Err(meta.error(format!(
+                    "policy `{name}`: an insert policy needs check = \"...\""
+                )));
+            }
+        }
+        PolicyCmd::All | PolicyCmd::Update => {
+            if using.is_none() && check.is_none() {
+                return Err(meta.error(format!(
+                    "policy `{name}`: a {keyword} policy needs at least one of using/check"
+                )));
+            }
+        }
+    }
+    if using == Some("") || check == Some("") {
+        return Err(meta.error(format!(
+            "policy `{name}`: using/check expression must not be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn policy_command_flag(path: &Path) -> Option<PolicyCmd> {
+    if path.is_ident("all") {
+        Some(PolicyCmd::All)
+    } else if path.is_ident("select") {
+        Some(PolicyCmd::Select)
+    } else if path.is_ident("insert") {
+        Some(PolicyCmd::Insert)
+    } else if path.is_ident("update") {
+        Some(PolicyCmd::Update)
+    } else if path.is_ident("delete") {
+        Some(PolicyCmd::Delete)
+    } else {
+        None
+    }
+}
+
+fn is_grant_privilege_flag(path: &Path) -> bool {
+    ["all", "select", "insert", "update", "delete"]
+        .iter()
+        .any(|keyword| path.is_ident(keyword))
+}
+
+/// Split a comma-separated `to = "a, b"` into trimmed, non-empty role names.
+fn split_roles(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn parse_references(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<(Path, String)> {
@@ -1027,3 +1298,149 @@ fn fk_check(column: &ColumnModel) -> Option<proc_macro2::TokenStream> {
 }
 
 use quote::ToTokens;
+
+#[cfg(test)]
+mod rls_tests {
+    use super::{expand_role, table_attrs};
+    use syn::{DeriveInput, parse_quote};
+
+    #[test]
+    fn role_emits_role_const() {
+        let input: DeriveInput = parse_quote! {
+            #[role(name = "app_user", login)]
+            struct AppUser;
+        };
+        let tokens = expand_role(&input).expect("valid role").to_string();
+        assert!(tokens.contains("ROLE"), "missing ROLE const: {tokens}");
+        assert!(tokens.contains("app_user"), "missing role name: {tokens}");
+    }
+
+    #[test]
+    fn role_rejects_unknown_attribute() {
+        let input: DeriveInput = parse_quote! {
+            #[role(name = "app_user", superuser)]
+            struct AppUser;
+        };
+        assert!(expand_role(&input).is_err());
+    }
+
+    #[test]
+    fn role_requires_name() {
+        let input: DeriveInput = parse_quote! {
+            #[role(login)]
+            struct AppUser;
+        };
+        assert!(expand_role(&input).is_err());
+    }
+
+    #[test]
+    fn full_rls_table_is_accepted() {
+        let input: DeriveInput = parse_quote! {
+            #[table(name = "posts", rls, force_rls,
+                grant(app_user(select, insert)),
+                policy(
+                    owner(select, to = "app_user", using = "true"),
+                    ins(insert, to = "app_user", check = "true")
+                ))]
+            struct Post { id: i64 }
+        };
+        assert_eq!(table_attrs(&input).expect("valid rls table"), "posts");
+    }
+
+    #[test]
+    fn force_rls_without_rls_is_rejected() {
+        let input: DeriveInput = parse_quote! {
+            #[table(name = "posts", force_rls)]
+            struct Post { id: i64 }
+        };
+        assert!(table_attrs(&input).is_err());
+    }
+
+    #[test]
+    fn policy_without_rls_is_rejected() {
+        let input: DeriveInput = parse_quote! {
+            #[table(name = "posts", policy(p(select, using = "true")))]
+            struct Post { id: i64 }
+        };
+        assert!(table_attrs(&input).is_err());
+    }
+
+    #[test]
+    fn unknown_table_attribute_is_rejected() {
+        let input: DeriveInput = parse_quote! {
+            #[table(name = "posts", rsl)]
+            struct Post { id: i64 }
+        };
+        assert!(table_attrs(&input).is_err());
+    }
+
+    #[test]
+    fn select_policy_requires_using() {
+        let bad: DeriveInput = parse_quote! {
+            #[table(name = "posts", rls, policy(p(select)))]
+            struct Post { id: i64 }
+        };
+        assert!(table_attrs(&bad).is_err());
+        let ok: DeriveInput = parse_quote! {
+            #[table(name = "posts", rls, policy(p(select, using = "true")))]
+            struct Post { id: i64 }
+        };
+        assert!(table_attrs(&ok).is_ok());
+    }
+
+    #[test]
+    fn insert_policy_rejects_using_and_requires_check() {
+        let with_using: DeriveInput = parse_quote! {
+            #[table(name = "posts", rls, policy(p(insert, using = "true")))]
+            struct Post { id: i64 }
+        };
+        assert!(table_attrs(&with_using).is_err());
+        let with_check: DeriveInput = parse_quote! {
+            #[table(name = "posts", rls, policy(p(insert, check = "true")))]
+            struct Post { id: i64 }
+        };
+        assert!(table_attrs(&with_check).is_ok());
+    }
+
+    #[test]
+    fn policy_rejects_two_commands() {
+        let input: DeriveInput = parse_quote! {
+            #[table(name = "posts", rls, policy(p(select, insert, using = "true")))]
+            struct Post { id: i64 }
+        };
+        assert!(table_attrs(&input).is_err());
+    }
+
+    #[test]
+    fn grant_requires_a_privilege() {
+        let no_priv: DeriveInput = parse_quote! {
+            #[table(name = "posts", grant(app_user()))]
+            struct Post { id: i64 }
+        };
+        assert!(table_attrs(&no_priv).is_err());
+        let ok: DeriveInput = parse_quote! {
+            #[table(name = "posts", grant(app_user(select, insert)))]
+            struct Post { id: i64 }
+        };
+        assert!(table_attrs(&ok).is_ok());
+    }
+
+    #[test]
+    fn grant_rejects_unknown_privilege() {
+        let input: DeriveInput = parse_quote! {
+            #[table(name = "posts", grant(app_user(truncate)))]
+            struct Post { id: i64 }
+        };
+        assert!(table_attrs(&input).is_err());
+    }
+
+    #[test]
+    fn policy_with_empty_to_is_rejected() {
+        // `to = ""` must not silently widen the policy to PUBLIC.
+        let input: DeriveInput = parse_quote! {
+            #[table(name = "posts", rls, policy(p(select, to = "", using = "true")))]
+            struct Post { id: i64 }
+        };
+        assert!(table_attrs(&input).is_err());
+    }
+}

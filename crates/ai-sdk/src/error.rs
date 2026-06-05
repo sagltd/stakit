@@ -215,7 +215,10 @@ mod tests {
             !dbg.contains(&body),
             "raw body leaked verbatim into Debug: {dbg}"
         );
-        assert!(dbg.contains("body_len"), "Debug must report the body length");
+        assert!(
+            dbg.contains("body_len"),
+            "Debug must report the body length"
+        );
         assert!(
             dbg.len() < body.len(),
             "Debug must be shorter than the raw body"

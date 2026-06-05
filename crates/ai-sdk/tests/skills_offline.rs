@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use stakit_ai_sdk::{
-    Agent, AgentError, AgentEvent, ChatRequest, ChatResponse, EventStream, Message, Provider,
-    ProviderError, Skill, SkillContent, SkillLoader, StopReason, StreamEvent, ToolOutcome, Usage,
+    Agent, AgentCx, AgentError, AgentEvent, AgentMiddleware, ChatRequest, ChatResponse,
+    EventStream, Flow, Message, Provider, ProviderError, Skill, SkillContent, SkillLoader,
+    StopReason, StreamEvent, ToolOutcome, Usage,
 };
 
 // ── Mock skill loader ────────────────────────────────────────────────────────
@@ -440,5 +441,77 @@ async fn loader_load_not_called_eagerly() {
         load_counter.load(Ordering::SeqCst),
         0,
         "loader.load must not be called when no load_skill tool call was made"
+    );
+}
+
+// ── Test 5: manifest is cached (injected every step) AND set_system still works
+
+/// Sets the base system prompt to "UPDATED" once `index >= 1`.
+struct SetSystemAtStep1;
+
+#[async_trait::async_trait]
+impl AgentMiddleware<()> for SetSystemAtStep1 {
+    async fn on_step(&self, cx: &mut AgentCx<'_, ()>) -> Result<Flow, AgentError> {
+        if cx.index() >= 1 {
+            cx.set_system("UPDATED");
+        }
+        Ok(Flow::Continue)
+    }
+}
+
+#[tokio::test]
+async fn skill_manifest_is_injected_each_step_and_set_system_still_applies() {
+    let skills = vec![Skill {
+        id: "s1".into(),
+        name: "Skill One".into(),
+        description: "first skill".into(),
+    }];
+    // Step 0 calls a built-in skill tool so the loop runs a second step; the
+    // middleware then swaps the base system prompt before step 1.
+    let provider = RecordingProvider::with_tool_call("search_skills", r#"{"query":"x"}"#);
+    let mut agent = Agent::new(())
+        .provider(provider.clone())
+        .model("recorder")
+        .skills(MockLoader::new(skills))
+        .register_middleware(SetSystemAtStep1)
+        .with_context(vec![Message::user("hi")]);
+
+    let _ = agent.run().await.expect("outcome");
+
+    let captured = provider.captured();
+    assert!(captured.len() >= 2, "expected at least two provider calls");
+
+    // The manifest (cached once) must be injected on BOTH steps.
+    for (i, req) in captured.iter().enumerate() {
+        let text = &*req
+            .system
+            .as_ref()
+            .unwrap_or_else(|| panic!("step {i} must have a system prompt"))
+            .text;
+        assert!(
+            text.contains("Skill One"),
+            "step {i} system must include the cached skill manifest: {text}"
+        );
+    }
+
+    // set_system must still take effect on the next step: step 0 has no base
+    // prompt, step 1 carries the middleware's "UPDATED" base before the manifest.
+    assert!(
+        !captured[0]
+            .system
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("UPDATED"),
+        "step 0 must not yet have the updated base prompt"
+    );
+    assert!(
+        captured[1]
+            .system
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("UPDATED"),
+        "step 1 must reflect set_system from on_step"
     );
 }

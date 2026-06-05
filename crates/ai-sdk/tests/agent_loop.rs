@@ -761,7 +761,7 @@ async fn streaming_deltas_are_yielded_live_and_in_order() {
             }
             AgentEvent::StepEnd { text, .. } => {
                 delta_count_at_step_end = Some(deltas.len());
-                assert_eq!(text, "abc", "StepEnd text is the assembled deltas");
+                assert_eq!(&*text, "abc", "StepEnd text is the assembled deltas");
             }
             _ => {}
         }

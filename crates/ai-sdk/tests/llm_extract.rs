@@ -44,7 +44,7 @@ fn extract_request() -> ChatRequest {
     let tool = ToolDef::new("extract", "Return the structured result.", User::schema());
     let mut req = ChatRequest::new("test-model");
     req.messages = vec![Message::user("Bob is 30")];
-    req.tools = vec![tool];
+    req.tools = std::sync::Arc::from([tool]);
     req.tool_choice = ToolChoice::Tool("extract".into());
     req.max_tokens = 1024;
     req

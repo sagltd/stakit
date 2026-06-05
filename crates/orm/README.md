@@ -382,6 +382,79 @@ Applied versions are tracked in a `_stakit_migrations` table. (MySQL implicitly
 commits DDL, so a multi-statement migration that fails mid-way is not atomic there —
 the standard MySQL caveat.)
 
+## Row-level security — roles, policies, grants (Postgres)
+
+Declare Postgres row-level security right on the schema; the `stakit-orm` migration
+CLI generates `CREATE ROLE` / `GRANT` / `ENABLE ROW LEVEL SECURITY` / `CREATE POLICY`
+(and their exact inverses for `down`). It's pure schema metadata — no runtime cost.
+
+```rust
+use stakit_orm::prelude::*;
+use uuid::Uuid;
+
+// A database role -> CREATE ROLE in the migration. `AppUser::ROLE == "app_user"`.
+#[derive(Role)]
+#[role(name = "app_user", login)]   // also: createdb, createrole, bypassrls
+struct AppUser;
+
+#[derive(Table)]
+#[table(
+    name = "posts",
+    rls,                                            // ENABLE ROW LEVEL SECURITY
+    // force_rls,                                    // (optional) also enforce for the owner
+    grant(app_user(select, insert, update, delete)),// GRANT ... TO app_user
+    policy(
+        // each policy is `name(command, to = "role(s)", using/check = "<sql>")`
+        owner(select, to = "app_user",
+              using = "author_id = current_setting('app.user_id')::uuid"),
+        new_rows(insert, to = "app_user",
+              check = "author_id = current_setting('app.user_id')::uuid"),
+    ),
+)]
+struct Post {
+    #[column(pk)]
+    id: Uuid,
+    author_id: Uuid,
+    title: String,
+}
+```
+
+`cargo stakit-orm gen add_posts_rls` emits:
+
+```sql
+create role "app_user" login;
+create table "posts" ( ... );
+grant select, insert, update, delete on "posts" to "app_user";
+alter table "posts" enable row level security;
+create policy "owner" on "posts" for select to "app_user" using (author_id = current_setting('app.user_id')::uuid);
+create policy "new_rows" on "posts" for insert to "app_user" with check (author_id = current_setting('app.user_id')::uuid);
+```
+
+Rules (checked at compile time **and** at generation time):
+
+- **Command** (one per policy): `all` (default), `select`, `insert`, `update`, `delete`.
+  `select`/`delete` take `using` only; `insert` takes `check` only; `all`/`update` take
+  at least one of `using`/`check`.
+- A `policy(...)` (and `force_rls`) requires `rls` on the table.
+- Role / policy names are identifiers; `to = "a, b"` targets multiple roles, and omitting
+  `to` targets `PUBLIC`. `using`/`check` are verbatim SQL (reviewed before apply, like
+  `default`/`generated`).
+
+**Using it at runtime.** Policies read the connected role and session settings, so set
+them per request/transaction on a single connection (RLS context is connection-local):
+
+```rust
+db.transaction(|tx| async move {
+    tx.raw("set local role app_user").exec().await?;
+    tx.raw("select set_config('app.user_id', $1, true)")
+        .bind(current_user_id.to_string())
+        .exec().await?;
+    // every query in this tx now sees only rows the policy permits
+    let mine = tx.find::<Post>().all().await?;
+    Ok(mine)
+}).await?;
+```
+
 ## Raw SQL escape hatch
 
 ```rust

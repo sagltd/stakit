@@ -2,6 +2,8 @@
 //!   5. `Flow::Stop` from `on_step_done` halts after results are recorded.
 //!   6. `Approval::Stop` from `on_tool_approve` halts the whole run (distinct from Deny).
 //!   7. `set_system` mid-run: next provider request uses the new system prompt.
+//!   8. An empty step never persists an empty assistant turn (resume-safety).
+//!   9. A mid-batch `Approval::Stop` leaves no dangling `tool_use` (resume-safety).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,9 +11,10 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use stakit_ai_sdk::{
-    Agent, AgentCx, AgentError, AgentEvent, AgentMiddleware, Approval, ChatRequest, ChatResponse,
-    EventStream, Finish, Flow, Message, PendingToolCall, Provider, ProviderError, StopReason,
-    StreamEvent, Tool, ToolCx, ToolError, ToolOutcome, Usage,
+    Agent, AgentCx, AgentError, AgentEvent, AgentMiddleware, Approval, AssistantContent,
+    ChatRequest, ChatResponse, EventStream, Finish, Flow, Message, PendingToolCall, Provider,
+    ProviderError, StopReason, StreamEvent, Tool, ToolCx, ToolError, ToolOutcome, Usage,
+    UserContent,
 };
 use stakit_model::{JsonSchema, Model};
 
@@ -339,4 +342,177 @@ async fn set_system_mid_run_affects_next_provider_request() {
         !step1.contains("ORIGINAL"),
         "step 1 must NOT contain the old system; got: {step1:?}"
     );
+}
+
+// ── Test 8 (C-1): an empty step never persists an empty assistant turn ────────
+//
+// A step that yields no text, reasoning, or tool calls must NOT push
+// `Assistant(vec![])` — an `on_step_done` checkpoint would persist it and some
+// providers 400 on resending an empty assistant turn.
+
+/// Yields a single empty step (just `End`, no content).
+#[derive(Clone)]
+struct EmptyStepProvider;
+
+impl Provider for EmptyStepProvider {
+    #[allow(
+        clippy::unnecessary_literal_bound,
+        reason = "trait method must return &str"
+    )]
+    fn model_id(&self) -> &str {
+        "empty"
+    }
+    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Cancelled) })
+    }
+    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
+        Box::pin(async move {
+            Ok(futures::stream::iter(vec![Ok(StreamEvent::End {
+                stop: StopReason::EndTurn,
+                usage: Usage::default(),
+            })])
+            .boxed())
+        })
+    }
+}
+
+#[tokio::test]
+async fn empty_step_does_not_persist_empty_assistant_turn() {
+    let mut agent = Agent::new(())
+        .provider(EmptyStepProvider)
+        .model("empty")
+        .with_context(vec![Message::user("hi")]);
+
+    let out = agent.run().await.expect("outcome");
+    assert!(matches!(out.finish, Finish::EndTurn));
+
+    // No assistant message may be empty (resume-safety).
+    let empty_assistant = agent
+        .messages()
+        .iter()
+        .any(|m| matches!(m, Message::Assistant(blocks) if blocks.is_empty()));
+    assert!(
+        !empty_assistant,
+        "an empty step must not persist an empty assistant turn: {:?}",
+        agent.messages()
+    );
+}
+
+// ── Test 9 (C-2): mid-batch Approval::Stop leaves no dangling tool_use ────────
+//
+// The assistant turn carries N `tool_use` blocks; a `Stop` on call k records
+// `tool_result`s only for the calls that ran. The history must still have a
+// matching `tool_result` for EVERY `tool_use` id (Claude rejects a resumed turn
+// with dangling tool_use blocks).
+
+/// Emits two tool calls in one turn on the first step.
+#[derive(Clone)]
+struct TwoToolProvider {
+    calls: Arc<AtomicU32>,
+}
+
+impl Provider for TwoToolProvider {
+    #[allow(
+        clippy::unnecessary_literal_bound,
+        reason = "trait method must return &str"
+    )]
+    fn model_id(&self) -> &str {
+        "two-tool"
+    }
+    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
+        Box::pin(async { Err(ProviderError::Cancelled) })
+    }
+    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            Ok(futures::stream::iter(vec![
+                Ok(StreamEvent::ToolCall {
+                    id: "call_a".into(),
+                    name: "echo".into(),
+                    arguments: r#"{"text":"a"}"#.into(),
+                }),
+                Ok(StreamEvent::ToolCall {
+                    id: "call_b".into(),
+                    name: "echo".into(),
+                    arguments: r#"{"text":"b"}"#.into(),
+                }),
+                Ok(StreamEvent::End {
+                    stop: StopReason::ToolUse,
+                    usage: Usage::default(),
+                }),
+            ])
+            .boxed())
+        })
+    }
+}
+
+/// Stops on the FIRST tool approval (mid-batch — the second call never runs).
+struct StopOnFirstApproval;
+
+#[async_trait::async_trait]
+impl AgentMiddleware<()> for StopOnFirstApproval {
+    async fn on_tool_approve(
+        &self,
+        _cx: &AgentCx<'_, ()>,
+        _call: &PendingToolCall,
+    ) -> Result<Approval, AgentError> {
+        Ok(Approval::Stop {
+            message: Some("stopped mid-batch".to_string()),
+        })
+    }
+}
+
+#[tokio::test]
+async fn mid_batch_stop_records_tool_result_for_every_tool_use() {
+    let mut agent = Agent::new(())
+        .provider(TwoToolProvider {
+            calls: Arc::new(AtomicU32::new(0)),
+        })
+        .model("two-tool")
+        .register_tool(EchoTool)
+        .register_middleware(StopOnFirstApproval)
+        .with_context(vec![Message::user("go")]);
+
+    let out = agent.run().await.expect("outcome");
+    assert!(
+        matches!(out.finish, Finish::Stopped { .. }),
+        "expected Finish::Stopped, got {:?}",
+        out.finish
+    );
+
+    // Collect every tool_use id from assistant turns and every tool_result id
+    // from user turns.
+    let mut tool_use_ids: Vec<String> = Vec::new();
+    let mut tool_result_ids: Vec<String> = Vec::new();
+    for m in agent.messages() {
+        match m {
+            Message::Assistant(blocks) => {
+                for b in blocks {
+                    if let AssistantContent::ToolUse { id, .. } = b {
+                        tool_use_ids.push(id.to_string());
+                    }
+                }
+            }
+            Message::User(parts) => {
+                for p in parts {
+                    if let UserContent::ToolResult { id, .. } = p {
+                        tool_result_ids.push(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        tool_use_ids,
+        vec!["call_a".to_string(), "call_b".to_string()],
+        "both tool_use blocks must be persisted"
+    );
+    // Every tool_use id must have a matching tool_result id (no dangling calls).
+    for id in &tool_use_ids {
+        assert!(
+            tool_result_ids.contains(id),
+            "tool_use id {id} has no matching tool_result; results={tool_result_ids:?}"
+        );
+    }
 }

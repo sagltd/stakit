@@ -91,6 +91,10 @@ pub use stakit_orm_derive::Table;
 /// The `#[derive(Row)]` macro: a named projection over `#[from(<expr>)]` fields.
 pub use stakit_orm_derive::Row;
 
+/// The `#[derive(Role)]` macro: declares a database role for row-level security
+/// migrations (`#[role(name = "...", login, …)]`), exposing `Self::ROLE`.
+pub use stakit_orm_derive::Role;
+
 /// The `#[derive(DbEnum)]` macro: makes a fieldless enum a column type (stored as
 /// text by default, or as an integer with `#[db_enum(int)]`).
 pub use stakit_orm_derive::DbEnum;
@@ -105,6 +109,7 @@ pub mod prelude {
     pub use crate::DbEnum;
     pub use crate::Json;
     pub use crate::Migration;
+    pub use crate::Role;
     pub use crate::Table;
     pub use crate::error::{Error, Result};
     pub use crate::expr::{

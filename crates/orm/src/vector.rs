@@ -69,6 +69,10 @@ impl ToValue for Vector {
 
 impl FromValue for Vector {
     const KIND: ValueKind = ValueKind::Vector;
+    /// Cast the column to `::text` on read so that Postgres (pgvector) delivers the
+    /// vector as the text literal `[1,2,3]` that [`parse_literal`] understands.
+    /// Without this cast, sqlx cannot decode the `vector` OID as a `String`.
+    const READ_CAST: Option<&'static str> = Some("text");
     fn from_value(value: Value) -> Result<Self> {
         match value {
             Value::Vector(components) => Ok(Self(components)),
