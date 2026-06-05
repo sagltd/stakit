@@ -47,10 +47,54 @@ pub fn derive_response_error(input: TokenStream) -> TokenStream {
         .into()
 }
 
+/// Converts a `snake_case` identifier to `lowerCamelCase`.
+///
+/// Splits on `_`, keeps the first segment lowercase, and uppercases the first
+/// character of each subsequent non-empty segment.  Single-word identifiers
+/// (e.g. `ping`) are returned as-is.
+///
+/// Examples: `accept_invite` → `acceptInvite`, `oauth_login` → `oauthLogin`,
+/// `ping` → `ping`, `__foo__bar__` → `fooBar`.
+fn to_lower_camel(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut first = true;
+    for segment in s.split('_') {
+        if segment.is_empty() {
+            continue;
+        }
+        if first {
+            out.push_str(segment);
+            first = false;
+        } else {
+            let mut chars = segment.chars();
+            if let Some(c) = chars.next() {
+                out.extend(c.to_uppercase());
+            }
+            out.push_str(chars.as_str());
+        }
+    }
+    out
+}
+
+/// The action's wire name: the function name, `lowerCamelCase`d under the
+/// `camel` feature (so the dispatch key and generated TypeScript match the
+/// camelCase models), otherwise the function name verbatim.
+fn action_name(name: &syn::Ident) -> String {
+    let raw = name.to_string();
+    #[cfg(feature = "camel")]
+    {
+        to_lower_camel(&raw)
+    }
+    #[cfg(not(feature = "camel"))]
+    {
+        raw
+    }
+}
+
 fn expand(func: &ItemFn, is_stream: bool) -> syn::Result<proc_macro2::TokenStream> {
     let vis = &func.vis;
     let name = &func.sig.ident;
-    let name_str = name.to_string();
+    let name_str = action_name(name);
     let block = &func.block;
 
     // Classify args: `&Cx<G, R>` is the context, the other is params. We keep the

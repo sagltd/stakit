@@ -5,6 +5,15 @@
 //! nothing about HTTP/WebSockets or JSON specifically — you wire it into your
 //! framework (axum, hyper, …) and hand it already-decoded params + a request
 //! context. See `docs/router.md`.
+//!
+//! ## Features
+//!
+//! - **`camel`** — emit `camelCase` everywhere a client sees a name: model field
+//!   names, validation paths, wire JSON, and **action names** (`create_user` is
+//!   dispatched/exported as `createUser`) — all from `snake_case` Rust. Forwards to
+//!   `stakit-model/camel` (model fields) and `stakit-router-derive/camel` (action
+//!   names). Declare models with the [`macro@model`] attribute so the matching serde
+//!   rename is injected and the wire format lines up with the generated TypeScript.
 
 mod action;
 mod client;

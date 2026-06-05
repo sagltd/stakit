@@ -47,9 +47,18 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
 /// One annotation for a model.
 ///
 /// Derives `Model` + serde `Serialize`/`Deserialize`, and (under the `camel`
-/// feature) injects `#[serde(rename_all = "camelCase")]` so the wire format
-/// always matches the camelCase TypeScript — no per-struct serde attribute to
-/// forget.
+/// feature) injects the serde rename that makes the wire format match the
+/// camelCase TypeScript + validation paths — no per-type serde attribute to
+/// forget. A struct gets `#[serde(rename_all = "camelCase")]` (renames its
+/// fields); an enum gets `#[serde(rename_all_fields = "camelCase")]` (renames
+/// struct-variant payload fields, leaving the externally-tagged variant names
+/// verbatim, which is how the TypeScript export renders them).
+///
+/// Prefer `#[model]` over a bare `#[derive(Model)]` when the `camel` feature is
+/// on: the derive camelCases the generated TypeScript + validation paths
+/// unconditionally, so a bare derive *without* the matching serde rename would
+/// produce camelCase TypeScript over a `snake_case` wire. `#[model]` keeps the
+/// two in lockstep.
 ///
 /// ```ignore
 /// #[model]
@@ -58,8 +67,18 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn model(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
+    // The serde rename must match how the generated TypeScript + validation paths
+    // are camelCased (`ir::wire_name`). For a struct, `rename_all` camelCases its
+    // fields. For an enum, `rename_all` would camelCase the *variant tags* (which
+    // the TS export keeps verbatim) — the payload field names are renamed by
+    // `rename_all_fields`, so an enum gets that one instead, leaving variant tags
+    // PascalCase on both the wire and in the TypeScript.
     let rename = if cfg!(feature = "camel") {
-        quote!(#[serde(rename_all = "camelCase")])
+        if matches!(input.data, syn::Data::Enum(_)) {
+            quote!(#[serde(rename_all_fields = "camelCase")])
+        } else {
+            quote!(#[serde(rename_all = "camelCase")])
+        }
     } else {
         quote!()
     };

@@ -5,27 +5,68 @@ use syn::{Attribute, Data, DeriveInput, Expr, Fields, Ident, LitStr, Type};
 
 /// The wire/TS name for a field: `camelCase` under the `camel` feature,
 /// otherwise the original (`snake_case`) name.
+///
+/// Under `camel` this must reproduce serde's `RenameRule::CamelCase` for fields
+/// **byte for byte**, because serde owns the real wire name (via the
+/// `#[serde(rename_all = "camelCase")]` / `rename_all_fields` that `#[model]`
+/// injects) while this drives the generated TypeScript and the validation-error
+/// path. If the two diverged, a TypeScript-conforming request would be
+/// unroutable and validation errors would be keyed under a name the client never
+/// sees. serde's rule (`serde_derive` `internals/case.rs`): ASCII `PascalCase` —
+/// each `_`-separated word capitalized — then the first character lowercased.
 pub(crate) fn wire_name(label: &str) -> String {
     #[cfg(feature = "camel")]
     {
-        let mut out = String::with_capacity(label.len());
-        let mut upper = false;
+        let mut pascal = String::with_capacity(label.len());
+        let mut capitalize = true;
         for ch in label.chars() {
             if ch == '_' {
-                upper = true;
-            } else if upper {
-                out.extend(ch.to_uppercase());
-                upper = false;
+                capitalize = true;
+            } else if capitalize {
+                pascal.push(ch.to_ascii_uppercase());
+                capitalize = false;
             } else {
-                out.push(ch);
+                pascal.push(ch);
             }
         }
-        out
+        let mut chars = pascal.chars();
+        match chars.next() {
+            None => pascal,
+            Some(first) => {
+                let mut out = String::with_capacity(pascal.len());
+                out.push(first.to_ascii_lowercase());
+                out.push_str(chars.as_str());
+                out
+            }
+        }
     }
     #[cfg(not(feature = "camel"))]
     {
         label.to_owned()
     }
+}
+
+/// Rejects two named fields that collapse to the same camelCase wire name (e.g.
+/// `user_name` and `userName`). serde would silently accept the duplicate wire
+/// key and the validation map would merge both fields' errors under one path, so
+/// the ambiguity is made a compile error rather than a runtime corruption.
+#[cfg(feature = "camel")]
+fn check_wire_collisions(fields: &[Field]) -> syn::Result<()> {
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for field in fields {
+        let wire = wire_name(&field.label);
+        if let Some(previous) = seen.insert(wire.clone(), field.label.clone()) {
+            return Err(syn::Error::new(
+                field.binding.span(),
+                format!(
+                    "fields `{previous}` and `{}` map to the same camelCase wire name \
+                     `{wire}`; rename one (the `camel` feature is enabled)",
+                    field.label
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A single validation rule attached to a field.
@@ -132,6 +173,8 @@ fn parse_fields(fields: &Fields) -> syn::Result<Body> {
                     description: parse_description(&f.attrs)?,
                 });
             }
+            #[cfg(feature = "camel")]
+            check_wire_collisions(&out)?;
             Ok(Body::Named(out))
         }
         Fields::Unnamed(unnamed) => {

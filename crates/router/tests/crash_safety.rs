@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use stakit_model::Model;
-use stakit_router::{Cx, Error, Frame, Middleware, Router, StreamActionExt as _, action};
+use stakit_router::{Cx, Endpoint, Error, Frame, Middleware, Router, StreamActionExt as _, action};
 
 #[derive(Model, Serialize, Deserialize)]
 struct In {
@@ -86,8 +86,9 @@ fn payload(action: &str, params: Value) -> Value {
 
 #[test]
 fn panicking_action_becomes_500_not_a_crash() {
-    let out = block_on(router().on_request((), payload("boom", json!(null))));
-    let env = &out["boom"];
+    let name = <boom as Endpoint>::ACTION;
+    let out = block_on(router().on_request((), payload(name, json!(null))));
+    let env = &out[name];
     assert_eq!(env["status"], "error");
     assert_eq!(env["error"]["code"], 500);
     // Generic client-facing message — the panic text must NOT leak.
@@ -103,19 +104,24 @@ fn panicking_action_becomes_500_not_a_crash() {
 #[test]
 fn app_survives_a_panic_and_keeps_serving() {
     let router = router();
+    let boom_name = <boom as Endpoint>::ACTION;
+    let ping_name = <ping as Endpoint>::ACTION;
     // First call panics...
-    let _ = block_on(router.on_request((), payload("boom", json!(null))));
+    let _ = block_on(router.on_request((), payload(boom_name, json!(null))));
     // ...the router is unharmed and still dispatches the next call.
-    let out = block_on(router.on_request((), payload("ping", json!(null))));
-    assert_eq!(out["ping"]["status"], "ok");
-    assert_eq!(out["ping"]["data"], json!("pong"));
+    let out = block_on(router.on_request((), payload(ping_name, json!(null))));
+    assert_eq!(out[ping_name]["status"], "ok");
+    assert_eq!(out[ping_name]["data"], json!("pong"));
 }
 
 #[test]
 fn panic_mid_stream_ends_with_error_frame_after_good_items() {
     let frames: Vec<Frame> = block_on(
         router()
-            .on_stream((), payload("boom_mid", json!({ "n": 5 })))
+            .on_stream(
+                (),
+                payload(<boom_mid as Endpoint>::ACTION, json!({ "n": 5 })),
+            )
             .collect(),
     );
     // Item 0 streamed fine, then the panic terminated the substream with an error
@@ -136,7 +142,10 @@ fn panic_mid_stream_ends_with_error_frame_after_good_items() {
 fn panic_on_first_stream_poll_is_an_error_frame() {
     let frames: Vec<Frame> = block_on(
         router()
-            .on_stream((), payload("boom_first", json!({ "n": 3 })))
+            .on_stream(
+                (),
+                payload(<boom_first as Endpoint>::ACTION, json!({ "n": 3 })),
+            )
             .collect(),
     );
     assert_eq!(frames.len(), 1);
@@ -147,7 +156,7 @@ fn panic_on_first_stream_poll_is_an_error_frame() {
 fn panicking_after_hook_yields_error_frame_after_all_items() {
     let frames: Vec<Frame> = block_on(
         router()
-            .on_stream((), payload("good", json!({ "n": 2 })))
+            .on_stream((), payload(<good as Endpoint>::ACTION, json!({ "n": 2 })))
             .collect(),
     );
     // All items delivered, then the teardown panic becomes a final error frame —
@@ -166,9 +175,13 @@ fn stream_panic_does_not_crash_subsequent_requests() {
     let router = router();
     let _: Vec<Frame> = block_on(
         router
-            .on_stream((), payload("boom_first", json!({ "n": 1 })))
+            .on_stream(
+                (),
+                payload(<boom_first as Endpoint>::ACTION, json!({ "n": 1 })),
+            )
             .collect(),
     );
-    let out = block_on(router.on_request((), payload("ping", json!(null))));
-    assert_eq!(out["ping"]["status"], "ok");
+    let ping_name = <ping as Endpoint>::ACTION;
+    let out = block_on(router.on_request((), payload(ping_name, json!(null))));
+    assert_eq!(out[ping_name]["status"], "ok");
 }

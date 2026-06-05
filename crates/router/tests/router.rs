@@ -15,8 +15,8 @@ use std::sync::OnceLock;
 
 use stakit_model::Model;
 use stakit_router::{
-    Action, ActionExt as _, ClientAction, Cx, Error, Frame, Middleware, ResponseError, Router,
-    StreamActionExt as _, action, err,
+    Action, ActionExt as _, ClientAction, Cx, Endpoint, Error, Frame, Middleware, ResponseError,
+    Router, StreamActionExt as _, action, err,
 };
 
 // --- contexts ---
@@ -241,19 +241,27 @@ fn malformed_params_yield_decode_error() {
 
 #[test]
 fn action_to_action_call() {
-    let env = call(&router(), true, "greet_twice", json!({"name": "sam"}));
+    let env = call(
+        &router(),
+        true,
+        <greet_twice as Endpoint>::ACTION,
+        json!({"name": "sam"}),
+    );
     assert_eq!(env["data"], json!("Hello, sam! Hello, sam!"));
 }
 
 #[test]
 fn object_payload_routes_multiple_actions() {
+    let greet_name = <greet as Endpoint>::ACTION;
+    let ping_name = <ping as Endpoint>::ACTION;
+    let find_name = <find as Endpoint>::ACTION;
     let out = block_on(router().on_request(
         Req { admin: true },
-        json!({ "greet": { "name": "sam" }, "ping": null, "find": { "name": "missing" } }),
+        json!({ greet_name: { "name": "sam" }, ping_name: null, find_name: { "name": "missing" } }),
     ));
-    assert_eq!(out["greet"]["data"]["message"], "Hello, sam!");
-    assert_eq!(out["ping"]["data"], json!("pong"));
-    assert_eq!(out["find"]["error"]["code"], 404);
+    assert_eq!(out[greet_name]["data"]["message"], "Hello, sam!");
+    assert_eq!(out[ping_name]["data"], json!("pong"));
+    assert_eq!(out[find_name]["error"]["code"], 404);
 }
 
 #[test]
@@ -320,7 +328,12 @@ fn axum_style_single_handler_routes_everything() {
 
 #[test]
 fn custom_app_error_is_generic_500_with_detail_kept_server_side() {
-    let env = call(&router(), true, "maybe_fail", json!({"name": "boom"}));
+    let env = call(
+        &router(),
+        true,
+        <maybe_fail as Endpoint>::ACTION,
+        json!({"name": "boom"}),
+    );
     assert_eq!(env["error"]["code"], 500);
     // client sees a generic message — the internal text is NOT leaked
     assert_eq!(env["error"]["message"], "internal server error");
@@ -337,9 +350,10 @@ fn explicit_error_code_via_macro() {
 
 #[test]
 fn streaming_action_yields_frames() {
+    let count_name = <count as Endpoint>::ACTION;
     let frames: Vec<Frame> = block_on(
         router()
-            .on_stream(Req { admin: true }, payload("count", json!({"n": 3})))
+            .on_stream(Req { admin: true }, payload(count_name, json!({"n": 3})))
             .collect(),
     );
     assert_eq!(frames.len(), 4); // 3 items + End
@@ -350,12 +364,12 @@ fn streaming_action_yields_frames() {
             data,
         } => {
             assert_eq!(*index, 0);
-            assert_eq!(action, "count");
+            assert_eq!(action, count_name);
             assert_eq!(data, &json!(0));
         }
         other => panic!("expected Next, got {other:?}"),
     }
-    assert!(matches!(&frames[3], Frame::End { action, .. } if action == "count"));
+    assert!(matches!(&frames[3], Frame::End { action, .. } if action == count_name));
 }
 
 #[test]
@@ -370,11 +384,12 @@ fn streaming_unknown_action_errors() {
 
 #[test]
 fn stream_payload_runs_multiple_actions() {
+    let count_name = <count as Endpoint>::ACTION;
     let frames: Vec<Frame> = block_on(
         router()
             .on_stream(
                 Req { admin: true },
-                json!([["count", { "n": 1 }], ["count", { "n": 1 }]]),
+                json!([[count_name, { "n": 1 }], [count_name, { "n": 1 }]]),
             )
             .collect(),
     );
@@ -408,9 +423,9 @@ async fn duplex_client_call_roundtrip() {
     let mut outgoing = session.outgoing();
     let session = Arc::new(session);
 
-    // Client invokes the server action `notify_user`.
+    // Client invokes the server action `notify_user` (camelCase under `camel` feature).
     session.handle(
-        &json!({ "kind": "call", "id": 1, "action": "notify_user", "params": { "name": "bob" } }),
+        &json!({ "kind": "call", "id": 1, "action": <notify_user as Endpoint>::ACTION, "params": { "name": "bob" } }),
     );
 
     // The action calls back into the client (`client_call`); we receive that frame.
@@ -438,7 +453,7 @@ async fn duplex_streams_over_websocket() {
     let mut outgoing = session.outgoing();
     let session = Arc::new(session);
 
-    session.handle(&json!({ "kind": "call", "id": 7, "action": "count", "params": { "n": 2 } }));
+    session.handle(&json!({ "kind": "call", "id": 7, "action": <count as Endpoint>::ACTION, "params": { "n": 2 } }));
 
     let f0 = outgoing.recv().await.unwrap();
     assert_eq!(f0["kind"], "result");
@@ -457,7 +472,7 @@ async fn duplex_stream_action_can_call_client_actions() {
     let session = Arc::new(session);
 
     // A streaming action `progress` that calls back to the client each iteration.
-    session.handle(&json!({ "kind": "call", "id": 1, "action": "progress", "params": { "n": 2 } }));
+    session.handle(&json!({ "kind": "call", "id": 1, "action": <progress as Endpoint>::ACTION, "params": { "n": 2 } }));
 
     for expected in 0..2u64 {
         // server → client call
@@ -483,7 +498,10 @@ fn http_stream_client_call_errors_without_duplex() {
     // fails fast with a clear 400 instead of hanging.
     let frames: Vec<Frame> = block_on(
         router()
-            .on_stream(Req { admin: true }, payload("progress", json!({ "n": 1 })))
+            .on_stream(
+                Req { admin: true },
+                payload(<progress as Endpoint>::ACTION, json!({ "n": 1 })),
+            )
             .collect(),
     );
     assert!(
@@ -511,7 +529,7 @@ async fn client_call_times_out_when_unanswered() {
     let session = Arc::new(session);
 
     session.handle(
-        &json!({ "kind": "call", "id": 1, "action": "notify_user", "params": { "name": "x" } }),
+        &json!({ "kind": "call", "id": 1, "action": <notify_user as Endpoint>::ACTION, "params": { "name": "x" } }),
     );
 
     // The server→client call goes out...
@@ -635,11 +653,10 @@ fn auth_router() -> Router<App, AuthReq> {
 
 #[test]
 fn middleware_rejects_before_reaching_action() {
+    let name = <whoami_authed as Endpoint>::ACTION;
     // no token → 401, action body never runs
-    let denied = block_on(
-        auth_router().on_request(AuthReq::default(), payload("whoami_authed", json!(null))),
-    );
-    assert_eq!(denied["whoami_authed"]["error"]["code"], 401);
+    let denied = block_on(auth_router().on_request(AuthReq::default(), payload(name, json!(null))));
+    assert_eq!(denied[name]["error"]["code"], 401);
 }
 
 static ACTION_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -660,6 +677,7 @@ impl Middleware<App, AuthReq> for Deny {
 #[test]
 fn before_error_never_calls_the_action() {
     ACTION_CALLS.store(0, Ordering::SeqCst);
+    let counted_name = <counted as Endpoint>::ACTION;
     let router = Router::builder()
         .ctx(App {
             greeting: "Hi".to_owned(),
@@ -667,21 +685,22 @@ fn before_error_never_calls_the_action() {
         .register(counted.middleware(Deny))
         .build();
 
-    let out = block_on(router.on_request(AuthReq::default(), payload("counted", json!(null))));
-    assert_eq!(out["counted"]["error"]["code"], 403);
+    let out = block_on(router.on_request(AuthReq::default(), payload(counted_name, json!(null))));
+    assert_eq!(out[counted_name]["error"]["code"], 403);
     // the action body never ran
     assert_eq!(ACTION_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn middleware_passes_and_injects_user() {
+    let name = <whoami_authed as Endpoint>::ACTION;
     let req = AuthReq {
         bearer: Some("valid:alice".to_owned()),
         user: OnceLock::new(),
     };
-    let ok = block_on(auth_router().on_request(req, payload("whoami_authed", json!(null))));
-    assert_eq!(ok["whoami_authed"]["status"], "ok");
-    assert_eq!(ok["whoami_authed"]["data"], json!("alice")); // injected by the guard
+    let ok = block_on(auth_router().on_request(req, payload(name, json!(null))));
+    assert_eq!(ok[name]["status"], "ok");
+    assert_eq!(ok[name]["data"], json!("alice")); // injected by the guard
 }
 
 static AFTER_RAN: AtomicUsize = AtomicUsize::new(0);
@@ -704,7 +723,8 @@ fn middleware_after_runs_once_the_action_completes() {
         .register(counted.middleware(Audit))
         .build();
 
-    block_on(router.on_request(AuthReq::default(), payload("counted", json!(null))));
+    let counted_name = <counted as Endpoint>::ACTION;
+    block_on(router.on_request(AuthReq::default(), payload(counted_name, json!(null))));
     assert_eq!(ACTION_CALLS.load(Ordering::SeqCst), 1); // action ran
     assert_eq!(AFTER_RAN.load(Ordering::SeqCst), 1); // ...then `after`
 }
@@ -730,10 +750,11 @@ fn stream_middleware_guards_the_stream() {
         .register_stream(count.middleware(RequireAdmin))
         .build();
 
+    let count_name = <count as Endpoint>::ACTION;
     // denied → a single 403 error frame, the stream body never starts
     let denied: Vec<Frame> = block_on(
         router
-            .on_stream(Req { admin: false }, payload("count", json!({"n": 3})))
+            .on_stream(Req { admin: false }, payload(count_name, json!({"n": 3})))
             .collect(),
     );
     assert!(matches!(denied.first(), Some(Frame::Error { error, .. }) if error.code == 403));
@@ -742,7 +763,7 @@ fn stream_middleware_guards_the_stream() {
     // allowed → 2 items + End
     let allowed: Vec<Frame> = block_on(
         router
-            .on_stream(Req { admin: true }, payload("count", json!({"n": 2})))
+            .on_stream(Req { admin: true }, payload(count_name, json!({"n": 2})))
             .collect(),
     );
     assert_eq!(allowed.len(), 3);
@@ -840,13 +861,25 @@ fn generates_typescript() {
     assert!(ts.contains("export interface Greeting {"), "{ts}");
     assert!(ts.contains("export interface Toast {"), "{ts}");
     assert!(ts.contains("message: string"), "{ts}");
-    // typed maps
+    // typed maps — action keys use the stable name (camelCase under `camel` feature)
     assert!(ts.contains("export interface ActionParameters {"), "{ts}");
-    assert!(ts.contains("greet: Greet;"), "{ts}");
+    let greet_key = format!("{}: Greet;", <greet as Endpoint>::ACTION);
+    assert!(
+        ts.contains(&greet_key),
+        "expected `{greet_key}` in TS: {ts}"
+    );
     assert!(ts.contains("export interface ActionResults {"), "{ts}");
-    assert!(ts.contains("count: number;"), "{ts}"); // stream item type
+    let count_result_key = format!("{}: number;", <count as Endpoint>::ACTION);
+    assert!(
+        ts.contains(&count_result_key),
+        "expected `{count_result_key}` in TS: {ts}"
+    ); // stream item type
     assert!(ts.contains("export interface ActionKinds {"), "{ts}");
-    assert!(ts.contains("count: \"stream\";"), "{ts}");
+    let count_kind_key = format!("{}: \"stream\";", <count as Endpoint>::ACTION);
+    assert!(
+        ts.contains(&count_kind_key),
+        "expected `{count_kind_key}` in TS: {ts}"
+    );
     assert!(
         ts.contains("export interface ClientActionParameters {"),
         "{ts}"

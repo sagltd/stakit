@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use stakit_model::Model;
-use stakit_router::{Error, Frame, ResponseError, Router, action};
+use stakit_router::{Endpoint, Error, Frame, ResponseError, Router, action};
 
 #[derive(Model, Serialize, Deserialize)]
 struct In {
@@ -50,9 +50,10 @@ fn payload(action: &str, params: Value) -> Value {
 
 #[test]
 fn default_hook_is_identity() {
+    let name = <explode as Endpoint>::ACTION;
     let router = Router::builder().ctx(()).register(explode).build();
-    let out = block_on(router.on_request((), payload("explode", json!(null))));
-    let env = &out["explode"];
+    let out = block_on(router.on_request((), payload(name, json!(null))));
+    let env = &out[name];
     assert_eq!(env["error"]["code"], 500);
     // Internal errors are already generic by default; the hook didn't alter it.
     assert_eq!(env["error"]["message"], "internal server error");
@@ -62,13 +63,14 @@ fn default_hook_is_identity() {
 
 #[test]
 fn prod_hook_redacts_message_and_code() {
+    let name = <explode as Endpoint>::ACTION;
     let router = Router::builder()
         .ctx(())
         .on_error(|e| Error::new(e.code, "request failed"))
         .register(explode)
         .build();
-    let out = block_on(router.on_request((), payload("explode", json!(null))));
-    let env = &out["explode"];
+    let out = block_on(router.on_request((), payload(name, json!(null))));
+    let env = &out[name];
     assert_eq!(env["error"]["code"], 500);
     assert_eq!(env["error"]["message"], "request failed");
     // The leaked DB URL never reaches the wire under any message.
@@ -79,6 +81,7 @@ fn prod_hook_redacts_message_and_code() {
 
 #[test]
 fn dev_hook_can_surface_detail_for_developers() {
+    let name = <explode as Endpoint>::ACTION;
     let router = Router::builder()
         .ctx(())
         // In dev we *want* the gory detail; the hook receives the `Error` and can
@@ -89,8 +92,8 @@ fn dev_hook_can_surface_detail_for_developers() {
         })
         .register(explode)
         .build();
-    let out = block_on(router.on_request((), payload("explode", json!(null))));
-    let env = &out["explode"];
+    let out = block_on(router.on_request((), payload(name, json!(null))));
+    let env = &out[name];
     assert_eq!(env["error"]["code"], 500);
     assert_eq!(
         env["error"]["message"],
@@ -107,6 +110,7 @@ fn hook_fires_on_not_found() {
         .on_error(|_| Error::new(404, "no"))
         .register(explode)
         .build();
+    // "ghost" is not a registered action; the key is unknown so the hook sees a 404.
     let out = block_on(router.on_request((), payload("ghost", json!(null))));
     assert_eq!(out["ghost"]["error"]["message"], "no");
 }
@@ -115,6 +119,7 @@ fn hook_fires_on_not_found() {
 
 #[test]
 fn hook_fires_on_stream_error_frames() {
+    let stream_name = <explode_stream as Endpoint>::ACTION;
     let router = Router::builder()
         .ctx(())
         .on_error(|e| Error::new(e.code, "redacted stream error"))
@@ -122,7 +127,7 @@ fn hook_fires_on_stream_error_frames() {
         .build();
     let frames: Vec<Frame> = block_on(
         router
-            .on_stream((), payload("explode_stream", json!({ "n": 1 })))
+            .on_stream((), payload(stream_name, json!({ "n": 1 })))
             .collect(),
     );
     match frames.iter().find(|f| matches!(f, Frame::Error { .. })) {
@@ -148,7 +153,9 @@ async fn hook_fires_on_session_path() {
     let mut outgoing = session.outgoing();
     let session = Arc::new(session);
 
-    session.handle(&json!({ "kind": "call", "id": 1, "action": "explode", "params": null }));
+    // Use the action's stable name (camelCase under the `camel` feature).
+    let action_name = <explode as Endpoint>::ACTION;
+    session.handle(&json!({ "kind": "call", "id": 1, "action": action_name, "params": null }));
     let result = tokio::time::timeout(Duration::from_secs(2), outgoing.recv())
         .await
         .unwrap()

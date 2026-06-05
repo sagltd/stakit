@@ -250,3 +250,47 @@ a silent client can't leak the suspended task.
 `ActionResults`, `ActionKinds`, `ClientAction*`) that the `@stakit/client`
 TypeScript package is generic over. See `docs/transport.md` for the wire
 contract shared by every client.
+
+### `camel` feature — camelCase TypeScript
+
+Enable `stakit-router/camel` to turn `snake_case` Rust fields into `camelCase`
+everywhere a client sees them: the generated TypeScript field names, the wire
+JSON, and validation-error paths (`error.fields` keys). Rust structs stay
+idiomatic `snake_case`.
+
+```toml
+stakit-router = { version = "…", features = ["camel"] }
+```
+
+```rust
+#[model] // injects the matching serde rename under `camel` (see the note below)
+struct CreateUser {
+    #[validate(min_len = 3)]
+    user_name: String,   // → TS `userName`, wire `"userName"`, error path `userName`
+    last_login_at: u64,  // → `lastLoginAt`
+}
+```
+
+The camelCase names exactly reproduce serde's `RenameRule::CamelCase`, so the
+generated TypeScript, the wire JSON, and the `error.fields` keys are always the
+same string — even for awkward identifiers (`_secret` → `secret`). The rename
+propagates through generics, so a monomorphized `Message<User>` exports
+`isSuccess`, not `is_success`. Enums work too: a struct variant's payload fields
+are camelCased while the externally-tagged variant name stays verbatim
+(`{ "UserCreated": { "userName": … } }`).
+
+Action names are camelCased too: `#[action] async fn create_user(…)` is dispatched
+and exported as `createUser`. The wire dispatch key and the generated `Router` map
+key both come from the one `#[action]`-generated name, so they always agree;
+action-to-action calls use the Rust function value (`cx.call(create_user, …)`), so
+they are unaffected. Reference the name in tests via `<create_user as Endpoint>::ACTION`
+rather than a hard-coded string so the code is correct under either feature state.
+
+> **Always declare camel models with `#[model]`, not a bare `#[derive(Model)]`.**
+> Under the feature the derive camelCases the TypeScript + validation paths
+> unconditionally; `#[model]` is what injects the matching serde rename
+> (`rename_all` for structs, `rename_all_fields` for enums) so the wire format
+> stays in lockstep. A bare `#[derive(Model)]` without that serde attribute would
+> emit camelCase TypeScript over a `snake_case` wire — a silent mismatch. Two
+> fields that would collapse to the same camelCase name (`user_name` + `userName`)
+> are a compile error, not a silent merge.

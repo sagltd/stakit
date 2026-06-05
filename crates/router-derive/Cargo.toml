@@ -16,5 +16,10 @@ syn.workspace = true
 quote.workspace = true
 proc-macro2.workspace = true
 
+[features]
+# camelCase action names on the wire and in generated TypeScript.
+# Forwarded from `stakit-router/camel`; do not enable directly.
+camel = []
+
 [lints]
 workspace = true

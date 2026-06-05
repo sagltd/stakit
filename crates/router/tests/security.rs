@@ -31,8 +31,8 @@ use serde_json::{Value, json};
 
 use stakit_model::Model;
 use stakit_router::{
-    ActionExt as _, Cx, Error, Frame, Middleware, ResponseError, Router, StreamActionExt as _,
-    action, err,
+    ActionExt as _, Cx, Endpoint, Error, Frame, Middleware, ResponseError, Router,
+    StreamActionExt as _, action, err,
 };
 
 // ── contexts ─────────────────────────────────────────────────────────────────
@@ -113,12 +113,13 @@ fn payload(action: &str, params: Value) -> Value {
 #[test]
 fn guard_rejects_before_validation_no_schema_leak() {
     ADMIN_BODY_RAN.store(0, Ordering::SeqCst);
+    let action_name = <admin_only as Endpoint>::ACTION;
     // Non-admin AND invalid params: the guard fires first → 403, not 422.
     let out = block_on(guarded_router().on_request(
         Req { admin: false },
-        payload("admin_only", json!({ "api_key": "short" })),
+        payload(action_name, json!({ "api_key": "short" })),
     ));
-    let env = &out["admin_only"];
+    let env = &out[action_name];
     assert_eq!(env["status"], "error");
     assert_eq!(env["error"]["code"], 403, "guard precedes validation");
     // no field/schema detail leaks to an unauthorized caller
@@ -132,23 +133,25 @@ fn guard_rejects_before_validation_no_schema_leak() {
 #[test]
 fn guard_rejects_valid_params_for_unauthorized_and_body_never_runs() {
     ADMIN_BODY_RAN.store(0, Ordering::SeqCst);
+    let action_name = <admin_only as Endpoint>::ACTION;
     // Valid params, but not admin → guard rejects with 403, body never runs.
     let out = block_on(guarded_router().on_request(
         Req { admin: false },
-        payload("admin_only", json!({ "api_key": "longenoughkey" })),
+        payload(action_name, json!({ "api_key": "longenoughkey" })),
     ));
-    assert_eq!(out["admin_only"]["error"]["code"], 403);
+    assert_eq!(out[action_name]["error"]["code"], 403);
     assert_eq!(ADMIN_BODY_RAN.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn guard_allows_admin_and_body_runs() {
     ADMIN_BODY_RAN.store(0, Ordering::SeqCst);
+    let action_name = <admin_only as Endpoint>::ACTION;
     let out = block_on(guarded_router().on_request(
         Req { admin: true },
-        payload("admin_only", json!({ "api_key": "longenoughkey" })),
+        payload(action_name, json!({ "api_key": "longenoughkey" })),
     ));
-    assert_eq!(out["admin_only"]["status"], "ok");
+    assert_eq!(out[action_name]["status"], "ok");
     assert_eq!(ADMIN_BODY_RAN.load(Ordering::SeqCst), 1);
 }
 
@@ -156,7 +159,10 @@ fn guard_allows_admin_and_body_runs() {
 fn stream_guard_rejects_unauthorized_with_single_error_frame() {
     let frames: Vec<Frame> = block_on(
         guarded_router()
-            .on_stream(Req { admin: false }, payload("count", json!({ "n": 5 })))
+            .on_stream(
+                Req { admin: false },
+                payload(<count as Endpoint>::ACTION, json!({ "n": 5 })),
+            )
             .collect(),
     );
     // Exactly one 403 frame, the stream body never starts.
@@ -233,14 +239,16 @@ fn per_call_errors_are_isolated_in_a_multicall_object() {
         .register(always_errors)
         .register(echo)
         .build();
+    let always_errors_name = <always_errors as Endpoint>::ACTION;
+    let echo_name = <echo as Endpoint>::ACTION;
     let out = block_on(router.on_request(
         Req { admin: true },
-        json!({ "always_errors": { "n": 1 }, "echo": { "n": 7 } }),
+        json!({ always_errors_name: { "n": 1 }, echo_name: { "n": 7 } }),
     ));
     // The failing call errors in its own slot; the good call still succeeds.
-    assert_eq!(out["always_errors"]["error"]["code"], 500);
-    assert_eq!(out["echo"]["status"], "ok");
-    assert_eq!(out["echo"]["data"], json!(7));
+    assert_eq!(out[always_errors_name]["error"]["code"], 500);
+    assert_eq!(out[echo_name]["status"], "ok");
+    assert_eq!(out[echo_name]["data"], json!(7));
 }
 
 // ── SAFETY: hostile websocket session frames must never panic ────────────────
@@ -303,7 +311,7 @@ async fn session_ignores_hostile_frames_without_panicking() {
     let mut out2 = session2.outgoing();
     let session2 = Arc::new(session2);
     session2.handle(&json!({
-        "kind": "call", "id": 1, "action": "greet", "params": { "name": "ok" }
+        "kind": "call", "id": 1, "action": <greet as Endpoint>::ACTION, "params": { "name": "ok" }
     }));
     let result = tokio::time::timeout(Duration::from_secs(2), out2.recv())
         .await
@@ -340,7 +348,7 @@ async fn session_validation_runs_on_the_duplex_path_too() {
     let session = Arc::new(session);
 
     session.handle(&json!({
-        "kind": "call", "id": 1, "action": "greet", "params": { "name": "" }
+        "kind": "call", "id": 1, "action": <greet as Endpoint>::ACTION, "params": { "name": "" }
     }));
     let result = tokio::time::timeout(Duration::from_secs(2), outgoing.recv())
         .await
@@ -368,11 +376,9 @@ async fn calls_back(cx: &Cx<App, Req>, _params: Count) -> Result<u64, Error> {
 
 #[test]
 fn client_call_without_duplex_errors_fast() {
+    let name = <calls_back as Endpoint>::ACTION;
     let router = Router::builder().ctx(App).register(calls_back).build();
-    let out = block_on(router.on_request(
-        Req { admin: true },
-        payload("calls_back", json!({ "n": 1 })),
-    ));
+    let out = block_on(router.on_request(Req { admin: true }, payload(name, json!({ "n": 1 }))));
     // 400, returned immediately — never an unbounded await on a missing channel.
-    assert_eq!(out["calls_back"]["error"]["code"], 400);
+    assert_eq!(out[name]["error"]["code"], 400);
 }
