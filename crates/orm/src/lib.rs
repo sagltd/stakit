@@ -74,8 +74,8 @@ pub use json::Json;
 pub use mutation::{Delete, Update};
 pub use nanoid::{nanoid, nanoid_custom, nanoid_sized};
 pub use projection::{
-    Agg, All, Count, NotNull, Nullable, Projection, SqlExpr, avg, count, count_col, max, min,
-    sql_expr, sum,
+    Agg, All, Count, NotNull, Nullable, Projection, SqlExpr, TsRank, avg, count, count_col, max,
+    min, sql_expr, sum, ts_rank, ts_rank_in, ts_rank_stored,
 };
 pub use query::Select;
 pub use raw::Raw;
@@ -123,7 +123,8 @@ pub mod prelude {
     };
     pub use crate::insert::Upsert;
     pub use crate::projection::{
-        All, Count, Projection, avg, count, count_col, max, min, sql_expr, sum,
+        All, Count, Projection, avg, count, count_col, max, min, sql_expr, sum, ts_rank,
+        ts_rank_in, ts_rank_stored,
     };
     pub use crate::schema::{Col, Rel, Table as TableTrait};
     pub use crate::vector::{Distance, Vector, distance};

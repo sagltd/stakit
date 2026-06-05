@@ -326,6 +326,50 @@ fn write_match(
     Ok(())
 }
 
+/// Render a Postgres `ts_rank(...)` full-text relevance score: `ts_rank(to_tsvector(
+/// '<cfg>', "t"."col"), plainto_tsquery('<cfg>', $N))`, or — when `stored` — against
+/// an already-stored `tsvector` column: `ts_rank("t"."col", plainto_tsquery('<cfg>',
+/// $N))`. `cfg` is a fixed `&'static` config (no injection); the query text is bound.
+/// Postgres-only: on an FTS5 dialect the bind is flagged so the terminal errors with
+/// `Error::Unsupported` rather than emitting a non-existent function.
+pub(crate) fn write_ts_rank(
+    writer: &mut SqlWriter,
+    table: &'static str,
+    name: &'static str,
+    query: &str,
+    config: Option<&'static str>,
+    stored: bool,
+) -> Result<(), IdentError> {
+    let crate::dialect::FullText::TsQuery(default_config) = writer.full_text() else {
+        writer.mark_unsupported("ts_rank (Postgres full-text only)");
+        // Still bind the value so placeholder numbering stays consistent; the terminal
+        // returns `Error::Unsupported` before this SQL is dispatched.
+        writer.push("ts_rank(");
+        writer.push_qualified(table, name)?;
+        writer.push(", ");
+        writer.push_bind(Value::Text(query.to_owned()));
+        writer.push(")");
+        return Ok(());
+    };
+    let config = config.unwrap_or(default_config);
+    writer.push("ts_rank(");
+    if !stored {
+        writer.push("to_tsvector('");
+        writer.push(config);
+        writer.push("', ");
+    }
+    writer.push_qualified(table, name)?;
+    if !stored {
+        writer.push(")");
+    }
+    writer.push(", plainto_tsquery('");
+    writer.push(config);
+    writer.push("', ");
+    writer.push_bind(Value::Text(query.to_owned()));
+    writer.push("))");
+    Ok(())
+}
+
 /// Render a literal-substring `LIKE`: `"table"."name" like $N escape '\'`. The
 /// pattern (already `%`/`_`/`\`-escaped and `%…%`-wrapped by [`contains`]) is
 /// always parameter-bound; the `escape '\'` clause makes the escaping effective.

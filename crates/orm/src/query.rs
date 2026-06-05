@@ -46,6 +46,7 @@ pub struct Select<P> {
     order: SmallVec<[Order; 4]>,
     nearest: Option<NearestOrder>,
     nearest_geo: Option<NearestGeo>,
+    rank_order: Option<crate::projection::TsRank>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -66,6 +67,7 @@ impl<P: Projection> Select<P> {
             order: SmallVec::new(),
             nearest: None,
             nearest_geo: None,
+            rank_order: None,
             limit: None,
             offset: None,
         }
@@ -133,10 +135,26 @@ impl<P: Projection> Select<P> {
         self
     }
 
-    /// Set the `WHERE` predicate.
+    /// Add a `WHERE` predicate. Repeated calls **AND** together, so
+    /// `.filter(a).filter(b)` means `a AND b` — chaining never silently drops an
+    /// earlier predicate (use [`or`](crate::or) explicitly for disjunction).
     #[must_use]
     pub fn filter(mut self, predicate: Predicate) -> Self {
-        self.filter = Some(predicate);
+        self.filter = Some(match self.filter.take() {
+            Some(existing) => crate::expr::and(existing, predicate),
+            None => predicate,
+        });
+        self
+    }
+
+    /// Order by Postgres full-text relevance, **highest first**:
+    /// `ORDER BY ts_rank(…) DESC`. Pair with [`matches`](crate::matches) in the filter
+    /// to get classic "search, ranked by relevance". Postgres-only (errors with
+    /// `Error::Unsupported` elsewhere). Build the rank with [`ts_rank`](crate::ts_rank)
+    /// / [`ts_rank_stored`](crate::ts_rank_stored).
+    #[must_use]
+    pub fn order_by_rank(mut self, rank: crate::projection::TsRank) -> Self {
+        self.rank_order = Some(rank);
         self
     }
 
@@ -217,6 +235,7 @@ impl<P: Projection> Select<P> {
             order,
             nearest,
             nearest_geo,
+            rank_order,
             limit,
             offset,
             exec: _,
@@ -284,6 +303,14 @@ impl<P: Projection> Select<P> {
             writer.push(" <-> ");
             writer.push_bind(geo.geom);
             writer.push(" asc");
+            order_started = true;
+        }
+        if let Some(rank) = rank_order {
+            // Relevance: `ORDER BY ts_rank(…) DESC`. `write` flags non-Postgres dialects
+            // as unsupported, so the terminal errors before dispatching invalid SQL.
+            writer.push(if order_started { ", " } else { " order by " });
+            rank.write(&mut writer)?;
+            writer.push(" desc");
         }
         if let Some(limit) = limit {
             writer.push(" limit ");
@@ -377,6 +404,7 @@ impl<P: Projection> Select<P> {
         self.order.clear();
         self.nearest = None;
         self.nearest_geo = None;
+        self.rank_order = None;
         let exec = self.take_exec()?;
         let (_projection, inner, arguments) = self.into_sql()?;
         // Pre-size + push instead of `format!` to avoid a second full-length copy.
@@ -404,6 +432,7 @@ impl<P: Projection> Select<P> {
         self.order.clear();
         self.nearest = None;
         self.nearest_geo = None;
+        self.rank_order = None;
         let exec = self.take_exec()?;
         let (_projection, inner, arguments) = self.into_sql()?;
         let mut sql = String::with_capacity(inner.len() + 16);

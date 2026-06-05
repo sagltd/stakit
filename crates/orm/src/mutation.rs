@@ -46,10 +46,15 @@ impl<T: Table> Update<T> {
         self
     }
 
-    /// Set the `WHERE` predicate.
+    /// Add a `WHERE` predicate. Repeated calls **AND** together, so
+    /// `.filter(a).filter(b)` means `a AND b` — chaining never silently drops an
+    /// earlier predicate (use [`or`](crate::or) explicitly for disjunction).
     #[must_use]
     pub fn filter(mut self, predicate: Predicate) -> Self {
-        self.filter = Some(predicate);
+        self.filter = Some(match self.filter.take() {
+            Some(existing) => crate::expr::and(existing, predicate),
+            None => predicate,
+        });
         self
     }
 
@@ -131,10 +136,15 @@ impl<T: Table> Delete<T> {
         }
     }
 
-    /// Set the `WHERE` predicate.
+    /// Add a `WHERE` predicate. Repeated calls **AND** together, so
+    /// `.filter(a).filter(b)` means `a AND b` — chaining never silently drops an
+    /// earlier predicate (use [`or`](crate::or) explicitly for disjunction).
     #[must_use]
     pub fn filter(mut self, predicate: Predicate) -> Self {
-        self.filter = Some(predicate);
+        self.filter = Some(match self.filter.take() {
+            Some(existing) => crate::expr::and(existing, predicate),
+            None => predicate,
+        });
         self
     }
 

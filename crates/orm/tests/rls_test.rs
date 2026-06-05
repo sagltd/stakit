@@ -169,3 +169,52 @@ async fn visible_ids(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>) -> V
         .map(|row| row.get::<i64, _>("id"))
         .collect()
 }
+
+// ----- typed runtime RLS-context helper: Tx::set_config -----
+
+#[derive(stakit_orm::Table, Debug)]
+#[table(name = "setting_probe")]
+#[allow(dead_code)]
+struct SettingProbe {
+    #[column(pk, nullable, sql_type = "text")]
+    v: Option<String>,
+}
+
+#[tokio::test]
+async fn tx_set_config_sets_transaction_scoped_rls_context() {
+    let (postgres, pool) = setup().await;
+    let db = stakit_orm::Db::new(pool);
+
+    // Inside a transaction, set_config sets the GUC a policy reads via
+    // current_setting(...); read it back in the same tx.
+    db.transaction(|tx| async move {
+        tx.set_config("app.user_id", "alice", true).await?;
+        let rows = tx
+            .raw("select current_setting('app.user_id', true) as v")
+            .all::<SettingProbe>()
+            .await?;
+        assert_eq!(
+            rows[0].v.as_deref(),
+            Some("alice"),
+            "set_config set the GUC for this tx"
+        );
+        Ok(())
+    })
+    .await
+    .expect("set_config inside tx");
+
+    // local = true → transaction-scoped: a later tx sees the default (unset), proving
+    // it didn't leak onto the pooled connection.
+    db.transaction(|tx| async move {
+        let rows = tx
+            .raw("select current_setting('app.user_id', true) as v")
+            .all::<SettingProbe>()
+            .await?;
+        assert_eq!(rows[0].v, None, "local GUC reset after the previous tx");
+        Ok(())
+    })
+    .await
+    .expect("read after");
+
+    postgres.stop().await.ok();
+}

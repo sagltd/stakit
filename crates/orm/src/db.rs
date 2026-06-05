@@ -530,6 +530,44 @@ impl Tx {
     pub fn raw(&self, sql: impl Into<String>) -> Raw {
         Raw::new(self.exec.clone(), sql)
     }
+
+    /// Set a Postgres run-time parameter for this transaction — typically the
+    /// row-level-security context a policy reads via `current_setting('…')`.
+    ///
+    /// `key`, `value`, and `local` are all **bound parameters** (`set_config` is a
+    /// function, so even the parameter name is bound — no injection). Use `local =
+    /// true` so the setting is **transaction-scoped** and resets on commit/rollback
+    /// — the pool-safe choice (a session-scoped GUC would leak to the next request
+    /// that reuses the connection). RLS context must be set on the **same
+    /// connection** as the queries, which is exactly what a transaction guarantees —
+    /// hence this lives on [`Tx`], not [`Db`].
+    ///
+    /// ```no_run
+    /// # async fn f(db: stakit_orm::Db, user_id: String) -> stakit_orm::Result<()> {
+    /// db.transaction(|tx| async move {
+    ///     tx.set_config("app.user_id", &user_id, true).await?;
+    ///     // Postgres now applies the policy's `using (… current_setting('app.user_id') …)`.
+    ///     let mine = tx.find::<Post>().all().await?;
+    ///     Ok(())
+    /// }).await
+    /// # }
+    /// # #[derive(stakit_orm::Table)] #[table(name="posts")] struct Post { #[column(pk)] id: i64 }
+    /// ```
+    ///
+    /// (For `SET ROLE`, which can't take a bound parameter, use `tx.raw(...)` with a
+    /// validated/quoted role identifier.)
+    ///
+    /// # Errors
+    /// Returns an error if the statement fails (Postgres feature).
+    pub async fn set_config(&self, key: &str, value: &str, local: bool) -> Result<()> {
+        Raw::new(self.exec.clone(), "select set_config($1, $2, $3)")
+            .bind(key.to_owned())
+            .bind(value.to_owned())
+            .bind(local)
+            .exec()
+            .await
+            .map(|_| ())
+    }
 }
 
 /// Turn on `libSQL` FK enforcement on a fresh connection (off by default, like

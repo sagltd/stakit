@@ -1,7 +1,7 @@
 //! Schema diffing and SQL generation. Pure functions (a [`Resolver`] supplies
 //! interactive decisions), so the core is unit-testable without stdin.
 
-use crate::model::{Column, Policy, Privilege, Role, Schema, Table};
+use crate::model::{Column, Index, Policy, Privilege, Role, Schema, Table};
 use core::fmt::Write as _;
 
 /// A single schema change.
@@ -55,6 +55,10 @@ pub enum Change {
     CreatePolicy { table: String, policy: Policy },
     /// Drop a policy (full definition kept for the down migration).
     DropPolicy { table: String, policy: Policy },
+    /// Create a table-level (composite/unique/method/partial) index.
+    CreateIndex { table: String, index: Index },
+    /// Drop a table-level index (full definition kept for the down migration).
+    DropIndex { table: String, index: Index },
 }
 
 /// Supplies interactive decisions during diffing.
@@ -160,6 +164,7 @@ pub fn diff(old: &Schema, new: &Schema, resolver: &mut dyn Resolver) -> Vec<Chan
         if let Some(old_table) = old.table(&new_table.name) {
             diff_table(old_table, new_table, resolver, &mut changes);
             diff_table_rls(old_table, new_table, &mut changes);
+            diff_table_indexes(old_table, new_table, &mut changes);
         }
     }
 
@@ -172,6 +177,34 @@ pub fn diff(old: &Schema, new: &Schema, resolver: &mut dyn Resolver) -> Vec<Chan
     }
 
     changes
+}
+
+/// Human-readable warnings for changes that **widen** access (a security downgrade),
+/// so the transition isn't buried in the generated SQL. For the `gen` command to
+/// print; non-fatal.
+#[must_use]
+pub fn widening_warnings(changes: &[Change]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for change in changes {
+        match change {
+            Change::SetRls {
+                table,
+                enabled: false,
+            } => warnings.push(format!(
+                "disables row-level security on \"{table}\" — every row becomes visible to \
+                 anyone with table access"
+            )),
+            Change::SetForceRls {
+                table,
+                forced: false,
+            } => warnings.push(format!(
+                "un-forces row-level security on \"{table}\" — the table owner now bypasses \
+                 all policies"
+            )),
+            _ => {}
+        }
+    }
+    warnings
 }
 
 /// Diff the row-level-security aspects of an **existing** table (RLS enable/force,
@@ -400,6 +433,65 @@ fn create_index_sql(table: &str, column: &Column) -> String {
     )
 }
 
+/// `create [unique] index "<name>" on "<table>" [using <method>] ("c1","c2",…) [where <pred>];`
+/// for a table-level [`Index`]. Identifiers are quoted; `method` is a validated bare
+/// identifier; `predicate` is verbatim trusted SQL (reviewed before apply).
+fn create_table_index_sql(table: &str, index: &Index) -> String {
+    let unique = if index.unique { "unique " } else { "" };
+    let using = index
+        .method
+        .as_deref()
+        .map_or_else(String::new, |method| format!(" using {method}"));
+    let columns = index
+        .columns
+        .iter()
+        .map(|column| quote(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!(
+        "create {unique}index {} on {}{using} ({columns})",
+        quote(&index.name),
+        quote(table)
+    );
+    if let Some(predicate) = &index.predicate {
+        let _ = write!(sql, " where {predicate}");
+    }
+    sql.push(';');
+    sql
+}
+
+/// `drop index "<name>";` — Postgres index names are schema-scoped (no table qualifier).
+fn drop_index_sql(index: &Index) -> String {
+    format!("drop index {};", quote(&index.name))
+}
+
+/// Diff table-level indexes by name. A changed index (any field differs) is dropped
+/// and recreated under the same name; drops are emitted before creates.
+fn diff_table_indexes(old: &Table, new: &Table, changes: &mut Vec<Change>) {
+    for index in &old.indexes {
+        let gone_or_changed = new
+            .index(&index.name)
+            .is_none_or(|current| current != index);
+        if gone_or_changed {
+            changes.push(Change::DropIndex {
+                table: new.name.clone(),
+                index: index.clone(),
+            });
+        }
+    }
+    for index in &new.indexes {
+        let new_or_changed = old
+            .index(&index.name)
+            .is_none_or(|previous| previous != index);
+        if new_or_changed {
+            changes.push(Change::CreateIndex {
+                table: new.name.clone(),
+                index: index.clone(),
+            });
+        }
+    }
+}
+
 fn create_table_sql(table: &Table) -> String {
     let mut lines: Vec<String> = table
         .columns
@@ -581,6 +673,13 @@ fn create_object_sql(table: &Table) -> String {
         sql.push('\n');
         sql.push_str(&create_index_sql(&table.name, column));
     }
+    // Table-level indexes after the table (and its single-column indexes); the
+    // referenced columns — including a generated `tsvector` for a GIN index — already
+    // exist by now since they are part of the CREATE TABLE above.
+    for index in &table.indexes {
+        sql.push('\n');
+        sql.push_str(&create_table_index_sql(&table.name, index));
+    }
     for grant in &table.grants {
         sql.push('\n');
         sql.push_str(&grant_sql(&table.name, &grant.role, &grant.privileges));
@@ -652,6 +751,8 @@ fn up(change: &Change) -> String {
         } => revoke_sql(table, role, privileges),
         Change::CreatePolicy { table, policy } => create_policy_sql(table, policy),
         Change::DropPolicy { table, policy } => drop_policy_sql(table, policy),
+        Change::CreateIndex { table, index } => create_table_index_sql(table, index),
+        Change::DropIndex { index, .. } => drop_index_sql(index),
     }
 }
 
@@ -712,6 +813,9 @@ fn down(change: &Change) -> String {
         } => grant_sql(table, role, privileges),
         Change::CreatePolicy { table, policy } => drop_policy_sql(table, policy),
         Change::DropPolicy { table, policy } => create_policy_sql(table, policy),
+        // An index is undone by dropping it; a drop is undone by recreating it.
+        Change::CreateIndex { index, .. } => drop_index_sql(index),
+        Change::DropIndex { table, index } => create_table_index_sql(table, index),
     }
 }
 
@@ -734,8 +838,32 @@ pub fn down_sql(changes: &[Change]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Change, Resolver, diff, down_sql, up_sql};
-    use crate::model::{Column, Grant, Policy, PolicyCommand, Privilege, Role, Schema, Table};
+    use super::{Change, Resolver, diff, down_sql, up_sql, widening_warnings};
+    use crate::model::{
+        Column, Grant, Index, Policy, PolicyCommand, Privilege, Role, Schema, Table,
+    };
+
+    fn index(name: &str, columns: &[&str]) -> Index {
+        Index {
+            name: name.to_owned(),
+            columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+            unique: false,
+            method: None,
+            predicate: None,
+        }
+    }
+
+    fn table_with_indexes(name: &str, columns: Vec<Column>, indexes: Vec<Index>) -> Schema {
+        Schema {
+            tables: vec![Table {
+                name: name.to_owned(),
+                columns,
+                indexes,
+                ..Table::default()
+            }],
+            roles: Vec::new(),
+        }
+    }
 
     fn col(name: &str, ty: &str) -> Column {
         Column {
@@ -1547,5 +1675,90 @@ mod tests {
         table.policies = vec![select_policy("p", "app_user", "true")];
         let schema = schema_with(vec![table], vec![role("app_user")]);
         assert!(diff(&schema, &schema, &mut NeverRename).is_empty());
+    }
+
+    #[test]
+    fn create_table_emits_composite_index_after_the_table() {
+        let new = table_with_indexes(
+            "event",
+            vec![col("id", "bigint"), col("a", "bigint"), col("b", "bigint")],
+            vec![index("idx_ab", &["a", "b"])],
+        );
+        let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
+        // The index appears after the CREATE TABLE, columns quoted in order.
+        assert!(
+            up.contains(r#"create index "idx_ab" on "event" ("a", "b");"#),
+            "got: {up}"
+        );
+        let table_pos = up.find("create table").expect("table");
+        let index_pos = up.find("create index").expect("index");
+        assert!(index_pos > table_pos, "index must follow the table");
+    }
+
+    #[test]
+    fn add_unique_method_index_to_existing_table_is_reversible() {
+        let columns = vec![col("id", "bigint"), col("a", "bigint"), col("b", "bigint")];
+        let old = table_with_indexes("event", columns.clone(), Vec::new());
+        let new = table_with_indexes(
+            "event",
+            columns,
+            vec![Index {
+                name: "uq_ab".to_owned(),
+                columns: vec!["a".to_owned(), "b".to_owned()],
+                unique: true,
+                method: Some("btree".to_owned()),
+                predicate: Some("a is not null".to_owned()),
+            }],
+        );
+        let changes = diff(&old, &new, &mut NeverRename);
+        assert_eq!(
+            up_sql(&changes),
+            r#"create unique index "uq_ab" on "event" using btree ("a", "b") where a is not null;"#
+        );
+        assert_eq!(down_sql(&changes), r#"drop index "uq_ab";"#);
+    }
+
+    #[test]
+    fn changing_an_index_drops_then_recreates_it() {
+        let columns = vec![col("id", "bigint"), col("a", "bigint"), col("b", "bigint")];
+        let old = table_with_indexes("event", columns.clone(), vec![index("i", &["a"])]);
+        let new = table_with_indexes("event", columns, vec![index("i", &["a", "b"])]);
+        let up = up_sql(&diff(&old, &new, &mut NeverRename));
+        assert!(up.contains(r#"drop index "i";"#), "drop first: {up}");
+        assert!(
+            up.contains(r#"create index "i" on "event" ("a", "b");"#),
+            "recreate: {up}"
+        );
+        assert!(
+            up.find("drop index").unwrap() < up.find("create index").unwrap(),
+            "drop must precede recreate"
+        );
+    }
+
+    #[test]
+    fn widening_warnings_flags_rls_disable_and_unforce_only() {
+        let changes = vec![
+            Change::SetRls {
+                table: "posts".to_owned(),
+                enabled: false,
+            },
+            Change::SetForceRls {
+                table: "posts".to_owned(),
+                forced: false,
+            },
+            // These do NOT widen access -> no warning.
+            Change::SetRls {
+                table: "posts".to_owned(),
+                enabled: true,
+            },
+            Change::SetForceRls {
+                table: "posts".to_owned(),
+                forced: true,
+            },
+        ];
+        let warnings = widening_warnings(&changes);
+        assert_eq!(warnings.len(), 2, "got: {warnings:?}");
+        assert!(warnings[0].contains("disables row-level security"));
+        assert!(warnings[1].contains("un-forces"));
     }
 }

@@ -145,6 +145,27 @@ pub struct Grant {
     pub privileges: Vec<Privilege>,
 }
 
+/// A table-level (possibly multi-column) index. Single-column indexes declared via
+/// `#[column(index)]` stay on [`Column`]; this models the composite,
+/// unique-composite, method-qualified (e.g. `gin`), and partial indexes declared at
+/// the table level with `index(...)` / `unique_index(...)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Index {
+    /// Index name (unique per schema).
+    pub name: String,
+    /// Indexed columns, in declaration order.
+    pub columns: Vec<String>,
+    /// Whether this is a `UNIQUE` index.
+    #[serde(default)]
+    pub unique: bool,
+    /// Access method (`gin`, `gist`, `hash`, …); `None` is the B-tree default.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Partial-index `WHERE` predicate (verbatim trusted SQL); `None` is a full index.
+    #[serde(default)]
+    pub predicate: Option<String>,
+}
+
 /// A database role (`CREATE ROLE`). Passwords are never modeled — they must be set
 /// out of band, never written into a migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +206,10 @@ pub struct Table {
     /// Privilege grants, one per role, sorted by role for stable diffs.
     #[serde(default)]
     pub grants: Vec<Grant>,
+    /// Table-level (composite/unique/method/partial) indexes, sorted by name for
+    /// stable diffs. Single-column `#[column(index)]` indexes are not listed here.
+    #[serde(default)]
+    pub indexes: Vec<Index>,
 }
 
 impl Table {
@@ -204,6 +229,12 @@ impl Table {
     #[must_use]
     pub fn grant(&self, role: &str) -> Option<&Grant> {
         self.grants.iter().find(|grant| grant.role == role)
+    }
+
+    /// Find a table-level index by name.
+    #[must_use]
+    pub fn index(&self, name: &str) -> Option<&Index> {
+        self.indexes.iter().find(|index| index.name == name)
     }
 }
 
@@ -233,7 +264,7 @@ impl Schema {
 
 #[cfg(test)]
 mod tests {
-    use super::{Grant, Policy, PolicyCommand, Privilege, Role, Schema, Table};
+    use super::{Grant, Index, Policy, PolicyCommand, Privilege, Role, Schema, Table};
 
     /// A snapshot written before RLS existed (no `roles`, no per-table RLS fields)
     /// must still load — the new fields default, so old snapshots are not a hard error.
@@ -255,6 +286,10 @@ mod tests {
         assert!(!users.force_rls);
         assert!(users.policies.is_empty());
         assert!(users.grants.is_empty());
+        assert!(
+            users.indexes.is_empty(),
+            "indexes default for old snapshots"
+        );
     }
 
     #[test]
@@ -275,6 +310,13 @@ mod tests {
                 grants: vec![Grant {
                     role: "app_user".to_owned(),
                     privileges: vec![Privilege::Select, Privilege::Insert],
+                }],
+                indexes: vec![Index {
+                    name: "idx_posts_owner".to_owned(),
+                    columns: vec!["author_id".to_owned(), "id".to_owned()],
+                    unique: true,
+                    method: Some("btree".to_owned()),
+                    predicate: Some("id is not null".to_owned()),
                 }],
             }],
             roles: vec![Role {

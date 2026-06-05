@@ -111,7 +111,9 @@ struct Post {
 
 Column attributes: `pk`, `unique`, `index`, `index_method = "<am>"`,
 `opclass = "<opclass>"`, `nullable`, `default = "<sql>"`, `generated = "<expr>"`,
-`name = "<col>"`, `sql_type = "<type>"`, `references = Type::col`,
+`name = "<col>"`, `sql_type = "<type>"`, `references = Type::col` (typed, with a
+compile-time PK-type check) **or** `references = "table.column"` (a string foreign
+key to a table whose Rust type isn't in scope — e.g. a **cross-crate** reference),
 `on_delete = "cascade|restrict|set null|no action"`. Mark two or more fields
 `#[column(pk)]` for a **composite primary key** (the migration emits
 `primary key (a, b)`); such a table's `Pk` is a tuple, so `db.get` is unavailable —
@@ -121,6 +123,23 @@ query it with `find().filter(..)`. `#[column(index)]` makes the CLI emit a
 `index_method = "gin"` for a tsvector/JSONB GIN index). `generated = "<expr>"`
 emits a `GENERATED ALWAYS AS (<expr>) STORED` column (database-computed, so it is
 omitted from the insert companion).
+
+**Multi-column indexes** are declared at the table level (mirroring `policy(...)` /
+`grant(...)` nesting), since a column attribute can't span columns:
+
+```rust
+#[derive(Table)]
+#[table(name = "event",
+    index(idx_event_window = (account_id, user_id, session_id, seq)),  // composite
+    unique_index(uq_event_session_seq = (session_id, seq)),            // unique-composite
+    index(idx_event_tsv = (tsv), method = "gin"),                      // GIN access method
+    index(idx_active = (account_id), predicate = "deleted_at is null"))] // partial
+struct Event { /* … each indexed column must be a real field (checked at compile time) */ }
+```
+
+The CLI emits `create [unique] index "<name>" on "<table>" [using <method>] ("c1","c2",…)
+[where <predicate>];` after the table, reversible in the down migration. (Single-column
+indexes stay on `#[column(index)]`.)
 
 ### Foreign keys & `ON DELETE CASCADE`
 
@@ -394,14 +413,14 @@ use uuid::Uuid;
 
 // A database role -> CREATE ROLE in the migration. `AppUser::ROLE == "app_user"`.
 #[derive(Role)]
-#[role(name = "app_user", login)]   // also: createdb, createrole, bypassrls
+#[role(name = "app_user", login)]   // also: createdb, createrole, bypassrls (⚠ bypasses ALL RLS)
 struct AppUser;
 
 #[derive(Table)]
 #[table(
     name = "posts",
     rls,                                            // ENABLE ROW LEVEL SECURITY
-    // force_rls,                                    // (optional) also enforce for the owner
+    // force_rls,                                    // also enforce for the owner (else owner bypasses)
     grant(app_user(select, insert, update, delete)),// GRANT ... TO app_user
     policy(
         // each policy is `name(command, to = "role(s)", using/check = "<sql>")`
@@ -440,20 +459,39 @@ Rules (checked at compile time **and** at generation time):
   `to` targets `PUBLIC`. `using`/`check` are verbatim SQL (reviewed before apply, like
   `default`/`generated`).
 
-**Using it at runtime.** Policies read the connected role and session settings, so set
-them per request/transaction on a single connection (RLS context is connection-local):
+**Using it at runtime.** Policies read the connected role and session settings, and
+RLS context is **connection-local** — so set it inside a transaction (one pinned
+connection) with the typed, transaction-scoped `tx.set_config`:
 
 ```rust
 db.transaction(|tx| async move {
-    tx.raw("set local role app_user").exec().await?;
-    tx.raw("select set_config('app.user_id', $1, true)")
-        .bind(current_user_id.to_string())
-        .exec().await?;
+    // transaction-scoped (local = true) -> resets on commit, pool-safe.
+    // key/value are bound parameters (no injection).
+    tx.set_config("app.user_id", &current_user_id.to_string(), true).await?;
     // every query in this tx now sees only rows the policy permits
     let mine = tx.find::<Post>().all().await?;
     Ok(mine)
 }).await?;
 ```
+
+`SET ROLE` can't take a bound parameter, so do it via `tx.raw("set local role \"app_user\"")`
+with a quoted/validated role name when a policy keys on the role rather than a GUC.
+
+**Safety notes — read these:**
+
+- **`bypassrls` defeats all RLS.** A role created with `bypassrls` is exempt from *every*
+  policy on *every* table. Grant it only to trusted admin roles.
+- **RLS without `force_rls` lets the table owner (and superusers) bypass policies.** The
+  owner connection sees all rows — convenient for seeding/admin, but if your app connects
+  as the table owner the policies won't apply. Add `force_rls` to subject the owner too,
+  and have the app connect as a non-owner role (e.g. `app_user`).
+- **Roles are cluster-global, not per-database.** `create role "app_user"` affects the
+  whole Postgres cluster — generating the same role from two databases in one cluster will
+  collide, and `drop role` fails while the role owns objects elsewhere. For shared
+  clusters, manage roles out of band and reference them (a `gen`-time warning fires if a
+  grant/policy names a role you didn't declare).
+- Dropping a policy or removing `rls`/`force_rls` **widens access** — `gen` prints a
+  warning so the downgrade isn't buried in the SQL.
 
 ## Raw SQL escape hatch
 

@@ -36,6 +36,10 @@ pub fn derive_table(input: TokenStream) -> TokenStream {
 /// role the migration CLI emits as `CREATE ROLE`. The struct gains a `Self::ROLE`
 /// constant (the role name) for use in code (e.g. `SET ROLE`). Attributes are
 /// validated at compile time.
+///
+/// **⚠ `bypassrls`** exempts the role from **all** row-level-security policies on
+/// every table — grant it only to trusted admin roles. Note roles are **cluster-global**
+/// (`CREATE ROLE` is not per-database).
 #[proc_macro_derive(Role, attributes(role))]
 pub fn derive_role(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -535,6 +539,15 @@ fn expand_row(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     })
 }
 
+/// A column's foreign-key reference. `Typed` (`references = Type::col`) reads the
+/// table name from `<Type as Table>::TABLE` and gets a compile-time PK-type check;
+/// `Named` (`references = "table.column"`) names the table directly — no type in
+/// scope, for a cross-crate reference — and skips the type check.
+enum FkRef {
+    Typed(Path, String),
+    Named(String, String),
+}
+
 #[allow(clippy::struct_excessive_bools)] // column flags (pk/unique/index/nullable)
 struct ColumnModel {
     field: Ident,
@@ -548,7 +561,7 @@ struct ColumnModel {
     opclass: Option<String>,
     is_nullable: bool,
     default: Option<String>,
-    references: Option<(Path, String)>,
+    references: Option<FkRef>,
     on_delete: Option<String>,
     generated: Option<String>,
 }
@@ -763,6 +776,20 @@ fn table_attrs(input: &DeriveInput) -> syn::Result<String> {
     let mut rls = false;
     let mut force_rls = false;
     let mut has_policy = false;
+    // Column field names, for the compile-time index-column guard (relation markers
+    // are not columns, so they're excluded — matching the CLI parser).
+    let field_names: std::collections::HashSet<String> = match &input.data {
+        Data::Struct(data) => match &data.fields {
+            Fields::Named(named) => named
+                .named
+                .iter()
+                .filter(|field| unwrap_generic(&field.ty, "Rel").is_none())
+                .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
+                .collect(),
+            _ => std::collections::HashSet::new(),
+        },
+        _ => std::collections::HashSet::new(),
+    };
     for attr in &input.attrs {
         if !attr.path().is_ident("table") {
             continue;
@@ -779,6 +806,8 @@ fn table_attrs(input: &DeriveInput) -> syn::Result<String> {
             } else if meta.path.is_ident("policy") {
                 has_policy = true;
                 meta.parse_nested_meta(|entry| validate_policy_entry(&entry))?;
+            } else if meta.path.is_ident("index") || meta.path.is_ident("unique_index") {
+                validate_index_entry(&meta, &field_names)?;
             } else {
                 // Reject typos rather than silently disabling RLS (a `rsl` typo would
                 // otherwise leave the table unprotected).
@@ -802,6 +831,69 @@ fn table_attrs(input: &DeriveInput) -> syn::Result<String> {
         ));
     }
     Ok(name)
+}
+
+/// Validate an `index(<name> = (cols), method = "…", predicate = "…")` (or
+/// `unique_index(...)`) table attribute: the name is a valid identifier, the method
+/// (if any) is a bare SQL identifier, the predicate (if any) is non-empty, and every
+/// indexed column is a real field on the struct. Emits no runtime code — the
+/// migration CLI generates the `CREATE INDEX`; this is the compile-time guard so a
+/// typo fails to build rather than at `gen`/apply.
+fn validate_index_entry(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    field_names: &std::collections::HashSet<String>,
+) -> syn::Result<()> {
+    let mut saw_name = false;
+    meta.parse_nested_meta(|entry| {
+        if entry.path.is_ident("method") {
+            let method = entry.value()?.parse::<LitStr>()?;
+            if !is_sql_identifier(&method.value(), false) {
+                return Err(syn::Error::new_spanned(
+                    &method,
+                    "index method must be a bare SQL identifier (e.g. \"gin\", \"gist\")",
+                ));
+            }
+        } else if entry.path.is_ident("predicate") {
+            let predicate = entry.value()?.parse::<LitStr>()?;
+            if predicate.value().is_empty() {
+                return Err(syn::Error::new_spanned(
+                    &predicate,
+                    "index predicate must not be empty",
+                ));
+            }
+        } else {
+            if saw_name {
+                return Err(entry.error("index(...) takes one `name = (columns)` entry"));
+            }
+            saw_name = true;
+            let ident = entry
+                .path
+                .get_ident()
+                .ok_or_else(|| entry.error("index name must be a bare identifier"))?;
+            validate_ident(&ident.to_string(), ident)?;
+            let value = entry.value()?;
+            let content;
+            syn::parenthesized!(content in value);
+            let columns =
+                syn::punctuated::Punctuated::<Ident, syn::Token![,]>::parse_terminated(&content)?;
+            if columns.is_empty() {
+                return Err(entry.error("index needs at least one column"));
+            }
+            for column in &columns {
+                if !field_names.contains(&column.to_string()) {
+                    return Err(syn::Error::new_spanned(
+                        column,
+                        format!("index references unknown field `{column}`"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if !saw_name {
+        return Err(meta.error("index(...) needs a `name = (columns)`"));
+    }
+    Ok(())
 }
 
 fn parse_column(ident: &Ident, field: &syn::Field) -> syn::Result<ColumnModel> {
@@ -1208,8 +1300,19 @@ fn split_roles(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_references(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<(Path, String)> {
-    let path: Path = meta.value()?.parse()?;
+fn parse_references(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<FkRef> {
+    let value = meta.value()?;
+    // String form `references = "table.column"`: a cross-crate FK whose Rust type
+    // isn't importable here. Otherwise the path form `references = Type::col`.
+    if value.peek(LitStr) {
+        let literal: LitStr = value.parse()?;
+        let (table, column) = split_table_column(&literal.value())
+            .map_err(|message| syn::Error::new_spanned(&literal, message))?;
+        validate_ident(&table, &literal)?;
+        validate_ident(&column, &literal)?;
+        return Ok(FkRef::Named(table, column));
+    }
+    let path: Path = value.parse()?;
     let column = path
         .segments
         .last()
@@ -1220,7 +1323,21 @@ fn parse_references(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<(Path,
     if let Some(pair) = root.segments.pop() {
         root.segments.push_value(pair.into_value());
     }
-    Ok((root, column))
+    Ok(FkRef::Typed(root, column))
+}
+
+/// Split a `"table.column"` foreign-key reference into its two identifiers; rejects
+/// anything that isn't exactly one table and one column (no extra dots).
+fn split_table_column(reference: &str) -> Result<(String, String), &'static str> {
+    let mut parts = reference.splitn(2, '.');
+    let table = parts.next().unwrap_or("").trim().to_owned();
+    let column = parts.next().map(|part| part.trim().to_owned());
+    match column {
+        Some(column) if !table.is_empty() && !column.is_empty() && !column.contains('.') => {
+            Ok((table, column))
+        }
+        _ => Err("references string must be \"table.column\""),
+    }
 }
 
 fn on_delete_tokens(value: Option<&str>) -> proc_macro2::TokenStream {
@@ -1252,18 +1369,25 @@ fn column_literal(column: &ColumnModel) -> proc_macro2::TokenStream {
         |value| quote! { ::core::option::Option::Some(#value) },
     );
     let on_delete = on_delete_tokens(column.on_delete.as_deref());
-    let references = column.references.as_ref().map_or_else(
-        || quote! { ::core::option::Option::None },
-        |(root, ref_column)| {
-            quote! {
-                ::core::option::Option::Some(::stakit_orm::ForeignKey {
-                    table: <#root as ::stakit_orm::Table>::TABLE,
-                    column: #ref_column,
-                    on_delete: #on_delete,
-                })
-            }
+    let references = match &column.references {
+        None => quote! { ::core::option::Option::None },
+        // Path form: the table name comes from the referenced type's `Table` impl.
+        Some(FkRef::Typed(root, ref_column)) => quote! {
+            ::core::option::Option::Some(::stakit_orm::ForeignKey {
+                table: <#root as ::stakit_orm::Table>::TABLE,
+                column: #ref_column,
+                on_delete: #on_delete,
+            })
         },
-    );
+        // String form: the table name is a literal (cross-crate, no type in scope).
+        Some(FkRef::Named(table, ref_column)) => quote! {
+            ::core::option::Option::Some(::stakit_orm::ForeignKey {
+                table: #table,
+                column: #ref_column,
+                on_delete: #on_delete,
+            })
+        },
+    };
     let field_ty = &column.field_ty;
     quote! {
         ::stakit_orm::Column {
@@ -1284,7 +1408,11 @@ fn column_literal(column: &ColumnModel) -> proc_macro2::TokenStream {
 }
 
 fn fk_check(column: &ColumnModel) -> Option<proc_macro2::TokenStream> {
-    let (root, _) = column.references.as_ref()?;
+    // Only the path form has a Rust type to type-check the FK against; the string
+    // form names a (possibly cross-crate) table with no type in scope.
+    let Some(FkRef::Typed(root, _)) = column.references.as_ref() else {
+        return None;
+    };
     let field_ty = unwrap_generic(&column.field_ty, "Option").unwrap_or(&column.field_ty);
     Some(quote! {
         const _: fn() = || {

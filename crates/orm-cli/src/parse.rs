@@ -7,7 +7,7 @@
 //! (e.g. `schema.rs` with `mod user_schema;` in `schema/user_schema.rs`) is fully read.
 
 use crate::model::{
-    Column, ForeignKey, Grant, Policy, PolicyCommand, Privilege, Role, Schema, Table,
+    Column, ForeignKey, Grant, Index, Policy, PolicyCommand, Privilege, Role, Schema, Table,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -224,6 +224,7 @@ struct TableMeta {
     force_rls: bool,
     policies: Vec<Policy>,
     grants: Vec<Grant>,
+    indexes: Vec<Index>,
 }
 
 /// Parse `#[table(name = "...", rls, force_rls, grant(...), policy(...))]`. RLS config
@@ -236,6 +237,7 @@ fn table_meta(input: &DeriveInput) -> Result<TableMeta, String> {
     let mut force_rls = false;
     let mut policies = Vec::new();
     let mut grants: Vec<Grant> = Vec::new();
+    let mut indexes: Vec<Index> = Vec::new();
     for attr in &input.attrs {
         if !attr.path().is_ident("table") {
             continue;
@@ -261,6 +263,10 @@ fn table_meta(input: &DeriveInput) -> Result<TableMeta, String> {
                     policies.push(policy);
                     Ok(())
                 })?;
+            } else if meta.path.is_ident("index") {
+                indexes.push(parse_index_entry(&meta, false).map_err(|m| meta.error(m))?);
+            } else if meta.path.is_ident("unique_index") {
+                indexes.push(parse_index_entry(&meta, true).map_err(|m| meta.error(m))?);
             } else {
                 return Err(meta.error("unknown #[table(...)] attribute"));
             }
@@ -281,13 +287,94 @@ fn table_meta(input: &DeriveInput) -> Result<TableMeta, String> {
     }
     policies.sort_by(|a, b| a.name.cmp(&b.name));
     grants.sort_by(|a, b| a.role.cmp(&b.role));
+    indexes.sort_by(|a, b| a.name.cmp(&b.name));
+    if let Some(window) = indexes.windows(2).find(|pair| pair[0].name == pair[1].name) {
+        return Err(format!("{name}: duplicate index name `{}`", window[0].name));
+    }
     Ok(TableMeta {
         name,
         rls,
         force_rls,
         policies,
         grants,
+        indexes,
     })
+}
+
+/// Parse one `index(<name> = (col, col, …), method = "…", predicate = "…")` (or
+/// `unique_index(...)`) entry. The name is the bare-identifier head; `method` and
+/// `predicate` are optional. Identifiers and the method are validated here (they
+/// reach the non-validating DDL emitter); the predicate is verbatim trusted SQL.
+fn parse_index_entry(meta: &syn::meta::ParseNestedMeta<'_>, unique: bool) -> Result<Index, String> {
+    let mut name: Option<String> = None;
+    let mut columns: Vec<String> = Vec::new();
+    let mut method: Option<String> = None;
+    let mut predicate: Option<String> = None;
+    meta.parse_nested_meta(|entry| {
+        if entry.path.is_ident("method") {
+            method = Some(entry.value()?.parse::<syn::LitStr>()?.value());
+        } else if entry.path.is_ident("predicate") {
+            predicate = Some(entry.value()?.parse::<syn::LitStr>()?.value());
+        } else {
+            // The `<name> = (columns)` head; there must be exactly one.
+            if name.is_some() {
+                return Err(entry.error("index(...) takes one `name = (columns)` entry"));
+            }
+            let ident = entry
+                .path
+                .get_ident()
+                .ok_or_else(|| entry.error("index name must be a bare identifier"))?;
+            name = Some(ident.to_string());
+            let value = entry.value()?;
+            let content;
+            syn::parenthesized!(content in value);
+            let parsed =
+                syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated(
+                    &content,
+                )?;
+            columns = parsed.iter().map(ToString::to_string).collect();
+        }
+        Ok(())
+    })
+    .map_err(|error| error.to_string())?;
+
+    let name = name.ok_or("index(...) needs a `name = (columns)`")?;
+    let index = Index {
+        name,
+        columns,
+        unique,
+        method,
+        predicate,
+    };
+    validate_index(&index)?;
+    Ok(index)
+}
+
+/// Validate an [`Index`]'s identifiers and method — they reach the DDL emitter via
+/// the non-validating `quote()`/`format!`, so a non-identifier name/column/method
+/// must be a hard error, not a silent SQL breakout. The `predicate` is verbatim
+/// trusted SQL (only rejected when empty). Shared by the attribute parser and the
+/// snapshot re-validation ([`validate_schema`]) so both paths enforce identical rules.
+fn validate_index(index: &Index) -> Result<(), String> {
+    let name = &index.name;
+    validate_identifier(name).map_err(|message| format!("index `{name}`: {message}"))?;
+    if index.columns.is_empty() {
+        return Err(format!("index `{name}`: needs at least one column"));
+    }
+    for column in &index.columns {
+        validate_identifier(column).map_err(|message| format!("index `{name}`: {message}"))?;
+    }
+    if let Some(method) = &index.method {
+        if !is_sql_identifier(method, false) {
+            return Err(format!(
+                "index `{name}`: method must be a bare SQL identifier"
+            ));
+        }
+    }
+    if index.predicate.as_deref() == Some("") {
+        return Err(format!("index `{name}`: predicate must not be empty"));
+    }
+    Ok(())
 }
 
 fn parse_table(
@@ -309,6 +396,17 @@ fn parse_table(
     }
 
     let meta = table_meta(input)?;
+    // Each index column must be a real column on the table — catch typos at gen time.
+    for index in &meta.indexes {
+        for column in &index.columns {
+            if !columns.iter().any(|c| &c.name == column) {
+                return Err(format!(
+                    "{}: index `{}` references unknown column `{column}`",
+                    meta.name, index.name
+                ));
+            }
+        }
+    }
     Ok(Table {
         name: meta.name,
         columns,
@@ -316,6 +414,7 @@ fn parse_table(
         force_rls: meta.force_rls,
         policies: meta.policies,
         grants: meta.grants,
+        indexes: meta.indexes,
     })
 }
 
@@ -561,6 +660,94 @@ fn validate_policy_clauses(
     Ok(())
 }
 
+/// Re-validate an entire [`Schema`]'s identifiers and policy invariants.
+///
+/// The parser validates each table/role/policy as it builds the **new** schema, but
+/// the **old** schema is deserialized from `.snapshot.json` with no checks — yet it
+/// is rendered into the (down-)migration DDL. Running this over the loaded snapshot
+/// keeps the fail-open guard (a policy with no `using`/`check` is always-true in PG)
+/// and the identifier rules enforced on *every* path that emits policy/grant DDL,
+/// not just the parse path. A tool-generated snapshot always passes; a hand-edited
+/// or corrupt one is rejected instead of silently producing a fail-open policy.
+///
+/// # Errors
+/// Returns the first identifier or policy-clause violation found.
+pub fn validate_schema(schema: &Schema) -> Result<(), String> {
+    for role in &schema.roles {
+        validate_identifier(&role.name)?;
+    }
+    for table in &schema.tables {
+        validate_identifier(&table.name)?;
+        for column in &table.columns {
+            validate_identifier(&column.name)?;
+            // The single-column index method/opclass also reach the DDL emitter; a
+            // tampered snapshot must not smuggle a non-identifier into `using <m>`.
+            if let Some(method) = &column.index_method {
+                if !is_sql_identifier(method, false) {
+                    return Err(format!(
+                        "column `{}`: index_method must be a bare SQL identifier",
+                        column.name
+                    ));
+                }
+            }
+            if let Some(opclass) = &column.opclass {
+                if !is_sql_identifier(opclass, true) {
+                    return Err(format!(
+                        "column `{}`: opclass must be a (schema-qualified) SQL identifier",
+                        column.name
+                    ));
+                }
+            }
+        }
+        for index in &table.indexes {
+            validate_index(index)?;
+        }
+        for grant in &table.grants {
+            validate_identifier(&grant.role)?;
+        }
+        for policy in &table.policies {
+            validate_identifier(&policy.name)?;
+            for role in &policy.roles {
+                validate_identifier(role)?;
+            }
+            validate_policy_clauses(
+                &policy.name,
+                policy.command,
+                policy.using.as_deref(),
+                policy.check.as_deref(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Roles referenced by a grant or a policy's `to =` that are **not** declared via
+/// `#[derive(Role)]`. Such a reference is usually a typo — the generated migration
+/// would only fail at apply time (`role "x" does not exist`). Returned sorted for a
+/// gen-time **warning** (granting to an out-of-band, externally-managed role is
+/// legitimate, so it is not a hard error).
+#[must_use]
+pub fn undeclared_role_refs(schema: &Schema) -> Vec<String> {
+    let declared: std::collections::HashSet<&str> =
+        schema.roles.iter().map(|role| role.name.as_str()).collect();
+    let mut missing = std::collections::BTreeSet::new();
+    for table in &schema.tables {
+        for grant in &table.grants {
+            if !declared.contains(grant.role.as_str()) {
+                missing.insert(grant.role.clone());
+            }
+        }
+        for policy in &table.policies {
+            for role in &policy.roles {
+                if !declared.contains(role.as_str()) {
+                    missing.insert(role.clone());
+                }
+            }
+        }
+    }
+    missing.into_iter().collect()
+}
+
 /// Reject `on_delete` combinations the derive also rejects (its keyword is emitted
 /// verbatim into the FK clause, so a free string would otherwise reach DDL raw). The
 /// caller prepends the column name to the returned message.
@@ -724,11 +911,21 @@ fn parse_reference(
     meta: &syn::meta::ParseNestedMeta<'_>,
     table_of_ident: &HashMap<String, String>,
 ) -> syn::Result<ForeignKey> {
-    let path: syn::Path = meta.value()?.parse()?;
-    let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-    let column = segments.last().cloned().unwrap_or_default();
-    let root = segments.iter().rev().nth(1).cloned().unwrap_or_default();
-    let table = table_of_ident.get(&root).cloned().unwrap_or(root);
+    let value = meta.value()?;
+    // `references = "table.column"` (string form): a foreign key to a table whose Rust
+    // type isn't in scope (e.g. a cross-crate reference). Otherwise `references =
+    // Type::col` (path form), resolved through the in-scope table types.
+    let (table, column) = if value.peek(syn::LitStr) {
+        let literal: syn::LitStr = value.parse()?;
+        split_table_column(&literal.value()).map_err(|message| meta.error(message))?
+    } else {
+        let path: syn::Path = value.parse()?;
+        let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+        let column = segments.last().cloned().unwrap_or_default();
+        let root = segments.iter().rev().nth(1).cloned().unwrap_or_default();
+        let table = table_of_ident.get(&root).cloned().unwrap_or(root);
+        (table, column)
+    };
     // Both names land in the FK clause via the non-validating `quote()`; validate them
     // here so an over-NAMEDATALEN spelling is a hard error, not a silent truncation.
     validate_identifier(&table).map_err(|message| meta.error(message))?;
@@ -738,6 +935,20 @@ fn parse_reference(
         column,
         on_delete: "no action".to_owned(),
     })
+}
+
+/// Split a `"table.column"` foreign-key reference into its two identifiers.
+/// Rejects anything that isn't exactly one `table` and one `column` (no extra dots).
+fn split_table_column(reference: &str) -> Result<(String, String), &'static str> {
+    let mut parts = reference.splitn(2, '.');
+    let table = parts.next().unwrap_or("").trim().to_owned();
+    let column = parts.next().map(|part| part.trim().to_owned());
+    match column {
+        Some(column) if !table.is_empty() && !column.is_empty() && !column.contains('.') => {
+            Ok((table, column))
+        }
+        _ => Err("references string must be \"table.column\""),
+    }
 }
 
 /// Whether `value` is a SQL identifier: a non-empty run of ASCII letters, digits, and
@@ -807,7 +1018,7 @@ fn sql_type(ty: &Type) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_schema, parse_schema_path};
+    use super::{parse_schema, parse_schema_path, undeclared_role_refs, validate_schema};
 
     #[test]
     fn follows_file_and_inline_modules_across_the_tree() {
@@ -1273,5 +1484,182 @@ mod tests {
         );
         let error = parse_schema(&source).unwrap_err();
         assert!(error.contains("NAMEDATALEN"), "got: {error}");
+    }
+
+    #[test]
+    fn validate_schema_rejects_a_fail_open_policy_in_a_snapshot() {
+        use crate::model::{Policy, PolicyCommand, Schema, Table};
+        // A snapshot smuggling a predicate-less `select` policy (always-true in PG).
+        let schema = Schema {
+            tables: vec![Table {
+                name: "posts".to_owned(),
+                rls: true,
+                policies: vec![Policy {
+                    name: "p".to_owned(),
+                    command: PolicyCommand::Select,
+                    roles: vec![],
+                    using: None, // <- fail-open
+                    check: None,
+                }],
+                ..Table::default()
+            }],
+            roles: vec![],
+        };
+        let error = validate_schema(&schema).expect_err("must reject fail-open policy");
+        assert!(error.contains("needs using"), "got: {error}");
+    }
+
+    #[test]
+    fn undeclared_role_refs_flags_a_typoed_grant_role() {
+        use crate::model::{Grant, Privilege, Role, Schema, Table};
+        let schema = Schema {
+            tables: vec![Table {
+                name: "posts".to_owned(),
+                grants: vec![Grant {
+                    role: "ap_user".to_owned(), // typo: declared role is "app_user"
+                    privileges: vec![Privilege::Select],
+                }],
+                ..Table::default()
+            }],
+            roles: vec![Role {
+                name: "app_user".to_owned(),
+                login: true,
+                createdb: false,
+                createrole: false,
+                bypassrls: false,
+            }],
+        };
+        assert_eq!(undeclared_role_refs(&schema), vec!["ap_user".to_owned()]);
+    }
+
+    #[test]
+    fn parses_composite_unique_and_method_indexes() {
+        let source = r#"
+            #[derive(Table)]
+            #[table(name = "event",
+                index(idx_event_window = (account_id, user_id, seq)),
+                unique_index(uq_event_session_seq = (session_id, seq)),
+                index(idx_desc_gin = (desc_tsv), method = "gin"))]
+            struct Event {
+                #[column(pk)] id: i64,
+                account_id: i64,
+                user_id: i64,
+                session_id: i64,
+                seq: i64,
+                #[column(sql_type = "tsvector")] desc_tsv: String,
+            }
+        "#;
+        let schema = parse_schema(source).expect("parse");
+        let event = schema.table("event").expect("event table");
+        assert_eq!(event.indexes.len(), 3);
+
+        let window = event.index("idx_event_window").expect("window index");
+        assert_eq!(window.columns, ["account_id", "user_id", "seq"]);
+        assert!(!window.unique);
+        assert_eq!(window.method, None);
+
+        let unique = event.index("uq_event_session_seq").expect("unique index");
+        assert!(unique.unique);
+        assert_eq!(unique.columns, ["session_id", "seq"]);
+
+        let gin = event.index("idx_desc_gin").expect("gin index");
+        assert_eq!(gin.method.as_deref(), Some("gin"));
+        assert_eq!(gin.columns, ["desc_tsv"]);
+    }
+
+    #[test]
+    fn index_referencing_an_unknown_column_is_rejected() {
+        let source = r#"
+            #[derive(Table)]
+            #[table(name = "t", index(i = (nope)))]
+            struct T { #[column(pk)] id: i64 }
+        "#;
+        let error = parse_schema(source).unwrap_err();
+        assert!(error.contains("unknown column `nope`"), "got: {error}");
+    }
+
+    #[test]
+    fn index_with_empty_predicate_is_rejected() {
+        let source = r#"
+            #[derive(Table)]
+            #[table(name = "t", index(i = (a), predicate = ""))]
+            struct T { #[column(pk)] id: i64, a: i64 }
+        "#;
+        let error = parse_schema(source).unwrap_err();
+        assert!(
+            error.contains("predicate must not be empty"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn duplicate_index_name_is_rejected() {
+        let source = r#"
+            #[derive(Table)]
+            #[table(name = "t", index(dup = (a)), index(dup = (b)))]
+            struct T { #[column(pk)] id: i64, a: i64, b: i64 }
+        "#;
+        let error = parse_schema(source).unwrap_err();
+        assert!(error.contains("duplicate index name"), "got: {error}");
+    }
+
+    #[test]
+    fn validate_schema_rejects_an_index_method_breakout_in_a_snapshot() {
+        use crate::model::{Index, Schema, Table};
+        // A tampered .snapshot.json whose index method is a SQL breakout: validate_schema
+        // (the snapshot trust boundary) must reject it before it reaches the DDL emitter.
+        let schema = Schema {
+            tables: vec![Table {
+                name: "docs".to_owned(),
+                indexes: vec![Index {
+                    name: "i".to_owned(),
+                    columns: vec!["id".to_owned()],
+                    unique: false,
+                    method: Some("gin); drop table docs; --".to_owned()),
+                    predicate: None,
+                }],
+                ..Table::default()
+            }],
+            roles: vec![],
+        };
+        let error =
+            validate_schema(&schema).expect_err("must reject a malicious index method in snapshot");
+        assert!(error.contains("bare SQL identifier"), "got: {error}");
+    }
+
+    #[test]
+    fn string_form_references_parses_table_and_column() {
+        // No `Account` type in scope — the string form names the table directly.
+        let source = r#"
+            #[derive(Table)]
+            #[table(name = "sessions")]
+            struct Session {
+                #[column(pk)] id: i64,
+                #[column(references = "accounts.id", on_delete = "cascade")] account_id: i64,
+            }
+        "#;
+        let schema = parse_schema(source).expect("parse");
+        let fk = schema
+            .table("sessions")
+            .unwrap()
+            .column("account_id")
+            .unwrap()
+            .references
+            .as_ref()
+            .expect("foreign key");
+        assert_eq!(fk.table, "accounts");
+        assert_eq!(fk.column, "id");
+        assert_eq!(fk.on_delete, "cascade");
+    }
+
+    #[test]
+    fn malformed_string_reference_is_rejected() {
+        let source = r#"
+            #[derive(Table)]
+            #[table(name = "t")]
+            struct T { #[column(pk)] id: i64, #[column(references = "nodot")] a: i64 }
+        "#;
+        let error = parse_schema(source).unwrap_err();
+        assert!(error.contains("table.column"), "got: {error}");
     }
 }

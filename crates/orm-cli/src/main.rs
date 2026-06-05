@@ -142,10 +142,26 @@ fn run_gen(options: &Options) -> Result<String, String> {
     let snapshot_path = options.migrations.join(".snapshot.json");
     let old_schema = load_snapshot(&snapshot_path)?;
 
+    // Warn (don't fail) when a grant/policy targets a role that isn't declared via
+    // `#[derive(Role)]` — usually a typo that would only fail at apply time.
+    for role in parse::undeclared_role_refs(&new_schema) {
+        eprintln!(
+            "warning: grant/policy references role \"{role}\" which is not declared with \
+             #[derive(Role)]; the migration will fail to apply unless that role already \
+             exists (typo?)"
+        );
+    }
+
     let mut resolver = StdinResolver;
     let changes = diff::diff(&old_schema, &new_schema, &mut resolver);
     if changes.is_empty() {
         return Ok("no schema changes — nothing to generate".to_owned());
+    }
+
+    // Surface access-widening transitions so a security downgrade isn't buried in
+    // the generated SQL.
+    for warning in diff::widening_warnings(&changes) {
+        eprintln!("warning: {warning}");
     }
 
     let up = diff::up_sql(&changes);
@@ -174,7 +190,17 @@ fn run_gen(options: &Options) -> Result<String, String> {
 
 fn load_snapshot(path: &Path) -> Result<Schema, String> {
     match std::fs::read_to_string(path) {
-        Ok(contents) => serde_json::from_str(&contents).map_err(|error| error.to_string()),
+        Ok(contents) => {
+            let schema: Schema =
+                serde_json::from_str(&contents).map_err(|error| error.to_string())?;
+            // Defense-in-depth: the snapshot is the one input not produced by the
+            // validated parser, yet it renders the down-migration DDL. Re-check the
+            // identifier + fail-open-policy invariants so a hand-edited/corrupt
+            // snapshot can't smuggle an always-true policy into a migration.
+            parse::validate_schema(&schema)
+                .map_err(|error| format!("snapshot {}: {error}", path.display()))?;
+            Ok(schema)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Schema::default()),
         Err(error) => Err(format!("read {}: {error}", path.display())),
     }

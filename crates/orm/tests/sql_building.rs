@@ -876,3 +876,98 @@ fn user_custom_type_casts_on_insert_and_filter() {
         .unwrap();
     assert!(sql.contains("$1::mood"), "filter cast, got {sql}");
 }
+
+// ----- chained filter() ANDs (regression: must not silently replace) -----
+
+#[test]
+fn chained_select_filters_are_anded_not_replaced() {
+    let sql = Select::new(User::all())
+        .from::<User>()
+        .filter(eq(User::name, "Dan"))
+        .filter(eq(User::email, "a@b.com"))
+        .to_sql()
+        .unwrap();
+    assert!(
+        sql.contains(r#"where ("users"."name" = $1 and "users"."email" = $2)"#),
+        "got: {sql}"
+    );
+}
+
+#[test]
+fn chained_update_filters_are_anded() {
+    use stakit_orm::Update;
+    let sql = Update::<User>::new()
+        .set(User::name, "x")
+        .filter(eq(User::email, "a@b.com"))
+        .filter(eq(User::name, "Dan"))
+        .to_sql()
+        .unwrap();
+    assert!(
+        sql.contains(r#"where ("users"."email" = $2 and "users"."name" = $3)"#),
+        "got: {sql}"
+    );
+}
+
+#[test]
+fn chained_delete_filters_are_anded() {
+    use stakit_orm::Delete;
+    let sql = Delete::<User>::new()
+        .filter(eq(User::email, "a@b.com"))
+        .filter(eq(User::id, uid()))
+        .to_sql()
+        .unwrap();
+    assert!(
+        sql.contains(r#"where ("users"."email" = $1 and "users"."id" = $2)"#),
+        "got: {sql}"
+    );
+}
+
+// ----- ts_rank projection + order_by_rank (Postgres full-text relevance) -----
+
+#[derive(Table)]
+#[table(name = "docs")]
+#[allow(dead_code)]
+struct Doc {
+    #[column(pk)]
+    id: i64,
+    body: String,
+}
+
+#[test]
+fn ts_rank_projection_and_order_by_rank_render() {
+    use stakit_orm::ts_rank;
+    let sql = Select::new((Doc::id, ts_rank(Doc::body, "fox")))
+        .from::<Doc>()
+        .filter(matches(Doc::body, "fox"))
+        .order_by_rank(ts_rank(Doc::body, "fox"))
+        .to_sql()
+        .unwrap();
+    // Selectable rank computes to_tsvector at query time and binds the query.
+    assert!(
+        sql.contains(
+            r#"ts_rank(to_tsvector('english', "docs"."body"), plainto_tsquery('english', $1))"#
+        ),
+        "rank projection: {sql}"
+    );
+    // Ordered by relevance, descending.
+    assert!(sql.trim_end().ends_with("desc"), "order desc: {sql}");
+    assert!(sql.contains("order by ts_rank("), "order by rank: {sql}");
+}
+
+#[test]
+fn ts_rank_stored_skips_to_tsvector() {
+    use stakit_orm::ts_rank_stored;
+    let sql = Select::new(ts_rank_stored(Doc::body, "fox"))
+        .from::<Doc>()
+        .to_sql()
+        .unwrap();
+    // Stored form matches the column directly (a GIN index applies).
+    assert!(
+        sql.contains(r#"ts_rank("docs"."body", plainto_tsquery('english', $1))"#),
+        "stored rank: {sql}"
+    );
+    assert!(
+        !sql.contains("to_tsvector"),
+        "stored form must not recompute: {sql}"
+    );
+}

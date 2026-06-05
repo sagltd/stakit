@@ -190,6 +190,90 @@ where
     }
 }
 
+/// A Postgres `ts_rank(...)` full-text relevance score, decoded as `f32`.
+///
+/// Selectable like any projection. Build with [`ts_rank`] / [`ts_rank_stored`] /
+/// [`ts_rank_in`]; order by it with [`Select::order_by_rank`](crate::Select::order_by_rank).
+/// Postgres-only — selecting it on another backend errors with `Error::Unsupported`.
+pub struct TsRank {
+    table: &'static str,
+    name: &'static str,
+    query: String,
+    config: Option<&'static str>,
+    stored: bool,
+}
+
+/// `ts_rank` of `column` against `query`, computing `to_tsvector` at query time (use
+/// for a plain `text` column). For a stored `tsvector` column use [`ts_rank_stored`].
+#[must_use]
+pub fn ts_rank<T, Ty>(column: Col<T, Ty>, query: impl Into<String>) -> TsRank {
+    TsRank {
+        table: column.table,
+        name: column.name,
+        query: query.into(),
+        config: None,
+        stored: false,
+    }
+}
+
+/// `ts_rank` against an already-stored `tsvector` column (no query-time recompute, so
+/// a GIN index applies) — e.g. a generated `desc_tsv` column.
+#[must_use]
+pub fn ts_rank_stored<T, Ty>(column: Col<T, Ty>, query: impl Into<String>) -> TsRank {
+    TsRank {
+        table: column.table,
+        name: column.name,
+        query: query.into(),
+        config: None,
+        stored: true,
+    }
+}
+
+/// [`ts_rank`] with an explicit Postgres text-search `config` (e.g. `"spanish"`).
+#[must_use]
+pub fn ts_rank_in<T, Ty>(
+    column: Col<T, Ty>,
+    query: impl Into<String>,
+    config: &'static str,
+) -> TsRank {
+    TsRank {
+        table: column.table,
+        name: column.name,
+        query: query.into(),
+        config: Some(config),
+        stored: false,
+    }
+}
+
+impl TsRank {
+    /// Render this rank expression into `out` (shared by the projection and
+    /// [`Select::order_by_rank`](crate::Select::order_by_rank)).
+    pub(crate) fn write(&self, out: &mut SqlWriter) -> Result<()> {
+        crate::expr::write_ts_rank(
+            out,
+            self.table,
+            self.name,
+            &self.query,
+            self.config,
+            self.stored,
+        )?;
+        Ok(())
+    }
+}
+
+impl Projection for TsRank {
+    type Output = f32;
+    fn arity(&self) -> usize {
+        1
+    }
+    fn write_columns(&self, out: &mut SqlWriter) -> Result<()> {
+        self.write(out)
+    }
+    fn decode(&self, row: &dyn Row, start: usize) -> Result<f32> {
+        decode_at(row, start)
+    }
+}
+
 /// Marker: a non-nullable whole-row projection.
 pub struct NotNull;
 /// Marker: a nullable whole-row projection (outer-join side).
