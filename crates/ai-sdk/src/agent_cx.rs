@@ -34,7 +34,7 @@ impl<'a, Ctx> AgentCx<'a, Ctx> {
     /// let mut cx = AgentCx::for_test(&ctx, &mut msgs, &mut model, &mut system, &usage, &cancel);
     /// ```
     #[allow(clippy::too_many_arguments)]
-    pub fn for_test(
+    pub const fn for_test(
         ctx: &'a Ctx,
         messages: &'a mut Vec<Message>,
         model: &'a mut String,

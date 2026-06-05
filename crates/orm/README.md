@@ -236,6 +236,11 @@ let n = db.find::<User>().count().await?;                     // i64
 let exists = db.find::<User>().filter(eq(User::id, 1)).exists().await?; // bool
 ```
 
+Repeated `.filter(..)` calls **AND** together — `.filter(a).filter(b)` is
+`a AND b`, never a silent replace. Chaining is safe: a scoped predicate (an RLS-style
+tenant filter, say) can't be dropped by a later `.filter(..)`. The same holds for
+`update().filter(..)` and `delete().filter(..)`.
+
 ### Aggregates & grouping
 
 ```rust
@@ -862,9 +867,28 @@ let hits = db.find::<Article>().filter(matches_tsv(Article::body_tsv, "systems")
 ```
 
 `matches_tsv` falls back to FTS5 `MATCH` on SQLite/Turso (no stored-tsvector form
-there). Relevance ranking (`ts_rank` / `bm25`) is not yet a typed projection — order by
-it via `raw_pred`/`db.raw` for now. `MySQL` full-text (`MATCH … AGAINST`) is not
-supported.
+there). `MySQL` full-text (`MATCH … AGAINST`) is not supported.
+
+**Relevance ranking** is a typed projection: `ts_rank(col, query)` recomputes the
+vector (`ts_rank(to_tsvector('english', "col"), plainto_tsquery('english', $n))`),
+`ts_rank_stored(col, query)` ranks a stored `tsvector` directly (GIN-backed, no
+recompute), and `ts_rank_in(col, query, config)` pins the text-search config. Select
+it like any column and sort by it with `Select::order_by_rank` (Postgres relevance,
+highest-first):
+
+```rust
+// id + relevance score, GIN-backed, most-relevant first
+let ranked: Vec<(i64, f32)> = db
+    .select((Article::id, ts_rank_stored(Article::body_tsv, "systems")))
+    .from::<Article>()
+    .filter(matches_tsv(Article::body_tsv, "systems"))
+    .order_by_rank(ts_rank_stored(Article::body_tsv, "systems"))
+    .all().await?;
+```
+
+`ts_rank` is Postgres-only: on other dialects it renders to an `Unsupported` error
+rather than silently mis-ranking. Window functions (`row_number() over (…)`, etc.)
+work today via `sql_expr::<T>("…")` as a projection.
 
 ## Custom backends
 
