@@ -442,7 +442,13 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                     )
                     .await
                     {
-                        AcquireOutcome::Cancelled => {
+                        AcquireOutcome::Cancelled { prompt_tokens } => {
+                            // A request already in flight may be billed: meter
+                            // its estimated prompt (0 when none was sent).
+                            self.usage.merge(&Usage {
+                                input_tokens: prompt_tokens,
+                                ..Usage::default()
+                            });
                             finish = Finish::Cancelled;
                             break 'run;
                         }
@@ -489,11 +495,16 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                         }
                     }
 
+                    // A step cut short still used its prompt (and whatever it
+                    // streamed): meter it, or stopping every reply early would
+                    // spend without ever counting.
                     if cancelled {
+                        self.usage.merge(&acc.partial_usage());
                         finish = Finish::Cancelled;
                         break 'run;
                     }
                     if let Some(e) = step_error {
+                        self.usage.merge(&acc.partial_usage());
                         finish = Finish::Stopped {
                             message: Some(format!("provider error: {e}")),
                         };
@@ -1094,6 +1105,77 @@ impl StepAccum {
             }
         }
     }
+
+    /// What a step cut short (stopped, or failed mid-stream) used: the
+    /// provider's counts so far, with the output estimated from the streamed
+    /// text when the provider has not reported that much yet.
+    fn partial_usage(&self) -> Usage {
+        let streamed = self.text.len().saturating_add(self.reasoning.len());
+        Usage {
+            output_tokens: self
+                .step_usage
+                .output_tokens
+                .max(estimated_tokens(streamed)),
+            ..self.step_usage
+        }
+    }
+}
+
+/// Bytes per token in the rough estimates used where a provider reported no
+/// usage (prose averages about four).
+const BYTES_PER_TOKEN: usize = 4;
+
+/// About how many tokens `bytes` of text are.
+fn estimated_tokens(bytes: usize) -> u64 {
+    u64::try_from(bytes.div_ceil(BYTES_PER_TOKEN)).unwrap_or(u64::MAX)
+}
+
+/// The bytes of text one message carries (tool calls as their JSON).
+fn message_bytes(message: &Message) -> usize {
+    match message {
+        Message::User(blocks) => blocks
+            .iter()
+            .map(|block| match block {
+                UserContent::Text(text) => text.len(),
+                UserContent::ToolResult { content, .. } => content
+                    .iter()
+                    .map(|part| match part {
+                        ToolResultPart::Text(text) => text.len(),
+                        ToolResultPart::Image(_) => 0,
+                    })
+                    .sum(),
+                UserContent::Image(_) => 0,
+            })
+            .sum(),
+        Message::Assistant(blocks) => blocks
+            .iter()
+            .map(|block| match block {
+                AssistantContent::Text(text)
+                | AssistantContent::Thinking(Thinking::Visible { text, .. }) => text.len(),
+                AssistantContent::ToolUse { name, input, .. } => {
+                    name.len() + input.to_string().len()
+                }
+                AssistantContent::Thinking(Thinking::Redacted { data }) => data.len(),
+            })
+            .sum(),
+    }
+}
+
+/// A rough count of the input tokens `request` costs (system prompt, history,
+/// tool definitions; images uncounted), for a request stopped while in flight:
+/// the provider may already be processing — and billing — its prompt.
+fn estimated_prompt_tokens(request: &ChatRequest) -> u64 {
+    let system = request
+        .system
+        .as_ref()
+        .map_or(0, |system| system.text.len());
+    let history: usize = request.messages.iter().map(message_bytes).sum();
+    let tools: usize = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.len() + tool.description.len() + tool.parameters.to_string().len())
+        .sum();
+    estimated_tokens(system + history + tools)
 }
 
 /// The result of trying to acquire a provider stream + its first event.
@@ -1103,7 +1185,11 @@ enum AcquireOutcome {
         stream: crate::provider::EventStream,
     },
     Error(crate::error::ProviderError),
-    Cancelled,
+    /// Cancelled; `prompt_tokens` estimates the prompt of a request that was
+    /// already in flight (0 when none was).
+    Cancelled {
+        prompt_tokens: u64,
+    },
 }
 
 /// Tries up to `max_retries + 1` times to open the stream and read its first
@@ -1123,13 +1209,13 @@ async fn acquire_stream(
 
     for attempt in 0..attempts {
         if cancel.is_cancelled() {
-            return AcquireOutcome::Cancelled;
+            return AcquireOutcome::Cancelled { prompt_tokens: 0 };
         }
         if attempt > 0 {
             let delay = retry.retry_delay(attempt - 1, &last_class);
             tokio::select! {
                 biased;
-                () = cancel.cancelled() => return AcquireOutcome::Cancelled,
+                () = cancel.cancelled() => return AcquireOutcome::Cancelled { prompt_tokens: 0 },
                 () = tokio::time::sleep(delay) => {}
             }
         }
@@ -1143,7 +1229,11 @@ async fn acquire_stream(
 
         let timed = tokio::select! {
             biased;
-            () = cancel.cancelled() => return AcquireOutcome::Cancelled,
+            () = cancel.cancelled() => {
+                return AcquireOutcome::Cancelled {
+                    prompt_tokens: estimated_prompt_tokens(&request),
+                };
+            }
             r = tokio::time::timeout(retry.timeout, attempt_fut) => r,
         };
 

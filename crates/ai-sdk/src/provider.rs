@@ -215,6 +215,19 @@ pub fn event_stream(events: Vec<Result<StreamEvent, ProviderError>>) -> EventStr
     futures::stream::iter(events).boxed()
 }
 
+/// The HTTP client the built-in providers share: a bounded connect, and a
+/// per-read timeout so a connection that stalls mid-stream ends with an error
+/// instead of hanging forever (streams send keep-alive pings well within it;
+/// generous enough for a long non-streamed completion).
+#[cfg(any(feature = "claude", feature = "openai"))]
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(300))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Parses the `Retry-After` response header (delta-seconds form) into a
 /// [`Duration`](std::time::Duration). HTTP-date forms and unparseable values
 /// yield `None`. Shared by the built-in providers when building a 429 error.

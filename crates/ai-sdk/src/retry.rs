@@ -65,9 +65,11 @@ impl RetryPolicy {
     pub fn retry_delay(&self, n: u32, classification: &Retryable) -> Duration {
         let backoff = self.backoff(n);
         match classification {
+            // Honor the server's Retry-After, but never past `max_backoff`: a
+            // huge value would otherwise park the run for that long.
             Retryable::RateLimited {
                 retry_after: Some(after),
-            } => backoff.max(*after),
+            } => backoff.max((*after).min(self.max_backoff)),
             _ => backoff,
         }
     }
@@ -205,6 +207,18 @@ mod tests {
             },
         );
         assert_eq!(delay, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn retry_delay_caps_a_huge_retry_after_at_max_backoff() {
+        let p = RetryPolicy::default();
+        let delay = p.retry_delay(
+            0,
+            &Retryable::RateLimited {
+                retry_after: Some(Duration::from_secs(86_400)),
+            },
+        );
+        assert_eq!(delay, p.max_backoff);
     }
 
     #[test]
