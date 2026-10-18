@@ -65,7 +65,10 @@ export interface CallOpts<R> {
   readonly headers?: HeadersMap
   /** Files uploaded as multipart `file` parts (HTTP only). */
   readonly files?: readonly FileInput[]
-  /** Override the HTTP method. */
+  /**
+   * Override the HTTP method (default `POST`, params in the JSON body). Only
+   * `GET` puts params in the url (`?q=`); it cannot carry `files`.
+   */
   readonly method?: HttpMethod
   /** Per-call client action handlers (override base for this call). */
   readonly defineClientActions?: Partial<ClientActionHandlers<R>>
@@ -85,4 +88,9 @@ export interface ClientOptions<R> {
   readonly defineClientActions?: Partial<ClientActionHandlers<R>>
   /** Maps a transport error before it is thrown. Only real network failures. */
   readonly onError?: (error: Error) => Error
+  /**
+   * The `fetch` used for every HTTP call (unary + stream). Defaults to the
+   * global `fetch`; pass e.g. `expo/fetch` on React Native for streaming bodies.
+   */
+  readonly fetch?: typeof fetch
 }

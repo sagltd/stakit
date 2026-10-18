@@ -1,7 +1,9 @@
 # axum-server-example
 
 Full [axum](https://docs.rs/axum) integration for `stakit-router`: HTTP unary,
-SSE streaming, and a WebSocket duplex endpoint with server→client `client_call`.
+JSONL streaming, and a WebSocket duplex endpoint with server→client
+`client_call`. Payload-routed: the action name lives in the JSON body, never
+the URL (see `docs/transport.md`).
 
 It's a standalone crate (excluded from the workspace), so run it from here:
 
@@ -13,21 +15,21 @@ cargo run        # listening on http://127.0.0.1:3007
 ## Try it
 
 ```bash
-# unary (200)
-curl -s localhost:3007/rpc/greet -H 'content-type: application/json' -H 'x-admin: true' \
-  -d '{"name":"bob"}'
-# -> {"status":"ok","data":{"message":"Hello, bob! (admin=true)"}}
+# unary (200; per-action outcome in the envelope)
+curl -s localhost:3007/app -H 'content-type: application/json' -H 'x-admin: true' \
+  -d '{"greet":{"name":"bob"}}'
+# -> {"greet":{"status":"ok","data":{"message":"Hello, bob! (admin=true)"}}}
 
-# validation error (422)
-curl -s localhost:3007/rpc/greet -H 'content-type: application/json' -d '{"name":""}'
-# -> {"status":"error","error":{"code":422,"type":"validation","message":"validation failed","fields":{"name":[...]}}}
+# validation error (422 inside the envelope)
+curl -s localhost:3007/app -H 'content-type: application/json' -d '{"greet":{"name":""}}'
+# -> {"greet":{"status":"error","error":{"code":422,"type":"validation",...}}}
 
-# unknown action (404)
-curl -s localhost:3007/rpc/nope -H 'content-type: application/json' -d 'null'
+# upload: params in the multipart `q` field, bytes in `file` parts
+curl -s localhost:3007/app -F 'q={"save_image":{"fileName":"a.png"}}' -F 'file=@a.png'
 
-# SSE stream
-curl -sN localhost:3007/sse/count -H 'content-type: application/json' -d '{"n":3}'
-# -> data: {"type":"next","data":0}  ... data: {"type":"end"}
+# JSONL stream
+curl -sN localhost:3007/stream -H 'content-type: application/json' -d '{"count":{"n":3}}'
+# -> {"type":"next","index":0,"action":"count","data":0} ... {"type":"end",...}
 ```
 
 ## WebSocket (duplex)

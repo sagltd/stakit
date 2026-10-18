@@ -3,12 +3,13 @@
 use std::sync::{Arc, RwLock};
 
 use reqwest::Client as HttpClient;
+use reqwest::header::CONTENT_TYPE;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use stakit_router::Endpoint;
 
-use crate::options::CallOpts;
+use crate::options::{CallOpts, Method};
 use crate::result::{ActionResult, Envelope};
 use crate::{TransportError, pool};
 
@@ -148,50 +149,58 @@ impl Client {
 
     /// Issues the HTTP request for an encoded `q` payload and decodes the JSON
     /// response. Shared by [`Client::fetch_with`] and [`Client::fetch_raw`].
+    ///
+    /// The payload rides in a JSON body (default `POST`) or, with files, in the
+    /// multipart `q` field — never the URL; only an explicit `GET` uses `?q=`.
+    /// A non-2xx status is a transport error (see `docs/transport.md`).
     async fn send_payload(
         &self,
         q: String,
         opts: CallOpts,
     ) -> Result<serde_json::Value, TransportError> {
-        let has_files = !opts.files.is_empty();
-        let method: reqwest::Method = opts.method.map_or_else(
-            || {
-                if has_files {
-                    reqwest::Method::POST
-                } else {
-                    reqwest::Method::GET
-                }
-            },
-            Into::into,
-        );
-        let url = opts.url.as_deref().unwrap_or(&self.inner.base_url);
-
-        let mut request = self
-            .inner
-            .http
-            .request(method, url)
-            .query(&[("q", q.as_str())]);
-        for (name, value) in self.merged_headers(&opts.headers) {
-            request = request.header(name, value);
+        let method = opts.method.unwrap_or_default();
+        if !opts.files.is_empty() && method == Method::Get {
+            return Err(TransportError::InvalidRequest(
+                "files cannot be sent with GET",
+            ));
         }
-        if has_files {
-            let mut form = reqwest::multipart::Form::new();
+        let url = opts.url.as_deref().unwrap_or(&self.inner.base_url);
+        let request = self.request(method, url, &opts.headers);
+
+        let request = if opts.files.is_empty() {
+            with_payload(request, method, q)
+        } else {
+            let mut form = reqwest::multipart::Form::new().text("q", q);
             for bytes in opts.files {
                 form = form.part(
                     "file",
                     reqwest::multipart::Part::bytes(bytes).file_name("file"),
                 );
             }
-            request = request.multipart(form);
-        }
+            request.multipart(form)
+        };
 
-        let response = request.send().await?;
+        let response = request.send().await?.error_for_status()?;
         response.json().await.map_err(Into::into)
     }
 
-    /// The shared HTTP pool backing this handle.
-    pub(crate) fn http(&self) -> &HttpClient {
-        &self.inner.http
+    /// A request carrying the merged headers. Any caller-supplied
+    /// `content-type` is dropped: the client owns the body encoding, and a
+    /// duplicate header would corrupt it.
+    pub(crate) fn request(
+        &self,
+        method: Method,
+        url: &str,
+        extra_headers: &[(String, String)],
+    ) -> reqwest::RequestBuilder {
+        let mut request = self.inner.http.request(method.into(), url);
+        for (name, value) in self.merged_headers(extra_headers) {
+            if name.eq_ignore_ascii_case(CONTENT_TYPE.as_str()) {
+                continue;
+            }
+            request = request.header(name, value);
+        }
+        request
     }
 
     /// The base url.
@@ -244,7 +253,20 @@ impl Client {
     }
 }
 
-/// Encodes `{ action: params }` into the `q` query value (see `docs/transport.md`).
+/// Attaches an encoded payload: a JSON body for every method but `GET`, which
+/// carries it in `?q=` (see `docs/transport.md`).
+pub(crate) fn with_payload(
+    request: reqwest::RequestBuilder,
+    method: Method,
+    q: String,
+) -> reqwest::RequestBuilder {
+    if method == Method::Get {
+        return request.query(&[("q", q.as_str())]);
+    }
+    request.header(CONTENT_TYPE, "application/json").body(q)
+}
+
+/// Encodes `{ action: params }` as the JSON payload (see `docs/transport.md`).
 pub(crate) fn encode_query<P: Serialize>(
     action: &str,
     params: &P,

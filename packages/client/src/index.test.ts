@@ -44,6 +44,62 @@ interface WsData {
   nextCid: number
 }
 
+/** What the mock saw on the wire for one HTTP request. */
+interface RequestRecord {
+  method: string
+  path: string
+  /** The raw `?q=` value, or `null` when the URL carries no params. */
+  urlQuery: string | null
+  contentType: string
+  /** The multipart `q` field, when the request was multipart. */
+  formQuery: string | null
+}
+
+const requestLog: RequestRecord[] = []
+
+function lastRequest(): RequestRecord {
+  const record = requestLog.at(-1)
+  if (!record) throw new Error('no request recorded')
+  return record
+}
+
+type Calls = Record<string, Record<string, unknown>>
+
+/**
+ * Reads the action payload exactly where docs/transport.md puts it: `?q=` for
+ * GET, the `q` form field for multipart, the JSON body for everything else.
+ */
+async function readCalls(
+  req: Request,
+  url: URL,
+): Promise<{ calls: Calls; fileBytes: number; formQuery: string | null }> {
+  if (req.method === 'GET') {
+    const calls = JSON.parse(url.searchParams.get('q') ?? '{}') as Calls
+    return { calls, fileBytes: 0, formQuery: null }
+  }
+  const contentType = req.headers.get('content-type') ?? ''
+  if (contentType.includes('multipart/form-data')) {
+    const form = await req.formData()
+    let fileBytes = 0
+    for (const value of form.getAll('file')) {
+      if (value instanceof Blob) fileBytes += value.size
+    }
+    const q = form.get('q')
+    const formQuery = typeof q === 'string' ? q : null
+    return {
+      calls: JSON.parse(formQuery ?? '{}') as Calls,
+      fileBytes,
+      formQuery,
+    }
+  }
+  const text = await req.text()
+  return {
+    calls: (text ? JSON.parse(text) : {}) as Calls,
+    fileBytes: 0,
+    formQuery: null,
+  }
+}
+
 function runAction(
   name: string,
   params: Record<string, unknown>,
@@ -94,10 +150,18 @@ function makeServer(serverName: string): Server<WsData> {
         return new Response('upgrade failed', { status: 400 })
       }
 
-      const calls = JSON.parse(url.searchParams.get('q') ?? '{}') as Record<
-        string,
-        Record<string, unknown>
-      >
+      if (url.pathname === '/broken-stream') {
+        return new Response('too many requests', { status: 429 })
+      }
+
+      const { calls, fileBytes, formQuery } = await readCalls(req, url)
+      requestLog.push({
+        method: req.method,
+        path: url.pathname,
+        urlQuery: url.searchParams.get('q'),
+        contentType: req.headers.get('content-type') ?? '',
+        formQuery,
+      })
 
       if (url.pathname === '/stream') {
         const [name, params] = Object.entries(calls)[0] ?? ['', {}]
@@ -107,8 +171,12 @@ function makeServer(serverName: string): Server<WsData> {
             const line = (obj: unknown) =>
               controller.enqueue(encoder.encode(`${JSON.stringify(obj)}\n`))
             if (name === 'count') {
-              for (let i = 0; i < Number(params.n); i++)
+              for (let i = 0; i < Number(params.n); i++) {
                 line({ type: 'next', data: i })
+                // keep-alive frames must never end or corrupt the stream
+                line({ type: 'heartbeat' })
+              }
+              controller.enqueue(encoder.encode('not json\n'))
               line({ type: 'end' })
             } else if (name === 'failing') {
               line({ type: 'next', data: 1 })
@@ -123,18 +191,6 @@ function makeServer(serverName: string): Server<WsData> {
         return new Response(body, {
           headers: { 'content-type': 'application/x-ndjson' },
         })
-      }
-
-      // /rpc — collect any uploaded files
-      let fileBytes = 0
-      if (req.method !== 'GET') {
-        const contentType = req.headers.get('content-type') ?? ''
-        if (contentType.includes('multipart/form-data')) {
-          const form = await req.formData()
-          for (const value of form.getAll('file')) {
-            if (value instanceof Blob) fileBytes += value.size
-          }
-        }
       }
 
       const result: Record<string, unknown> = {}
@@ -370,4 +426,99 @@ test('12: setHeaders replace and functional update', async () => {
 test('13: transport failure rejects', async () => {
   const client = createClient<TestRouter>({ url: 'http://127.0.0.1:1/rpc' })
   await expect(client.fetch({ greet: { name: 'x' } })).rejects.toThrow()
+})
+
+// ── wire format (docs/transport.md): params never ride in a POST url ─────────
+
+test('14: unary POSTs a JSON body and never puts params in the url', async () => {
+  const r = await clientFor(serverA).fetch({ greet: { name: 'body' } })
+  if (isOk(r.greet)) expect(r.greet.data.message).toBe('hello body from A')
+  const sent = lastRequest()
+  expect(sent.method).toBe('POST')
+  expect(sent.urlQuery).toBeNull()
+  expect(sent.contentType).toContain('application/json')
+})
+
+test('15: explicit GET keeps params in ?q=', async () => {
+  const r = await clientFor(serverA).fetch(
+    { greet: { name: 'get' } },
+    { method: 'GET' },
+  )
+  if (isOk(r.greet)) expect(r.greet.data.message).toBe('hello get from A')
+  const sent = lastRequest()
+  expect(sent.method).toBe('GET')
+  expect(JSON.parse(sent.urlQuery ?? '{}')).toEqual({ greet: { name: 'get' } })
+})
+
+test('16: multipart sends params as a q form field, never in the url', async () => {
+  const r = await clientFor(serverA).fetch(
+    { save_image: { fileName: 'b.png' } },
+    { files: [new Uint8Array([1, 2, 3])] },
+  )
+  if (isOk(r.save_image)) expect(r.save_image.data.bytes).toBe(3)
+  const sent = lastRequest()
+  expect(sent.method).toBe('POST')
+  expect(sent.urlQuery).toBeNull()
+  expect(sent.contentType).toContain('multipart/form-data')
+  expect(JSON.parse(sent.formQuery ?? '{}')).toEqual({
+    save_image: { fileName: 'b.png' },
+  })
+})
+
+test('17: files cannot ride a GET', async () => {
+  await expect(
+    clientFor(serverA).fetch(
+      { save_image: { fileName: 'c.png' } },
+      { method: 'GET', files: [new Uint8Array([1])] },
+    ),
+  ).rejects.toThrow()
+})
+
+test('18: stream POSTs a JSON body and never puts params in the url', async () => {
+  for await (const frame of clientFor(serverA).stream({ count: { n: 1 } })) {
+    void frame
+  }
+  const sent = lastRequest()
+  expect(sent.path).toBe('/stream')
+  expect(sent.method).toBe('POST')
+  expect(sent.urlQuery).toBeNull()
+  expect(sent.contentType).toContain('application/json')
+})
+
+test('19: stream non-2xx status rejects instead of yielding nothing', async () => {
+  const origin = `http://localhost:${serverA.port}`
+  const client = createClient<TestRouter>({
+    url: `${origin}/rpc`,
+    streamUrl: `${origin}/broken-stream`,
+  })
+  const drain = async (): Promise<void> => {
+    for await (const frame of client.stream({ count: { n: 1 } })) void frame
+  }
+  await expect(drain()).rejects.toThrow('429')
+})
+
+test('20: an injected fetch carries every HTTP call', async () => {
+  const origin = `http://localhost:${serverA.port}`
+  const seen: string[] = []
+  const tracingFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    seen.push(String(input))
+    return fetch(input, init)
+  }) as typeof fetch
+  const client = createClient<TestRouter>({
+    url: `${origin}/rpc`,
+    streamUrl: `${origin}/stream`,
+    fetch: tracingFetch,
+  })
+
+  const r = await client.fetch({ greet: { name: 'f' } })
+  expect(isOk(r.greet)).toBe(true)
+  for await (const frame of client.stream({ count: { n: 1 } })) void frame
+
+  expect(seen).toEqual([`${origin}/rpc`, `${origin}/stream`])
+})
+
+test('21: unary non-2xx status rejects', async () => {
+  const origin = `http://localhost:${serverA.port}`
+  const client = createClient<TestRouter>({ url: `${origin}/broken-stream` })
+  await expect(client.fetch({ greet: { name: 'x' } })).rejects.toThrow('429')
 })

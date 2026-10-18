@@ -1,13 +1,13 @@
 //! Per-call request options.
 
-/// HTTP method override for a call. Defaults to `GET` (no files) or `POST`
-/// (with files) when left unset.
+/// HTTP method override for a call. Defaults to `POST` (params in a JSON body,
+/// or the multipart `q` field with files) — params never ride in a POST url.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Method {
-    /// `GET` — params in the query string, no body.
-    #[default]
+    /// `GET` — opt-in: params in the `?q=` query string, no body, no files.
     Get,
-    /// `POST`.
+    /// `POST` (the default) — params in the body.
+    #[default]
     Post,
     /// `PUT`.
     Put,
@@ -47,7 +47,7 @@ pub struct CallOpts {
     pub headers: Vec<(String, String)>,
     /// Files to upload as multipart `file` parts (HTTP only).
     pub files: Vec<Vec<u8>>,
-    /// Override the HTTP method.
+    /// Override the HTTP method (default `POST`; `GET` puts params in `?q=`).
     pub method: Option<Method>,
 }
 

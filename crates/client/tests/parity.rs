@@ -10,9 +10,10 @@ use axum::Json;
 use axum::Router as AxumRouter;
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Multipart, Query, State};
-use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::extract::{FromRequest as _, Multipart, Query, Request, State};
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, post};
 use bytes::Bytes;
 use futures::{SinkExt as _, StreamExt as _};
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
-use stakit_client::{ActionResult, CallOpts, Client, ServerFrame, TransportError};
+use stakit_client::{ActionResult, CallOpts, Client, Method, ServerFrame, TransportError};
 use stakit_model::Model;
 use stakit_router::{ClientAction, Cx, Error, ResponseError, Router, action};
 
@@ -187,21 +188,46 @@ async fn rpc(State(router): Shared, headers: HeaderMap, Query(q): Query<Q>) -> J
     dispatch(&router, &headers, &q.q, Vec::new()).await
 }
 
-async fn rpc_upload(
-    State(router): Shared,
-    headers: HeaderMap,
-    Query(q): Query<Q>,
-    mut multipart: Multipart,
-) -> Json<Value> {
+/// `POST /rpc`: params in the JSON body, or — with files — in the multipart
+/// `q` field (docs/transport.md). A `q` in the url is a contract violation.
+async fn rpc_post(State(router): Shared, request: Request) -> Response {
+    if request.uri().query().is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "params must not ride in a POST url",
+        )
+            .into_response();
+    }
+    let headers = request.headers().clone();
+    let is_multipart = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("multipart/form-data"));
+    if !is_multipart {
+        let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let q = std::str::from_utf8(&body).unwrap();
+        return dispatch(&router, &headers, q, Vec::new())
+            .await
+            .into_response();
+    }
+
+    let mut multipart = Multipart::from_request(request, &()).await.unwrap();
+    let mut q = String::new();
     let mut files = Vec::new();
     while let Some(field) = multipart.next_field().await.unwrap() {
-        files.push(field.bytes().await.unwrap().to_vec());
+        if field.name() == Some("q") {
+            q = field.text().await.unwrap();
+        } else {
+            files.push(field.bytes().await.unwrap().to_vec());
+        }
     }
-    dispatch(&router, &headers, &q.q, files).await
+    dispatch(&router, &headers, &q, files).await.into_response()
 }
 
-async fn stream_handler(State(router): Shared, Query(q): Query<Q>) -> Response {
-    let payload: Value = serde_json::from_str(&q.q).unwrap_or(Value::Null);
+async fn stream_handler(State(router): Shared, body: Bytes) -> Response {
+    let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let frames = router
         .on_stream(
             Req {
@@ -253,7 +279,7 @@ async fn handle_socket(router: Arc<Router<App, Req>>, socket: WebSocket) {
 async fn spawn_server(name: &'static str) -> String {
     let router = Arc::new(build_router(name));
     let app = AxumRouter::new()
-        .route("/rpc", get(rpc).post(rpc_upload))
+        .route("/rpc", get(rpc).post(rpc_post))
         .route("/stream", post(stream_handler))
         .route("/ws", get(ws_handler))
         .with_state(router);
@@ -548,4 +574,20 @@ async fn transport_failure_is_err() {
         )
         .await;
     assert!(matches!(result, Err(TransportError::Http(_))));
+}
+
+#[tokio::test] // 16: explicit GET opts into `?q=` and still round-trips
+async fn explicit_get_round_trips_through_query() {
+    let client = client_for(&spawn_server("A").await);
+    let result = client
+        .fetch_with(
+            greet,
+            Greet {
+                name: "get".to_owned(),
+            },
+            CallOpts::new().method(Method::Get),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.data().unwrap().message, "hello get from A");
 }

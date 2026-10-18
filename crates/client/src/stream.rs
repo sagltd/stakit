@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use stakit_router::{Endpoint, ErrorBody};
 
 use crate::TransportError;
-use crate::client::{Client, encode_query};
+use crate::client::{Client, encode_query, with_payload};
 use crate::options::CallOpts;
 use crate::result::ActionResult;
 
@@ -26,11 +26,14 @@ enum WireFrame<T> {
 
 impl Client {
     /// Streams a streaming action against the stream url (falls back to the base
-    /// url) with default options. Yields one [`ActionResult`] per frame.
+    /// url) with default options: `POST` with the params as a JSON body. Yields
+    /// one [`ActionResult`] per frame; blank, malformed and unknown frames (e.g.
+    /// `heartbeat` keep-alives) are skipped.
     ///
     /// # Errors
-    /// Returns `Err` if the initial request fails. Per-frame application errors
-    /// are yielded as [`ActionResult::Error`] (and terminate the stream).
+    /// Returns `Err` if the initial request fails or answers a non-2xx status.
+    /// Per-frame application errors are yielded as [`ActionResult::Error`] (and
+    /// terminate the stream).
     pub async fn stream<E>(
         &self,
         endpoint: E,
@@ -61,7 +64,7 @@ impl Client {
         E::Output: DeserializeOwned,
     {
         let q = encode_query(E::ACTION, &params)?;
-        let method: reqwest::Method = opts.method.map_or(reqwest::Method::POST, Into::into);
+        let method = opts.method.unwrap_or_default();
         let url = opts
             .url
             .as_deref()
@@ -69,14 +72,8 @@ impl Client {
             .unwrap_or_else(|| self.base_url())
             .to_owned();
 
-        let mut request = self
-            .http()
-            .request(method, &url)
-            .query(&[("q", q.as_str())]);
-        for (name, value) in self.merged_headers(&opts.headers) {
-            request = request.header(name, value);
-        }
-        let response = request.send().await?;
+        let request = with_payload(self.request(method, &url, &opts.headers), method, q);
+        let response = request.send().await?.error_for_status()?;
         let byte_stream = response.bytes_stream();
 
         // Boxed so the returned stream is `Unpin` — callers can `.next()` it in a

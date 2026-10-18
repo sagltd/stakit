@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use axum::Router as AxumRouter;
 use axum::body::Body;
-use axum::extract::Query;
 use axum::response::Response;
 use axum::routing::{get, post};
 use futures::{SinkExt as _, StreamExt as _};
@@ -62,11 +61,6 @@ async fn greet(_params: Greet) -> Result<Greeting, Error> {
 #[action(stream)]
 fn count(_params: Count) -> impl futures::Stream<Item = Result<u32, Error>> + use<> {
     async_stream::stream! { yield Ok(0u32); }
-}
-
-#[derive(Deserialize)]
-struct Q {
-    q: String,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -208,7 +202,7 @@ async fn jsonl_stream_drops_malformed_frames_without_panicking() {
 //  Unary HTTP: an unexpected response shape is a typed error, not a panic
 // ════════════════════════════════════════════════════════════════════════════
 
-async fn weird_response(Query(_q): Query<Q>) -> Response {
+async fn weird_response() -> Response {
     // Server answers with a bare array where the unary client expects an object
     // keyed by the action name.
     Response::new(Body::from(r#"["unexpected","array"]"#))

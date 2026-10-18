@@ -2,11 +2,12 @@
 // websocket duplex), generic over the generated `Router` type. Mirrors the
 // Rust client and the wire contract in docs/transport.md.
 
+import { parseFrame, payloadRequest, unaryRequest } from './http'
+import type { HttpRequest } from './http'
 import type {
   CallOpts,
   ClientActionHandlers,
   ClientOptions,
-  FileInput,
   HeadersMap,
   ParamsMap,
   ResultMap,
@@ -55,6 +56,9 @@ type ActionsProxy<R> = {
   ) => Promise<ResultMap<R, ParamsMap<R>>[keyof ResultMap<R, ParamsMap<R>>]>
 }
 
+/** The slice of `fetch` the client needs (any fetch-compatible function fits). */
+type FetchFn = (input: string, init: RequestInit) => Promise<Response>
+
 interface State<R> {
   url: string
   streamUrl?: string
@@ -62,9 +66,13 @@ interface State<R> {
   headers: HeadersMap
   defineClientActions: Partial<ClientActionHandlers<R>>
   onError: (error: Error) => Error
+  fetch: FetchFn
 }
 
 const identity = (error: Error): Error => error
+
+// Resolved per call, so a fetch installed after `createClient` still applies.
+const globalFetch: FetchFn = (input, init) => globalThis.fetch(input, init)
 
 /** Creates a stakit client generic over the generated `Router` type. */
 export function createClient<R>(options: ClientOptions<R>): Client<R> {
@@ -75,6 +83,7 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
     headers: { ...(options.headers ?? {}) },
     defineClientActions: options.defineClientActions ?? {},
     onError: options.onError ?? identity,
+    fetch: options.fetch ?? globalFetch,
   }
 
   const setHeaders: Client<R>['setHeaders'] = (headers) => {
@@ -84,30 +93,34 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
         : { ...headers }
   }
 
+  /** Sends one HTTP request; any network failure or non-2xx goes to onError. */
+  const send = async (request: HttpRequest): Promise<Response> => {
+    let response: Response
+    try {
+      response = await state.fetch(request.url, request.init)
+    } catch (error) {
+      throw state.onError(asError(error))
+    }
+    if (!response.ok) {
+      throw state.onError(
+        new Error(`request failed with status ${response.status}`),
+      )
+    }
+    return response
+  }
+
   const doFetch = async <P extends ParamsMap<R>>(
     params: P,
     opts?: CallOpts<R>,
   ): Promise<ResultMap<R, P>> => {
-    const hasFiles = Boolean(opts?.files?.length)
-    const method = opts?.method ?? (hasFiles ? 'POST' : 'GET')
-    const url = buildUrl(opts?.url ?? state.url, params)
     const headers = mergeHeaders(state.headers, opts?.headers)
-
-    let body: BodyInit | undefined
-    if (hasFiles) {
-      const form = new FormData()
-      for (const file of opts!.files!) form.append('file', toBlob(file))
-      body = form
-      delete headers['content-type']
-      delete headers['Content-Type']
-    }
-
-    let response: Response
+    let request: HttpRequest
     try {
-      response = await fetch(url, { method, headers, body })
+      request = unaryRequest(opts?.url ?? state.url, params, headers, opts)
     } catch (error) {
       throw state.onError(asError(error))
     }
+    const response = await send(request)
     try {
       return (await response.json()) as ResultMap<R, P>
     } catch (error) {
@@ -119,17 +132,13 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
     params: P,
     opts?: CallOpts<R>,
   ): AsyncGenerator<ResultMap<R, P>> {
-    const method = opts?.method ?? 'POST'
-    const url = buildUrl(opts?.url ?? state.streamUrl ?? state.url, params)
+    const url = opts?.url ?? state.streamUrl ?? state.url
     const headers = mergeHeaders(state.headers, opts?.headers)
     const actionKey = Object.keys(params)[0] ?? ''
 
-    let response: Response
-    try {
-      response = await fetch(url, { method, headers })
-    } catch (error) {
-      throw state.onError(asError(error))
-    }
+    const response = await send(
+      payloadRequest(url, params, opts?.method ?? 'POST', headers),
+    )
     if (!response.body)
       throw state.onError(new Error('stream response has no body'))
 
@@ -145,12 +154,8 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
         const line = buffer.slice(0, newline)
         buffer = buffer.slice(newline + 1)
         newline = buffer.indexOf('\n')
-        if (!line.trim()) continue
-        const frame = JSON.parse(line) as {
-          type: 'next' | 'error' | 'end'
-          data?: unknown
-          error?: unknown
-        }
+        const frame = parseFrame(line)
+        if (!frame) continue
         if (frame.type === 'next') {
           yield {
             [actionKey]: { status: 'ok', data: frame.data },
@@ -160,9 +165,10 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
             [actionKey]: { status: 'error', error: frame.error },
           } as ResultMap<R, P>
           return
-        } else {
+        } else if (frame.type === 'end') {
           return
         }
+        // any other type (e.g. `heartbeat`) is a keep-alive: skip it
       }
     }
   }
@@ -295,19 +301,8 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function buildUrl(base: string, params: unknown): string {
-  const url = new URL(base)
-  url.searchParams.set('q', JSON.stringify(params))
-  return url.toString()
-}
-
 function mergeHeaders(base: HeadersMap, extra?: HeadersMap): HeadersMap {
   return { ...base, ...(extra ?? {}) }
-}
-
-function toBlob(file: FileInput): Blob {
-  if (file instanceof Blob) return file
-  return new Blob([file as BlobPart])
 }
 
 function toWsUrl(url: string): string {

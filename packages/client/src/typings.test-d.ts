@@ -73,6 +73,24 @@ async function _resultMap(): Promise<void> {
   void _val
 }
 
+// `fetch` takes any fetch-compatible function (e.g. `expo/fetch`), nothing else
+function _fetchOption(): void {
+  const injected: typeof fetch = fetch
+  void createClient<TestRouter>({ url: 'http://x', fetch: injected })
+
+  // @ts-expect-error — fetch must be a fetch-compatible function
+  void createClient<TestRouter>({ url: 'http://x', fetch: 'nope' })
+}
+
+// GET is the only method that may put params in the url; the type stays open
+function _methodOption(): void {
+  void client.fetch({ greet: { name: 'a' } }, { method: 'GET' })
+  // @ts-expect-error — not an HTTP method the client knows
+  void client.fetch({ greet: { name: 'a' } }, { method: 'TRACE' })
+}
+
 void _guards
 void _params
 void _resultMap
+void _fetchOption
+void _methodOption

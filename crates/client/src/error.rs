@@ -27,6 +27,10 @@ pub enum TransportError {
     /// The server returned a response shape the client did not expect.
     #[error("unexpected response shape: {0}")]
     UnexpectedResponse(&'static str),
+    /// The call options describe a request that cannot be sent (e.g. files on a
+    /// `GET`). Rejected before anything reaches the wire.
+    #[error("invalid request: {0}")]
+    InvalidRequest(&'static str),
     /// A websocket-level failure.
     #[error("websocket error: {0}")]
     WebSocket(String),

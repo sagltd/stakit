@@ -24,8 +24,13 @@ const client = createClient<Router>({
     },
   },
   onError: (err) => err, // fires only on a real network failure
+  fetch: customFetch, // optional (defaults to global fetch), e.g. expo/fetch
 })
 ```
+
+Calls are `POST` with the params as a JSON body — params never ride in a POST
+url. Uploads send them as the multipart `q` field next to the `file` parts.
+Pass `{ method: 'GET' }` per call to put them in `?q=` instead (no files).
 
 ## Unary — one or many actions in one request
 
@@ -54,9 +59,12 @@ await client.fetch(
   {
     url: 'https://vm-42.internal/app', // override base url
     headers: { authorization: vmToken }, // merged over base headers
-    files: [file], // multipart upload
+    files: [file], // multipart upload (params go in the `q` form field)
   },
 )
+
+// opt into `?q=` for a cacheable read (default is POST + JSON body; no files)
+await client.fetch({ version: null }, { method: 'GET' })
 ```
 
 ## Stream

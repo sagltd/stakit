@@ -3,9 +3,10 @@
 //! handful of endpoints (one per transport), each delegating the entire payload
 //! to the router:
 //!
-//! - `GET  /app`    — unary calls, payload in `?q=<json>`
-//! - `POST /app`    — unary calls + multipart file upload (`?q=` + `file` parts)
-//! - `POST /stream` — streaming calls (JSONL frames)
+//! - `POST /app`    — unary calls: JSON body, or multipart (`q` field + `file`
+//!   parts) for uploads. Params never ride in a POST url.
+//! - `GET  /app`    — opt-in unary calls with the payload in `?q=<json>`
+//! - `POST /stream` — streaming calls: JSON body in, JSONL frames out
 //! - `GET  /ws`     — duplex websocket (incl. server→client `client_call`)
 //!
 //! A real HTTP-only app can collapse to a **single** `/app` route. The payload is
@@ -15,9 +16,10 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::Router as AxumRouter;
-use axum::body::{Body, Bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Multipart, Query, State};
+use axum::extract::{FromRequest as _, Multipart, Query, Request, State};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse as _, Response};
@@ -172,7 +174,8 @@ pub fn progress(
     }
 }
 
-/// Saves uploaded image bytes (params from `?q=`, bytes from the multipart body).
+/// Saves uploaded image bytes (params from the multipart `q` field, bytes from
+/// the `file` parts).
 #[action]
 pub async fn save_image(cx: &Cx<App, Req>, params: SaveImage) -> Result<Saved, Error> {
     if cx.req.image.is_empty() {
@@ -245,6 +248,9 @@ async fn login(body: Bytes) -> Response {
     axum::Json(serde_json::json!({ "ok": true, "email": params.email })).into_response()
 }
 
+/// Largest JSON body the demo accepts (uploads ride the multipart path).
+const BODY_LIMIT: usize = 256 * 1024;
+
 #[derive(Deserialize)]
 struct Q {
     q: Option<String>,
@@ -276,35 +282,64 @@ async fn app_get(
     axum::Json(response).into_response()
 }
 
-// ---- unary + files: POST /app?q={json} (multipart `file` parts) ----
-async fn app_post(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(q): Query<Q>,
-    mut multipart: Multipart,
-) -> Response {
+/// Whether the request body is `multipart/form-data`.
+fn is_multipart(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("multipart/form-data"))
+}
+
+/// Reads a multipart body: the JSON payload from the `q` field, file bytes from
+/// the `file` parts (concatenated into one image buffer for this demo).
+async fn read_multipart(request: Request) -> (Value, Vec<u8>) {
+    let Ok(mut multipart) = Multipart::from_request(request, &()).await else {
+        return (Value::Null, Vec::new());
+    };
+    let mut payload = Value::Null;
     let mut image = Vec::new();
     while let Ok(Some(field)) = multipart.next_field().await {
-        if let Ok(bytes) = field.bytes().await {
+        let is_q = field.name() == Some("q");
+        let Ok(bytes) = field.bytes().await else {
+            continue;
+        };
+        if is_q {
+            payload = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        } else {
             image.extend_from_slice(&bytes);
         }
     }
+    (payload, image)
+}
+
+// ---- unary: POST /app (JSON body, or multipart `q` field + `file` parts) ----
+async fn app_post(State(state): State<AppState>, request: Request) -> Response {
+    let headers = request.headers().clone();
+    let (payload, image) = if is_multipart(&headers) {
+        read_multipart(request).await
+    } else {
+        let body = to_bytes(request.into_body(), BODY_LIMIT)
+            .await
+            .unwrap_or_default();
+        (serde_json::from_slice(&body).unwrap_or(Value::Null), Vec::new())
+    };
     let response = state
         .router
-        .on_request(req_from(&headers, image), payload_from(&q))
+        .on_request(req_from(&headers, image), payload)
         .await;
     axum::Json(response).into_response()
 }
 
-// ---- stream: POST /stream (JSONL frames) ----
+// ---- stream: POST /stream (JSON body in, JSONL frames out) ----
 async fn stream_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<Q>,
+    body: Bytes,
 ) -> Response {
+    let payload = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let frames = state
         .router
-        .on_stream(req_from(&headers, Vec::new()), payload_from(&q))
+        .on_stream(req_from(&headers, Vec::new()), payload)
         .map(|frame| {
             let mut bytes = serde_json::to_vec(&frame).unwrap_or_default();
             bytes.push(b'\n');
