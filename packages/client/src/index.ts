@@ -7,12 +7,17 @@
 export { createClient } from './client'
 export type { Client, Connection } from './client'
 export { isError, isOk } from './guards'
+export { TransportError } from './transport-error'
+export type { TransportErrorDetails } from './transport-error'
 export type {
   ActionResult,
   CallOpts,
   ClientActionHandlers,
   ClientOptions,
   ErrorBody,
+  FetchFn,
+  FetchInit,
+  FetchResponse,
   FileInput,
   HeadersMap,
   HttpMethod,

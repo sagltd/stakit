@@ -4,7 +4,8 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test'
 import type { Server } from 'bun'
 
-import { createClient, isError, isOk } from './index'
+import { TransportError, createClient, isError, isOk } from './index'
+import type { FetchFn } from './index'
 
 interface TestRouter {
   serverActions: {
@@ -494,16 +495,18 @@ test('19: stream non-2xx status rejects instead of yielding nothing', async () =
   const drain = async (): Promise<void> => {
     for await (const frame of client.stream({ count: { n: 1 } })) void frame
   }
-  await expect(drain()).rejects.toThrow('429')
+  const failure = await drain().catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(TransportError)
+  expect((failure as TransportError).status).toBe(429)
 })
 
 test('20: an injected fetch carries every HTTP call', async () => {
   const origin = `http://localhost:${serverA.port}`
   const seen: string[] = []
-  const tracingFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
-    seen.push(String(input))
+  const tracingFetch: FetchFn = (input, init) => {
+    seen.push(input)
     return fetch(input, init)
-  }) as typeof fetch
+  }
   const client = createClient<TestRouter>({
     url: `${origin}/rpc`,
     streamUrl: `${origin}/stream`,
@@ -520,5 +523,10 @@ test('20: an injected fetch carries every HTTP call', async () => {
 test('21: unary non-2xx status rejects', async () => {
   const origin = `http://localhost:${serverA.port}`
   const client = createClient<TestRouter>({ url: `${origin}/broken-stream` })
-  await expect(client.fetch({ greet: { name: 'x' } })).rejects.toThrow('429')
+  const failure = await client
+    .fetch({ greet: { name: 'x' } })
+    .catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(TransportError)
+  expect((failure as TransportError).status).toBe(429)
+  expect((failure as TransportError).body).toBe('too many requests')
 })

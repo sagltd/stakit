@@ -10,9 +10,11 @@ Every action outcome is one of:
 
 ```jsonc
 { "status": "ok",    "data":  <value> }
-{ "status": "error", "error": { "code": 422, "message": "…", "fields"?: { "name": ["…"] }, "data"?: <value> } }
+{ "status": "error", "error": { "code": 422, "type"?: "validation", "message": "…", "fields"?: { "name": ["…"] }, "data"?: <value> } }
 ```
 
+`type` is the stable, machine-readable error code clients branch on (e.g.
+`budget_exceeded`); it is omitted when it is the default, `error`.
 `fields` is present only for validation errors. `data` is present only when the
 action attached a client-facing payload with `Error::with_data` (for example
 when a quota resets), so clients can render their own copy. `code` mirrors the HTTP-style
@@ -39,7 +41,8 @@ browser history). Clients default to POST:
 Response: HTTP **200 always** for a dispatched payload (per-action errors live
 in the envelope). A non-2xx status is a transport-level failure (rate limited,
 body too large, malformed request) and clients surface it as a transport error,
-never as an envelope. Body:
+never as an envelope, keeping its status, the `x-error-code` header and
+`Retry-After` (the TypeScript client throws a `TransportError`). Body:
 
 ```jsonc
 { "greet": { "status": "ok", "data": { "message": "hi" } },
@@ -76,7 +79,10 @@ clients only need `type` (servers may add `index` / `action`):
 Clients skip blank lines, malformed lines and frames of any **unknown** `type`
 (forward compatible: servers send `heartbeat` frames so proxies do not idle the
 connection out). Only `error` and `end` terminate a stream. A non-2xx response
-status is a transport error.
+status is a transport error. The last line may omit its newline. A body that
+breaks off or ends before an `end`/`error` frame is **not** a clean finish:
+clients report it (`stream_interrupted`), and a `next` frame whose `data` does
+not decode is an error, not a skip.
 
 ## WebSocket / duplex
 

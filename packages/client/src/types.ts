@@ -5,6 +5,11 @@
 /** Error body carried by an action error (mirrors the server `ErrorBody`). */
 export interface ErrorBody {
   readonly code: number
+  /**
+   * Stable, machine-readable error code (e.g. `budget_exceeded`) to branch on.
+   * Omitted on the wire when it is the default, `error`.
+   */
+  readonly type?: string
   readonly message: string
   readonly fields?: Record<string, readonly string[]>
   /** Structured, client-facing payload some errors carry (e.g. when a quota resets). */
@@ -74,7 +79,33 @@ export interface CallOpts<R> {
   readonly method?: HttpMethod
   /** Per-call client action handlers (override base for this call). */
   readonly defineClientActions?: Partial<ClientActionHandlers<R>>
+  /** Aborts the HTTP call (a stream stops reading and rejects). */
+  readonly signal?: AbortSignal
 }
+
+/** What the client hands to `fetch`. */
+export interface FetchInit {
+  readonly method: string
+  readonly headers: HeadersMap
+  readonly body?: string | FormData
+  readonly signal?: AbortSignal
+}
+
+/** The parts of a fetch response the client reads. */
+export interface FetchResponse {
+  readonly ok: boolean
+  readonly status: number
+  readonly headers: { get(name: string): string | null }
+  readonly body: ReadableStream<Uint8Array> | null
+  json(): Promise<unknown>
+  text(): Promise<string>
+}
+
+/**
+ * Any fetch-compatible function: the global `fetch`, `expo/fetch`, or a plain
+ * wrapper around either. Called as a plain function, never as a method.
+ */
+export type FetchFn = (input: string, init: FetchInit) => Promise<FetchResponse>
 
 /** Options for `createClient`. */
 export interface ClientOptions<R> {
@@ -88,11 +119,15 @@ export interface ClientOptions<R> {
   readonly wsUrl?: string
   /** Base client action handlers (called by the server over a connection). */
   readonly defineClientActions?: Partial<ClientActionHandlers<R>>
-  /** Maps a transport error before it is thrown. Only real network failures. */
+  /**
+   * Maps a transport error before it is thrown: a failed request, a non-2xx
+   * answer (a `TransportError`), or a stream that breaks off. Never an action
+   * error — those ride in the result.
+   */
   readonly onError?: (error: Error) => Error
   /**
    * The `fetch` used for every HTTP call (unary + stream). Defaults to the
    * global `fetch`; pass e.g. `expo/fetch` on React Native for streaming bodies.
    */
-  readonly fetch?: typeof fetch
+  readonly fetch?: FetchFn
 }

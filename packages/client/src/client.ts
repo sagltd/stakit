@@ -4,10 +4,13 @@
 
 import { parseFrame, payloadRequest, unaryRequest } from './http'
 import type { HttpRequest } from './http'
+import { TransportError, failedResponse } from './transport-error'
 import type {
   CallOpts,
   ClientActionHandlers,
   ClientOptions,
+  FetchFn,
+  FetchResponse,
   HeadersMap,
   ParamsMap,
   ResultMap,
@@ -56,9 +59,6 @@ type ActionsProxy<R> = {
   ) => Promise<ResultMap<R, ParamsMap<R>>[keyof ResultMap<R, ParamsMap<R>>]>
 }
 
-/** The slice of `fetch` the client needs (any fetch-compatible function fits). */
-type FetchFn = (input: string, init: RequestInit) => Promise<Response>
-
 interface State<R> {
   url: string
   streamUrl?: string
@@ -74,6 +74,14 @@ const identity = (error: Error): Error => error
 // Resolved per call, so a fetch installed after `createClient` still applies.
 const globalFetch: FetchFn = (input, init) => globalThis.fetch(input, init)
 
+/**
+ * `injected` called as a plain function: browser and Worker `fetch` throw
+ * "Illegal invocation" when called as a method of anything but `globalThis`.
+ */
+function plainCall(injected: FetchFn | undefined): FetchFn {
+  return injected ? (input, init) => injected(input, init) : globalFetch
+}
+
 /** Creates a stakit client generic over the generated `Router` type. */
 export function createClient<R>(options: ClientOptions<R>): Client<R> {
   const state: State<R> = {
@@ -83,7 +91,7 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
     headers: { ...(options.headers ?? {}) },
     defineClientActions: options.defineClientActions ?? {},
     onError: options.onError ?? identity,
-    fetch: options.fetch ?? globalFetch,
+    fetch: plainCall(options.fetch),
   }
 
   const setHeaders: Client<R>['setHeaders'] = (headers) => {
@@ -93,19 +101,18 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
         : { ...headers }
   }
 
-  /** Sends one HTTP request; any network failure or non-2xx goes to onError. */
-  const send = async (request: HttpRequest): Promise<Response> => {
-    let response: Response
+  /**
+   * Sends one HTTP request; a network failure, or a non-2xx answer (as a
+   * `TransportError` with its status, code and Retry-After), goes to onError.
+   */
+  const send = async (request: HttpRequest): Promise<FetchResponse> => {
+    let response: FetchResponse
     try {
       response = await state.fetch(request.url, request.init)
     } catch (error) {
       throw state.onError(asError(error))
     }
-    if (!response.ok) {
-      throw state.onError(
-        new Error(`request failed with status ${response.status}`),
-      )
-    }
+    if (!response.ok) throw state.onError(await failedResponse(response))
     return response
   }
 
@@ -136,40 +143,73 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
     const headers = mergeHeaders(state.headers, opts?.headers)
     const actionKey = Object.keys(params)[0] ?? ''
 
-    const response = await send(
-      payloadRequest(url, params, opts?.method ?? 'POST', headers),
-    )
+    let request: HttpRequest
+    try {
+      request = payloadRequest(
+        url,
+        params,
+        opts?.method ?? 'POST',
+        headers,
+        opts?.signal,
+      )
+    } catch (error) {
+      throw state.onError(asError(error))
+    }
+    const response = await send(request)
     if (!response.body)
-      throw state.onError(new Error('stream response has no body'))
+      throw state.onError(
+        new TransportError('stream response has no body', {
+          status: response.status,
+        }),
+      )
 
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let newline = buffer.indexOf('\n')
-      while (newline >= 0) {
-        const line = buffer.slice(0, newline)
-        buffer = buffer.slice(newline + 1)
-        newline = buffer.indexOf('\n')
-        const frame = parseFrame(line)
-        if (!frame) continue
-        if (frame.type === 'next') {
-          yield {
-            [actionKey]: { status: 'ok', data: frame.data },
-          } as ResultMap<R, P>
-        } else if (frame.type === 'error') {
-          yield {
-            [actionKey]: { status: 'error', error: frame.error },
-          } as ResultMap<R, P>
-          return
-        } else if (frame.type === 'end') {
-          return
+    try {
+      for (;;) {
+        let read: Awaited<ReturnType<typeof reader.read>>
+        try {
+          read = await reader.read()
+        } catch (error) {
+          throw state.onError(asError(error))
         }
-        // any other type (e.g. `heartbeat`) is a keep-alive: skip it
+        // At the end, flush the decoder and treat what is left as a last
+        // line (JSON Lines allows one without its newline).
+        buffer += read.done
+          ? `${decoder.decode()}\n`
+          : decoder.decode(read.value, { stream: true })
+        let newline = buffer.indexOf('\n')
+        while (newline >= 0) {
+          const frame = parseFrame(buffer.slice(0, newline))
+          buffer = buffer.slice(newline + 1)
+          newline = buffer.indexOf('\n')
+          if (frame?.type === 'next') {
+            yield {
+              [actionKey]: { status: 'ok', data: frame.data },
+            } as ResultMap<R, P>
+          } else if (frame?.type === 'error') {
+            yield {
+              [actionKey]: { status: 'error', error: frame.error },
+            } as ResultMap<R, P>
+            return
+          } else if (frame?.type === 'end') {
+            return
+          }
+          // blank, malformed or any other type (e.g. `heartbeat`): skip it
+        }
+        if (read.done)
+          throw state.onError(
+            new TransportError('the stream ended before it finished', {
+              status: response.status,
+              code: 'stream_interrupted',
+            }),
+          )
       }
+    } finally {
+      // Release the connection when the consumer stops early or an error ends
+      // the stream (a no-op once the body was read to its end).
+      await reader.cancel().catch(() => undefined)
     }
   }
 

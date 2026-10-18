@@ -73,10 +73,34 @@ async function _resultMap(): Promise<void> {
   void _val
 }
 
+/** The shape of `expo/fetch`: its own request and response types, no extras. */
+declare function expoLikeFetch(
+  input: string | URL | { readonly url: string },
+  init?: {
+    method?: string
+    headers?: Record<string, string> | [string, string][]
+    body?: string | ArrayBuffer | Blob | FormData | URLSearchParams | null
+    signal?: AbortSignal | null
+    credentials?: 'include' | 'omit' | 'same-origin'
+  },
+): Promise<{
+  readonly ok: boolean
+  readonly status: number
+  readonly headers: Headers
+  readonly body: ReadableStream<Uint8Array> | null
+  json(): Promise<unknown>
+  text(): Promise<string>
+  arrayBuffer(): Promise<ArrayBuffer>
+}>
+
 // `fetch` takes any fetch-compatible function (e.g. `expo/fetch`), nothing else
 function _fetchOption(): void {
-  const injected: typeof fetch = fetch
-  void createClient<TestRouter>({ url: 'http://x', fetch: injected })
+  void createClient<TestRouter>({ url: 'http://x', fetch })
+  void createClient<TestRouter>({
+    url: 'http://x',
+    fetch: (input, init) => globalThis.fetch(input, init),
+  })
+  void createClient<TestRouter>({ url: 'http://x', fetch: expoLikeFetch })
 
   // @ts-expect-error — fetch must be a fetch-compatible function
   void createClient<TestRouter>({ url: 'http://x', fetch: 'nope' })
@@ -96,11 +120,15 @@ void _fetchOption
 void _methodOption
 void _errorData
 
-// an error body may carry a structured payload, typed `unknown` until narrowed
+// an error body may carry a structured payload, typed `unknown` until narrowed,
+// and a stable machine-readable `type` to branch on
 function _errorData(result: ActionResult<number>): void {
   if (isError(result)) {
     type _E = Expect<Equal<typeof result.error.data, unknown>>
     const _payload: _E = true
     void _payload
+    type _T = Expect<Equal<typeof result.error.type, string | undefined>>
+    const _type: _T = true
+    void _type
   }
 }

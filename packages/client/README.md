@@ -23,10 +23,16 @@ const client = createClient<Router>({
       /* … */ return 'ok'
     },
   },
-  onError: (err) => err, // fires only on a real network failure
+  onError: (err) => err, // fires only on a transport failure (see below)
   fetch: customFetch, // optional (defaults to global fetch), e.g. expo/fetch
 })
 ```
+
+Transport failures reject (after `onError`): a failed request, a non-2xx
+answer — a `TransportError` with `status`, `code` (the `x-error-code` header),
+`retryAfter` (seconds) and the start of the `body` — or a stream that breaks off
+before its end (`code: 'stream_interrupted'`). Action errors never reject; they
+ride in the result (`error.type` is the stable code to branch on).
 
 Calls are `POST` with the params as a JSON body — params never ride in a POST
 url. Uploads send them as the multipart `q` field next to the `file` parts.
@@ -41,7 +47,7 @@ const r = await client.fetch({
 })
 
 if (isOk(r.greet)) r.greet.data.message // typed
-if (isError(r.greet)) r.greet.error.code // { code, message, fields? }
+if (isError(r.greet)) r.greet.error.code // { code, type?, message, fields?, data? }
 ```
 
 `fetch` takes a map of `action → params` and returns a map of
@@ -70,10 +76,16 @@ await client.fetch({ version: null }, { method: 'GET' })
 ## Stream
 
 ```ts
-for await (const frame of client.stream({ count: { n: 5 } })) {
+const controller = new AbortController() // optional: stop it from elsewhere
+for await (const frame of client.stream(
+  { count: { n: 5 } },
+  { signal: controller.signal },
+)) {
   if (isOk(frame.count)) console.log(frame.count.data)
 }
 ```
+
+Leaving the loop early (`break`, `return`, a throw) closes the connection.
 
 ## WebSocket (duplex + server→client calls)
 
