@@ -247,6 +247,17 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
         &self.usage
     }
 
+    /// The agent's cancellation token (a shared handle). Cancel it from another
+    /// task to stop a run cooperatively: an in-flight provider call aborts, the
+    /// loop ends with [`Finish::Cancelled`], and every started middleware's
+    /// `on_finish` still runs (so usage gets recorded). Dropping the run also
+    /// cancels, but skips `on_finish`. Once cancelled, the token stays
+    /// cancelled — later runs on this agent stop immediately.
+    #[must_use]
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
+    }
+
     /// Whether a provider is registered for `model`.
     #[cfg(test)]
     #[must_use]
@@ -1358,5 +1369,63 @@ mod tests {
         assert!(matches!(out.finish, Finish::Stopped { .. }));
         // 1 try + 1 retry = 2 attempts, then give up.
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    /// A provider that streams one delta and then never finishes.
+    struct HangingProvider;
+
+    impl Provider for HangingProvider {
+        #[allow(
+            clippy::unnecessary_literal_bound,
+            reason = "trait method must return &str"
+        )]
+        fn model_id(&self) -> &str {
+            "hanging"
+        }
+        fn complete(
+            &self,
+            _r: ChatRequest,
+        ) -> BoxFuture<'_, Result<ChatResponse, crate::error::ProviderError>> {
+            Box::pin(async { Err(crate::error::ProviderError::Cancelled) })
+        }
+        fn stream(
+            &self,
+            _r: ChatRequest,
+        ) -> BoxFuture<'_, Result<EventStream, crate::error::ProviderError>> {
+            Box::pin(async {
+                let first = futures::stream::iter([Ok(StreamEvent::TextDelta("partial".into()))]);
+                Ok(first.chain(futures::stream::pending()).boxed())
+            })
+        }
+    }
+
+    /// Records whether `on_finish` ran.
+    struct FinishFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl AgentMiddleware<()> for FinishFlag {
+        async fn on_finish(&self, _cx: &AgentCx<'_, ()>) -> Result<(), AgentError> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_token_stops_a_running_agent_and_still_runs_on_finish() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut agent = Agent::new(())
+            .provider(HangingProvider)
+            .register_middleware(FinishFlag(Arc::clone(&finished)))
+            .with_context(vec![Message::user("hi")]);
+        let token = agent.cancel_token();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            token.cancel();
+        });
+
+        let out = agent.run().await.expect("outcome");
+
+        assert!(matches!(out.finish, Finish::Cancelled));
+        assert!(finished.load(Ordering::SeqCst), "on_finish must run");
     }
 }
