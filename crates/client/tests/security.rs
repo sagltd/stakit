@@ -149,19 +149,19 @@ async fn self_signed_wss_accepted_only_with_explicit_opt_in() {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// A stream endpoint that emits a hostile JSONL body: blank lines, non-JSON
-/// garbage, frames of an unknown `type`, a frame whose `data` is the wrong type
-/// for the typed stream, then a couple of valid frames and an `end`.
+/// garbage, frames of an unknown `type`, then a couple of valid frames and an
+/// `end`. (A `next` frame whose `data` is the wrong type is an error, not a
+/// skip: see `tests/stream_integrity.rs`.)
 async fn hostile_stream() -> Response {
     let body = [
-        "",                                               // blank line, skipped
-        "not json at all",                                // unparseable, skipped
-        "{}",                                             // no type tag, skipped
-        r#"{"type":"unknownkind"}"#,                      // unknown variant, skipped
-        r#"{"type":"next","data":"a string not a u32"}"#, // type mismatch, skipped
-        r#"{"type":"next","data":1}"#,                    // valid item
-        r#"{"type":"next","data":2}"#,                    // valid item
-        r#"{"type":"end"}"#,                              // terminator
-        r#"{"type":"next","data":99}"#,                   // after end → never seen
+        "",                             // blank line, skipped
+        "not json at all",              // unparseable, skipped
+        "{}",                           // no type tag, skipped
+        r#"{"type":"unknownkind"}"#,    // unknown variant, skipped
+        r#"{"type":"next","data":1}"#,  // valid item
+        r#"{"type":"next","data":2}"#,  // valid item
+        r#"{"type":"end"}"#,            // terminator
+        r#"{"type":"next","data":99}"#, // after end → never seen
     ]
     .join("\n");
     let mut body = body.into_bytes();
@@ -190,7 +190,7 @@ async fn jsonl_stream_drops_malformed_frames_without_panicking() {
     let items: Vec<_> = stream.collect().await;
 
     // Only the two well-formed, correctly-typed `next` frames survive; the
-    // malformed/mistyped/post-`end` frames are dropped — no panic, no crash.
+    // malformed/unknown/post-`end` frames are dropped — no panic, no crash.
     let values: Vec<u32> = items
         .into_iter()
         .filter_map(stakit_client::ActionResult::ok)
