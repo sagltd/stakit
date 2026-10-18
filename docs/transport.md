@@ -10,10 +10,12 @@ Every action outcome is one of:
 
 ```jsonc
 { "status": "ok",    "data":  <value> }
-{ "status": "error", "error": { "code": 422, "message": "…", "fields"?: { "name": ["…"] } } }
+{ "status": "error", "error": { "code": 422, "message": "…", "fields"?: { "name": ["…"] }, "data"?: <value> } }
 ```
 
-`fields` is present only for validation errors. `code` mirrors the HTTP-style
+`fields` is present only for validation errors. `data` is present only when the
+action attached a client-facing payload with `Error::with_data` (for example
+when a quota resets), so clients can render their own copy. `code` mirrors the HTTP-style
 status of the individual action (not the transport response).
 
 ## HTTP — unary (batch)

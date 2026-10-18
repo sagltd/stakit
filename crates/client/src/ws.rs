@@ -234,6 +234,7 @@ fn parse_frame(bytes: &[u8]) -> Result<ServerFrame, TransportError> {
                         kind: std::borrow::Cow::Borrowed("internal"),
                         message: "missing error body".to_owned(),
                         fields: None,
+                        data: None,
                     });
                 ActionResult::Error(error)
             } else {

@@ -7,6 +7,8 @@ export interface ErrorBody {
   readonly code: number
   readonly message: string
   readonly fields?: Record<string, readonly string[]>
+  /** Structured, client-facing payload some errors carry (e.g. when a quota resets). */
+  readonly data?: unknown
 }
 
 /**

@@ -94,3 +94,13 @@ void _params
 void _resultMap
 void _fetchOption
 void _methodOption
+void _errorData
+
+// an error body may carry a structured payload, typed `unknown` until narrowed
+function _errorData(result: ActionResult<number>): void {
+  if (isError(result)) {
+    type _E = Expect<Equal<typeof result.error.data, unknown>>
+    const _payload: _E = true
+    void _payload
+  }
+}

@@ -103,7 +103,7 @@ The conversion is `impl<E: ResponseError> From<E> for Error` — bounded on *our
 trait, not `std::error::Error`, so it preserves each error's status (no blanket
 500) and never conflicts with user-written `From` impls. The wire envelope is
 uniform: `Reply = { status, data } | { status, error: { code, type?, message,
-fields? } }`. TypeScript generation emits an `ErrorCode` string union (every
+fields?, data? } }` (`data` only when the action called `Error::with_data`). TypeScript generation emits an `ErrorCode` string union (every
 action's codes + built-ins), a typed `ResponseError`, and an `isValidationError`
 guard.
 

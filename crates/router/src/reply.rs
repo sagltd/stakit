@@ -53,6 +53,10 @@ pub struct ErrorBody {
     /// validation-only) map doesn't bloat every `ErrorBody` / `Result<_, _>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<Box<IndexMap<String, Vec<String>>>>,
+    /// Client-facing structured payload, when the action attached one
+    /// ([`Error::with_data`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Box<Value>>,
 }
 
 impl From<Error> for ErrorBody {
@@ -62,6 +66,7 @@ impl From<Error> for ErrorBody {
             kind: error.kind,
             message: error.message,
             fields: error.fields,
+            data: error.data,
         }
     }
 }
@@ -80,6 +85,9 @@ impl ErrorBody {
                 "fields".to_owned(),
                 serde_json::to_value(fields).unwrap_or(Value::Null),
             );
+        }
+        if let Some(data) = self.data {
+            object.insert("data".to_owned(), *data);
         }
         Value::Object(object)
     }
@@ -177,6 +185,7 @@ impl Reply {
                 kind: error.kind,
                 message: error.message,
                 fields: error.fields,
+                data: error.data,
             },
         }
     }

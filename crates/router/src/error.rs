@@ -25,6 +25,10 @@ pub struct Error {
     /// Per-field validation messages, when this is a validation error. Boxed so a
     /// large validation map doesn't bloat every `Result<_, Error>`.
     pub fields: Option<Box<IndexMap<String, Vec<String>>>>,
+    /// Client-facing structured payload (e.g. when a quota resets), serialized
+    /// as `data` next to `message`. Boxed like `fields`; set with
+    /// [`Error::with_data`]. Never put internals here — it goes over the wire.
+    pub data: Option<Box<serde_json::Value>>,
     /// Server-side detail, never sent to clients (log it).
     pub detail: Option<String>,
 }
@@ -42,6 +46,7 @@ impl Error {
             kind: Cow::Borrowed("not_found"),
             message: format!("unknown action `{action}`"),
             fields: None,
+            data: None,
             detail: None,
         }
     }
@@ -54,6 +59,7 @@ impl Error {
             kind: Cow::Borrowed("bad_request"),
             message: format!("invalid parameters: {error}"),
             fields: None,
+            data: None,
             detail: None,
         }
     }
@@ -66,6 +72,7 @@ impl Error {
             kind: Cow::Borrowed("internal"),
             message: INTERNAL_MESSAGE.to_owned(),
             fields: None,
+            data: None,
             detail: Some(format!("failed to serialize result: {error}")),
         }
     }
@@ -85,6 +92,7 @@ impl Error {
             kind: Cow::Borrowed("validation"),
             message: "validation failed".to_owned(),
             fields: Some(Box::new(fields)),
+            data: None,
             detail: None,
         }
     }
@@ -97,6 +105,7 @@ impl Error {
             kind: Cow::Borrowed("error"),
             message: message.into(),
             fields: None,
+            data: None,
             detail: None,
         }
     }
@@ -115,6 +124,7 @@ impl Error {
             kind: kind.into(),
             message: message.into(),
             fields: None,
+            data: None,
             detail: None,
         }
     }
@@ -128,8 +138,18 @@ impl Error {
             kind: Cow::Borrowed("internal"),
             message: INTERNAL_MESSAGE.to_owned(),
             fields: None,
+            data: None,
             detail: Some(error.to_string()),
         }
+    }
+
+    /// Attach a client-facing JSON payload, serialized as `data` beside the
+    /// message — e.g. `{ "resetsAt": … }` on a quota error, so clients can
+    /// render their own copy without parsing `message`.
+    #[must_use]
+    pub fn with_data(mut self, data: serde_json::Value) -> Self {
+        self.data = Some(Box::new(data));
+        self
     }
 
     /// The server-side detail (never sent to clients), if any.
@@ -213,6 +233,7 @@ impl<E: ResponseError> From<E> for Error {
                 kind: error.code(),
                 message: INTERNAL_MESSAGE.to_owned(),
                 fields: None,
+                data: None,
                 detail: Some(error.to_string()),
             };
         }
@@ -221,6 +242,7 @@ impl<E: ResponseError> From<E> for Error {
             kind: error.code(),
             message: error.message().into_owned(),
             fields: None,
+            data: None,
             detail: None,
         }
     }

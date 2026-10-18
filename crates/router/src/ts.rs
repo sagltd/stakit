@@ -110,6 +110,7 @@ fn write_error_envelope<G, R>(
         "  type: ErrorCode;\n",
         "  message: string;\n",
         "  fields?: Record<string, string[]>;\n",
+        "  data?: unknown;\n",
         "}\n\n",
         "export const isValidationError = (error: ResponseError): boolean =>\n",
         "  error.type === \"validation\";\n\n",
