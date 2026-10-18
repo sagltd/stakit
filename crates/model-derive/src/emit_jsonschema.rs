@@ -39,7 +39,7 @@ pub(crate) fn expand(ident: &Ident, ir: &Ir) -> TokenStream {
     let sj = sj();
     let body = match ir {
         Ir::Struct { body } => struct_schema(body),
-        Ir::Enum { variants } => enum_schema(variants),
+        Ir::Enum { variants, .. } => enum_schema(variants),
     };
     quote! {
         impl ::stakit_model::JsonSchema for #ident {
@@ -127,7 +127,7 @@ fn enum_schema(variants: &[Variant]) -> TokenStream {
         return quote! { #sj::json!({ "not": {} }) };
     }
     if variants.iter().all(|v| matches!(v.body, Body::Unit)) {
-        let names = variants.iter().map(|v| v.ident.to_string());
+        let names = variants.iter().map(|v| v.wire.clone());
         return quote! { #sj::json!({ "type": "string", "enum": [ #(#names),* ] }) };
     }
     let arms = variants.iter().map(variant_schema);
@@ -140,7 +140,7 @@ fn enum_schema(variants: &[Variant]) -> TokenStream {
 
 fn variant_schema(variant: &Variant) -> TokenStream {
     let sj = sj();
-    let name = variant.ident.to_string();
+    let name = variant.wire.clone();
     match &variant.body {
         Body::Unit => quote! {
             __variants.push(#sj::json!({ "type": "string", "const": #name }));

@@ -19,7 +19,7 @@ fn v() -> TokenStream {
 pub(crate) fn expand(ident: &Ident, ir: &Ir, generics: &Generics) -> TokenStream {
     let body = match ir {
         Ir::Struct { body } => struct_body(body),
-        Ir::Enum { variants } => enum_body(variants),
+        Ir::Enum { variants, .. } => enum_body(variants),
     };
     // No bound added to type params: the body only touches `#[validate]`-rule'd
     // fields (a `dive`d generic field would need `T: Validate`, added by hand).

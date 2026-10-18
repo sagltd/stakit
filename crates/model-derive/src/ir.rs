@@ -120,13 +120,107 @@ pub(crate) enum Body {
 /// An enum variant.
 pub(crate) struct Variant {
     pub(crate) ident: Ident,
+    /// The serde wire name: the ident after the enum's `rename_all` and the
+    /// variant's own `rename` (both mirrored so the TypeScript matches serde).
+    pub(crate) wire: String,
     pub(crate) body: Body,
 }
 
 /// Parsed model input.
 pub(crate) enum Ir {
-    Struct { body: Body },
-    Enum { variants: Vec<Variant> },
+    Struct {
+        body: Body,
+    },
+    Enum {
+        variants: Vec<Variant>,
+        /// serde's internal tag (`#[serde(tag = "…")]`), if any.
+        tag: Option<String>,
+    },
+}
+
+/// The enum-level serde attributes the TypeScript export mirrors.
+#[derive(Default)]
+struct SerdeEnum {
+    tag: Option<String>,
+    rename_all: Option<LitStr>,
+}
+
+/// Consume the value of a serde key the export does not mirror (`key = …`,
+/// `key(…)` or a bare flag), so unrelated serde options never break the derive.
+fn skip_serde_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<()> {
+    if meta.input.peek(syn::Token![=]) {
+        let _: Expr = meta.value()?.parse()?;
+    } else if meta.input.peek(syn::token::Paren) {
+        let _: proc_macro2::Group = meta.input.parse()?;
+    }
+    Ok(())
+}
+
+/// Reads `tag` and `rename_all` from an enum's `#[serde(...)]` attributes.
+fn parse_serde_enum(attrs: &[Attribute]) -> syn::Result<SerdeEnum> {
+    let mut out = SerdeEnum::default();
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            let has_value = meta.input.peek(syn::Token![=]);
+            if meta.path.is_ident("tag") && has_value {
+                out.tag = Some(meta.value()?.parse::<LitStr>()?.value());
+            } else if meta.path.is_ident("rename_all") && has_value {
+                out.rename_all = Some(meta.value()?.parse()?);
+            } else {
+                skip_serde_value(&meta)?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(out)
+}
+
+/// A variant's own `#[serde(rename = "…")]`, if any.
+fn parse_serde_rename(attrs: &[Attribute]) -> syn::Result<Option<String>> {
+    let mut rename = None;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") && meta.input.peek(syn::Token![=]) {
+                rename = Some(meta.value()?.parse::<LitStr>()?.value());
+            } else {
+                skip_serde_value(&meta)?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(rename)
+}
+
+/// Applies a serde `rename_all` rule to a variant name, byte for byte like
+/// serde's `RenameRule::apply_to_variant`; `None` for an unknown rule.
+fn rename_variant(ident: &str, rule: &str) -> Option<String> {
+    let snake = || {
+        let mut snake = String::with_capacity(ident.len() + 4);
+        for (index, ch) in ident.char_indices() {
+            if index > 0 && ch.is_uppercase() {
+                snake.push('_');
+            }
+            snake.push(ch.to_ascii_lowercase());
+        }
+        snake
+    };
+    let renamed = match rule {
+        "lowercase" => ident.to_ascii_lowercase(),
+        "UPPERCASE" => ident.to_ascii_uppercase(),
+        "PascalCase" => ident.to_owned(),
+        "camelCase" => {
+            let mut chars = ident.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_ascii_lowercase().to_string() + chars.as_str()
+            })
+        }
+        "snake_case" => snake(),
+        "SCREAMING_SNAKE_CASE" => snake().to_ascii_uppercase(),
+        "kebab-case" => snake().replace('_', "-"),
+        "SCREAMING-KEBAB-CASE" => snake().to_ascii_uppercase().replace('_', "-"),
+        _ => return None,
+    };
+    Some(renamed)
 }
 
 /// Parses a [`DeriveInput`] into the [`Ir`] plus the type ident.
@@ -137,14 +231,29 @@ pub(crate) fn parse(input: &DeriveInput) -> syn::Result<(Ident, Ir)> {
             body: parse_fields(&data.fields)?,
         },
         Data::Enum(data) => {
+            let serde = parse_serde_enum(&input.attrs)?;
             let mut variants = Vec::with_capacity(data.variants.len());
             for v in &data.variants {
+                let name = v.ident.to_string();
+                let wire = match (parse_serde_rename(&v.attrs)?, &serde.rename_all) {
+                    (Some(rename), _) => rename,
+                    (None, Some(rule)) => {
+                        rename_variant(&name, &rule.value()).ok_or_else(|| {
+                            syn::Error::new(rule.span(), "unsupported serde `rename_all` rule")
+                        })?
+                    }
+                    (None, None) => name,
+                };
                 variants.push(Variant {
                     ident: v.ident.clone(),
+                    wire,
                     body: parse_fields(&v.fields)?,
                 });
             }
-            Ir::Enum { variants }
+            Ir::Enum {
+                variants,
+                tag: serde.tag,
+            }
         }
         Data::Union(u) => {
             return Err(syn::Error::new(

@@ -46,7 +46,7 @@ fn field_types(ir: &Ir) -> Vec<Type> {
     };
     match ir {
         Ir::Struct { body } => push_body(body),
-        Ir::Enum { variants } => {
+        Ir::Enum { variants, .. } => {
             for v in variants {
                 push_body(&v.body);
             }
@@ -130,7 +130,7 @@ fn ts_ref_fn(name: &str, type_params: &[&Ident]) -> TokenStream {
 fn decl_expr(ir: &Ir) -> TokenStream {
     match ir {
         Ir::Struct { body } => struct_decl(body),
-        Ir::Enum { variants } => enum_decl(variants),
+        Ir::Enum { variants, tag } => enum_decl(variants, tag.as_deref()),
     }
 }
 
@@ -180,13 +180,13 @@ fn named_field_line(field: &Field) -> TokenStream {
     }
 }
 
-fn enum_decl(variants: &[Variant]) -> TokenStream {
+fn enum_decl(variants: &[Variant], tag: Option<&str>) -> TokenStream {
     if variants.is_empty() {
         return quote! {
             format!("export type {} = never;", <Self as ::stakit_model::TSType>::ts_ref())
         };
     }
-    let parts = variants.iter().map(variant_part);
+    let parts = variants.iter().map(|variant| variant_part(variant, tag));
     quote! {{
         let __parts: ::std::vec::Vec<String> = ::std::vec![ #(#parts),* ];
         format!(
@@ -197,13 +197,22 @@ fn enum_decl(variants: &[Variant]) -> TokenStream {
     }}
 }
 
-fn variant_part(variant: &Variant) -> TokenStream {
+/// One variant of an enum's union. Without a serde `tag` a unit variant is its
+/// string literal; with one, every variant is an object carrying the tag.
+fn variant_part(variant: &Variant, tag: Option<&str>) -> TokenStream {
+    let tag_entry = tag.map(|tag| format!("{tag}: \"{}\"", variant.wire));
     match &variant.body {
         Body::Unit => {
-            let lit = format!("\"{}\"", variant.ident);
+            let lit = tag_entry.map_or_else(
+                || format!("\"{}\"", variant.wire),
+                |entry| format!("{{ {entry} }}"),
+            );
             quote! { String::from(#lit) }
         }
         Body::Named(fields) => {
+            let tag_entry = tag_entry
+                .into_iter()
+                .map(|entry| quote! { String::from(#entry) });
             let entries = fields.iter().map(|f| {
                 let expr = field_ref_expr(&f.ty);
                 let name = crate::ir::wire_name(&f.label);
@@ -215,7 +224,8 @@ fn variant_part(variant: &Variant) -> TokenStream {
                 quote! {{ let mut __e = String::from(#head); __e.push_str(&#expr); __e }}
             });
             quote! {{
-                let __fields: ::std::vec::Vec<String> = ::std::vec![ #(#entries),* ];
+                let __fields: ::std::vec::Vec<String> =
+                    ::std::vec![ #(#tag_entry,)* #(#entries),* ];
                 format!("{{ {} }}", __fields.join("; "))
             }}
         }

@@ -136,3 +136,31 @@ fn enum_validation_path_is_camel_case() {
     .unwrap_err();
     assert_eq!(err.iter().next().unwrap().path, "userName");
 }
+
+/// A stream frame shape: internally tagged, camelCase tags and fields.
+#[model]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum ChatFrame {
+    AgentDone {
+        agent_id: String,
+        message_id: String,
+    },
+    Heartbeat,
+}
+
+#[test]
+fn tagged_model_enum_matches_its_camel_case_wire() {
+    assert_eq!(
+        generate_typescript::<ChatFrame>(),
+        r#"export type ChatFrame = { kind: "agentDone"; agentId: string; messageId: string } | { kind: "heartbeat" };"#
+    );
+    let json = serde_json::to_string(&ChatFrame::AgentDone {
+        agent_id: "a".to_owned(),
+        message_id: "m".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(
+        json,
+        r#"{"kind":"agentDone","agentId":"a","messageId":"m"}"#
+    );
+}
