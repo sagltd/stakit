@@ -16,17 +16,12 @@ struct Counter {
     cap: i64,
 }
 
+#[path = "support/embedded_pg.rs"]
+mod embedded_pg;
+
 async fn setup() -> (postgresql_embedded::PostgreSQL, Db) {
-    let mut postgres = postgresql_embedded::PostgreSQL::default();
-    postgres.setup().await.expect("setup embedded postgres");
-    postgres.start().await.expect("start embedded postgres");
-    postgres
-        .create_database("arith_test")
-        .await
-        .expect("create database");
-    let db = Db::connect(&postgres.settings().url("arith_test"))
-        .await
-        .expect("connect");
+    let (postgres, url) = embedded_pg::boot("arith_test").await;
+    let db = Db::connect(&url).await.expect("connect");
     db.raw(
         "create table counters (id text primary key, balance bigint not null, cap bigint not null)",
     )

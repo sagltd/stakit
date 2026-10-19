@@ -58,26 +58,13 @@ const DOWN: &[&str] = &[
     r#"drop table "event";"#,
 ];
 
+#[path = "support/embedded_pg.rs"]
+mod embedded_pg;
+
 async fn setup() -> (postgresql_embedded::PostgreSQL, sqlx::PgPool) {
-    let mut postgres = postgresql_embedded::PostgreSQL::default();
-    postgres.setup().await.expect("setup embedded postgres");
-    postgres.start().await.expect("start embedded postgres");
-    postgres
-        .create_database("index_test")
-        .await
-        .expect("create database");
-    let url = postgres.settings().url("index_test");
+    let (postgres, url) = embedded_pg::boot("index_test").await;
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     (postgres, pool)
-}
-
-async fn run(pool: &sqlx::PgPool, statements: &'static [&'static str]) {
-    for statement in statements {
-        sqlx::query(*statement)
-            .execute(pool)
-            .await
-            .unwrap_or_else(|error| panic!("apply `{statement}`: {error}"));
-    }
 }
 
 async fn index_names(pool: &sqlx::PgPool) -> Vec<String> {
@@ -94,7 +81,7 @@ async fn index_names(pool: &sqlx::PgPool) -> Vec<String> {
 async fn generated_composite_indexes_exist_in_postgres_and_revert() {
     let (postgres, pool) = setup().await;
 
-    run(&pool, UP).await;
+    embedded_pg::run(&pool, UP).await;
     let names = index_names(&pool).await;
     // The three table-level indexes (plus the implicit primary-key index) are present.
     for expected in [
@@ -128,7 +115,7 @@ async fn generated_composite_indexes_exist_in_postgres_and_revert() {
     );
 
     // The down migration drops every generated index (and the table).
-    run(&pool, DOWN).await;
+    embedded_pg::run(&pool, DOWN).await;
 
     postgres.stop().await.ok();
 }

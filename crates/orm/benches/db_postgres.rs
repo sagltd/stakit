@@ -11,15 +11,13 @@
 #[macro_use]
 #[path = "common/db.rs"]
 mod common;
+#[path = "../tests/support/embedded_pg.rs"]
+mod embedded_pg;
 
 db_benches! {
     pool: sqlx::PgPool,
     connect: async {
-        let mut pg = postgresql_embedded::PostgreSQL::default();
-        pg.setup().await.expect("setup embedded postgres");
-        pg.start().await.expect("start embedded postgres");
-        pg.create_database("bench").await.expect("create database");
-        let url = pg.settings().url("bench");
+        let (pg, url) = embedded_pg::boot("bench").await;
         let db = Db::connect(&url).await.expect("connect");
         let pool = db.pool().expect("postgres pool").clone();
         (Box::new(pg) as Box<dyn std::any::Any + Send + Sync>, pool, db)

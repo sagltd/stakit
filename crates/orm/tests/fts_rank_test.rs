@@ -20,17 +20,12 @@ struct Doc {
     tsv: String,
 }
 
+#[path = "support/embedded_pg.rs"]
+mod embedded_pg;
+
 async fn connect() -> (postgresql_embedded::PostgreSQL, Db) {
-    let mut postgres = postgresql_embedded::PostgreSQL::default();
-    postgres.setup().await.expect("setup embedded postgres");
-    postgres.start().await.expect("start embedded postgres");
-    postgres
-        .create_database("fts_rank_test")
-        .await
-        .expect("create database");
-    let db = Db::connect(&postgres.settings().url("fts_rank_test"))
-        .await
-        .expect("connect");
+    let (postgres, url) = embedded_pg::boot("fts_rank_test").await;
+    let db = Db::connect(&url).await.expect("connect");
     (postgres, db)
 }
 

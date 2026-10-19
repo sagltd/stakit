@@ -6,28 +6,13 @@ use stakit_orm::prelude::*;
 use stakit_orm::{Count, Select, count};
 use uuid::Uuid;
 
-#[derive(Table)]
-#[table(name = "users")]
-#[allow(dead_code)]
-struct User {
-    #[column(pk)]
-    id: Uuid,
-    #[column(unique)]
-    email: String,
-    name: String,
-}
+#[path = "support/uuid_users.rs"]
+mod uuid_users;
+use uuid_users::User;
 
-#[derive(Table)]
-#[table(name = "posts")]
-#[allow(dead_code)]
-struct Post {
-    #[column(pk)]
-    id: Uuid,
-    #[column(references = User::id, on_delete = "cascade")]
-    author_id: Uuid,
-    title: String,
-    views: i32,
-}
+#[path = "support/uuid_posts.rs"]
+mod uuid_posts;
+use uuid_posts::Post;
 
 const fn uid() -> Uuid {
     Uuid::nil()
@@ -105,35 +90,6 @@ fn inner_join_renders_on_clause() {
     assert_eq!(
         sql,
         r#"select "posts"."id", "users"."name" from "posts" inner join "users" on "posts"."author_id" = "users"."id""#
-    );
-}
-
-#[test]
-fn any_of_uses_array_bind() {
-    let ids = [uid(), uid()];
-    let sql = Select::new(User::all())
-        .from::<User>()
-        .filter(any_of(User::id, &ids))
-        .to_sql()
-        .unwrap();
-    assert_eq!(
-        sql,
-        r#"select "users"."id", "users"."email", "users"."name" from "users" where "users"."id" = any($1)"#
-    );
-}
-
-#[test]
-fn empty_any_of_renders_array_bind() {
-    let ids: [Uuid; 0] = [];
-    // `= ANY('{}')` is valid Postgres (matches nothing) — unlike `IN ()`.
-    let sql = Select::new(User::all())
-        .from::<User>()
-        .filter(any_of(User::id, &ids))
-        .to_sql()
-        .unwrap();
-    assert_eq!(
-        sql,
-        r#"select "users"."id", "users"."email", "users"."name" from "users" where "users"."id" = any($1)"#
     );
 }
 
@@ -234,16 +190,20 @@ fn insert_many_one_statement() {
     assert_eq!(sql, r#"insert into "accounts" ("email") values ($1), ($2)"#);
 }
 
-#[test]
-fn group_by_with_aggregate() {
-    use stakit_orm::count_col;
-    let sql = Select::new((User::name, count_col(User::id)))
+/// `SELECT <projection> FROM users GROUP BY users.name`, rendered.
+fn grouped_by_name<P: stakit_orm::Projection>(projection: P) -> String {
+    Select::new(projection)
         .from::<User>()
         .group_by(User::name)
         .to_sql()
-        .unwrap();
+        .unwrap()
+}
+
+#[test]
+fn group_by_with_aggregate() {
+    use stakit_orm::count_col;
     assert_eq!(
-        sql,
+        grouped_by_name((User::name, count_col(User::id))),
         r#"select "users"."name", count("users"."id") from "users" group by "users"."name""#
     );
 }
@@ -325,14 +285,10 @@ struct UserStat {
 
 #[test]
 fn derive_row_named_projection() {
-    let sql = Select::new(UserStat::project())
-        .from::<User>()
-        .group_by(User::name)
-        .to_sql()
-        .unwrap();
+    // The derived projection renders exactly like the hand-written tuple.
     assert_eq!(
-        sql,
-        r#"select "users"."name", count("users"."id") from "users" group by "users"."name""#
+        grouped_by_name(UserStat::project()),
+        grouped_by_name((User::name, stakit_orm::count_col(User::id)))
     );
 }
 
@@ -456,29 +412,20 @@ fn multiple_order_by_terms() {
 
 #[test]
 fn any_of_multi_and_empty_bind_one_param_each() {
-    // multi
-    let ids = [uid(), uid(), uid()];
-    let sql = Select::new(User::all())
-        .from::<User>()
-        .filter(any_of(User::id, &ids))
-        .to_sql()
-        .unwrap();
-    assert_eq!(
-        sql,
-        r#"select "users"."id", "users"."email", "users"."name" from "users" where "users"."id" = any($1)"#
-    );
-
-    // empty (still a single array bind)
+    // `= ANY('{}')` is valid Postgres (matches nothing) — unlike `IN ()` — so the
+    // empty list is still a single array bind.
     let none: [Uuid; 0] = [];
-    let sql = Select::new(User::all())
-        .from::<User>()
-        .filter(any_of(User::id, &none))
-        .to_sql()
-        .unwrap();
-    assert_eq!(
-        sql,
-        r#"select "users"."id", "users"."email", "users"."name" from "users" where "users"."id" = any($1)"#
-    );
+    for ids in [&[uid(), uid(), uid()][..], &[uid(), uid()], &none] {
+        let sql = Select::new(User::all())
+            .from::<User>()
+            .filter(any_of(User::id, ids))
+            .to_sql()
+            .unwrap();
+        assert_eq!(
+            sql,
+            r#"select "users"."id", "users"."email", "users"."name" from "users" where "users"."id" = any($1)"#
+        );
+    }
 }
 
 #[test]
@@ -587,18 +534,23 @@ struct Widget {
     price: i32,
 }
 
-#[test]
-fn on_conflict_do_update_multiple_non_target_columns() {
-    use stakit_orm::Insert;
-    let sql = Insert::new(vec![WidgetNew {
+/// The widget row every `on_conflict` test inserts.
+fn gadget() -> WidgetNew {
+    WidgetNew {
         id: Some(uid()),
         sku: "abc".to_owned(),
         name: "Gadget".to_owned(),
         price: 10,
-    }])
-    .on_conflict_do_update(Widget::sku)
-    .to_sql()
-    .unwrap();
+    }
+}
+
+#[test]
+fn on_conflict_do_update_multiple_non_target_columns() {
+    use stakit_orm::Insert;
+    let sql = Insert::new(vec![gadget()])
+        .on_conflict_do_update(Widget::sku)
+        .to_sql()
+        .unwrap();
     // Every inserted column except the conflict target is set to excluded.<col>.
     assert_eq!(
         sql,
@@ -628,17 +580,12 @@ fn on_conflict_composite_key_selective_set_and_coalesce() {
     use stakit_orm::Insert;
     // Composite conflict key + explicit per-column updates: `price` overwritten,
     // `id` kept when the incoming value is NULL (coalesce keeps the stored one).
-    let sql = Insert::new(vec![WidgetNew {
-        id: Some(uid()),
-        sku: "abc".to_owned(),
-        name: "Gadget".to_owned(),
-        price: 10,
-    }])
-    .on_conflict((Widget::sku, Widget::name))
-    .set(Widget::price)
-    .set_coalesce(Widget::id)
-    .to_sql()
-    .unwrap();
+    let sql = Insert::new(vec![gadget()])
+        .on_conflict((Widget::sku, Widget::name))
+        .set(Widget::price)
+        .set_coalesce(Widget::id)
+        .to_sql()
+        .unwrap();
     assert_eq!(
         sql,
         r#"insert into "widgets" ("sku", "name", "price", "id") values ($1, $2, $3, $4) on conflict ("sku", "name") do update set "price" = excluded."price", "id" = coalesce(excluded."id", "widgets"."id")"#
@@ -648,16 +595,11 @@ fn on_conflict_composite_key_selective_set_and_coalesce() {
 #[test]
 fn on_conflict_builder_do_nothing_renders_composite_target() {
     use stakit_orm::Insert;
-    let sql = Insert::new(vec![WidgetNew {
-        id: Some(uid()),
-        sku: "abc".to_owned(),
-        name: "Gadget".to_owned(),
-        price: 10,
-    }])
-    .on_conflict((Widget::sku, Widget::name))
-    .do_nothing()
-    .to_sql()
-    .unwrap();
+    let sql = Insert::new(vec![gadget()])
+        .on_conflict((Widget::sku, Widget::name))
+        .do_nothing()
+        .to_sql()
+        .unwrap();
     assert!(
         sql.ends_with(r#"on conflict ("sku", "name") do nothing"#),
         "got {sql}"
@@ -668,16 +610,11 @@ fn on_conflict_builder_do_nothing_renders_composite_target() {
 fn on_conflict_do_update_all_via_builder() {
     use stakit_orm::Insert;
     // `do_update_all()` overwrites every non-key inserted column with excluded.<col>.
-    let sql = Insert::new(vec![WidgetNew {
-        id: Some(uid()),
-        sku: "abc".to_owned(),
-        name: "Gadget".to_owned(),
-        price: 10,
-    }])
-    .on_conflict(Widget::sku)
-    .do_update_all()
-    .to_sql()
-    .unwrap();
+    let sql = Insert::new(vec![gadget()])
+        .on_conflict(Widget::sku)
+        .do_update_all()
+        .to_sql()
+        .unwrap();
     assert_eq!(
         sql,
         r#"insert into "widgets" ("sku", "name", "price", "id") values ($1, $2, $3, $4) on conflict ("sku") do update set "name" = excluded."name", "price" = excluded."price", "id" = excluded."id""#
@@ -688,16 +625,11 @@ fn on_conflict_do_update_all_via_builder() {
 fn on_conflict_do_update_all_except_via_builder() {
     use stakit_orm::Insert;
     // `do_update_all_except(name)` overwrites all non-key columns but leaves `name`.
-    let sql = Insert::new(vec![WidgetNew {
-        id: Some(uid()),
-        sku: "abc".to_owned(),
-        name: "Gadget".to_owned(),
-        price: 10,
-    }])
-    .on_conflict(Widget::sku)
-    .do_update_all_except(Widget::name)
-    .to_sql()
-    .unwrap();
+    let sql = Insert::new(vec![gadget()])
+        .on_conflict(Widget::sku)
+        .do_update_all_except(Widget::name)
+        .to_sql()
+        .unwrap();
     assert_eq!(
         sql,
         r#"insert into "widgets" ("sku", "name", "price", "id") values ($1, $2, $3, $4) on conflict ("sku") do update set "price" = excluded."price", "id" = excluded."id""#
@@ -708,15 +640,10 @@ fn on_conflict_do_update_all_except_via_builder() {
 fn on_conflict_builder_with_no_set_defaults_to_do_nothing() {
     use stakit_orm::Insert;
     // `on_conflict(key)` with no `set`/`set_coalesce` -> DO NOTHING (no empty SET).
-    let sql = Insert::new(vec![WidgetNew {
-        id: Some(uid()),
-        sku: "abc".to_owned(),
-        name: "Gadget".to_owned(),
-        price: 10,
-    }])
-    .on_conflict(Widget::sku)
-    .to_sql()
-    .unwrap();
+    let sql = Insert::new(vec![gadget()])
+        .on_conflict(Widget::sku)
+        .to_sql()
+        .unwrap();
     assert!(
         sql.ends_with(r#"on conflict ("sku") do nothing"#),
         "got {sql}"

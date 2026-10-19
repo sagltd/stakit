@@ -26,28 +26,16 @@ struct User {
     active: bool,
 }
 
-#[derive(Table, Debug)]
-#[table(name = "posts")]
-#[allow(dead_code)]
-struct Post {
-    #[column(pk)]
-    id: Uuid,
-    #[column(references = User::id, on_delete = "cascade")]
-    author_id: Uuid,
-    title: String,
-    views: i32,
-}
+#[path = "support/uuid_posts.rs"]
+mod uuid_posts;
+use uuid_posts::{Post, PostNew};
+
+#[path = "support/embedded_pg.rs"]
+mod embedded_pg;
 
 /// Boot embedded Postgres, apply migrations, return a connected [`Db`].
 async fn setup() -> (postgresql_embedded::PostgreSQL, Db) {
-    let mut postgres = postgresql_embedded::PostgreSQL::default();
-    postgres.setup().await.expect("setup embedded postgres");
-    postgres.start().await.expect("start embedded postgres");
-    postgres
-        .create_database("stakit_test")
-        .await
-        .expect("create database");
-    let url = postgres.settings().url("stakit_test");
+    let (postgres, url) = embedded_pg::boot("stakit_test").await;
     let db = Db::connect(&url).await.expect("connect");
     MIGRATOR
         .run(db.pool().expect("postgres pool"))

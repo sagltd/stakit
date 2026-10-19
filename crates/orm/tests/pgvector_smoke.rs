@@ -51,17 +51,13 @@ struct DocVec {
 // Harness — identical pattern to `postgres_test.rs`
 // ---------------------------------------------------------------------------
 
+#[path = "support/embedded_pg.rs"]
+mod embedded_pg;
+
 /// Boot embedded Postgres and enable the `vector` extension. Returns `None` (after a
 /// printed notice) when pgvector is not installed, so the test skips instead of failing.
 async fn setup_pgvector() -> Option<(postgresql_embedded::PostgreSQL, Db)> {
-    let mut postgres = postgresql_embedded::PostgreSQL::default();
-    postgres.setup().await.expect("setup embedded postgres");
-    postgres.start().await.expect("start embedded postgres");
-    postgres
-        .create_database("pgvec_test")
-        .await
-        .expect("create database");
-    let url = postgres.settings().url("pgvec_test");
+    let (postgres, url) = embedded_pg::boot("pgvec_test").await;
     let db = Db::connect(&url).await.expect("connect");
 
     // Enable the vector extension. If it is not installed in the theseus pg tree, skip

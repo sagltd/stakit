@@ -37,16 +37,12 @@ fn string_fk_is_recorded_in_column_metadata() {
     assert!(matches!(fk.on_delete, OnDelete::Cascade));
 }
 
+#[path = "support/embedded_pg.rs"]
+mod embedded_pg;
+
 #[tokio::test]
 async fn string_fk_is_enforced_by_postgres() {
-    let mut postgres = postgresql_embedded::PostgreSQL::default();
-    postgres.setup().await.expect("setup embedded postgres");
-    postgres.start().await.expect("start embedded postgres");
-    postgres
-        .create_database("string_fk_test")
-        .await
-        .expect("create database");
-    let url = postgres.settings().url("string_fk_test");
+    let (postgres, url) = embedded_pg::boot("string_fk_test").await;
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
 
     // `accounts` exists out of band (no derive); `membership` references it inline by

@@ -15,16 +15,12 @@
 
 use sqlx::Row as _;
 
+#[path = "support/embedded_pg.rs"]
+mod embedded_pg;
+
 /// Boot embedded Postgres and return a superuser-connected pool.
 async fn setup() -> (postgresql_embedded::PostgreSQL, sqlx::PgPool) {
-    let mut postgres = postgresql_embedded::PostgreSQL::default();
-    postgres.setup().await.expect("setup embedded postgres");
-    postgres.start().await.expect("start embedded postgres");
-    postgres
-        .create_database("rls_test")
-        .await
-        .expect("create database");
-    let url = postgres.settings().url("rls_test");
+    let (postgres, url) = embedded_pg::boot("rls_test").await;
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     (postgres, pool)
 }
@@ -51,22 +47,13 @@ const DOWN: &[&str] = &[
     r#"drop role "app_user";"#,
 ];
 
-async fn run(pool: &sqlx::PgPool, statements: &'static [&'static str]) {
-    for statement in statements {
-        sqlx::query(*statement)
-            .execute(pool)
-            .await
-            .unwrap_or_else(|error| panic!("apply `{statement}`: {error}"));
-    }
-}
-
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn generated_rls_migration_enforces_the_policy() {
     let (postgres, pool) = setup().await;
 
     // Apply the generated up migration.
-    run(&pool, UP).await;
+    embedded_pg::run(&pool, UP).await;
 
     // Seed as the table owner (RLS is enabled but NOT forced, so the owner bypasses
     // it for seeding) — two authors, three rows.
@@ -145,7 +132,7 @@ async fn generated_rls_migration_enforces_the_policy() {
 
     // The generated down migration reverts cleanly (drop policies → disable rls →
     // revoke → drop table → drop role), proving up/down are real inverses on pg.
-    run(&pool, DOWN).await;
+    embedded_pg::run(&pool, DOWN).await;
 
     postgres.stop().await.ok();
 }

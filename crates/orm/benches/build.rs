@@ -5,16 +5,9 @@ use stakit_orm::Select;
 use stakit_orm::prelude::*;
 use uuid::Uuid;
 
-#[derive(Table)]
-#[table(name = "users")]
-#[allow(dead_code)]
-struct User {
-    #[column(pk)]
-    id: Uuid,
-    #[column(unique)]
-    email: String,
-    name: String,
-}
+#[path = "../tests/support/uuid_users.rs"]
+mod uuid_users;
+use uuid_users::User;
 
 fn main() {
     divan::main();
