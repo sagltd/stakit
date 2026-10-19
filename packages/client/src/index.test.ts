@@ -177,7 +177,7 @@ function makeServer(serverName: string): Server<WsData> {
                 // keep-alive frames must never end or corrupt the stream
                 line({ type: 'heartbeat' })
               }
-              controller.enqueue(encoder.encode('not json\n'))
+              line({ type: 'future_extension', data: { ignored: true } })
               line({ type: 'end' })
             } else if (name === 'failing') {
               line({ type: 'next', data: 1 })

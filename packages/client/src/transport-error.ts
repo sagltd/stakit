@@ -1,4 +1,4 @@
-// A network-level failure, with what the response said about it, so callers
+// A transport-level failure, with what the response said about it, so callers
 // can show "file too large" or back off on a rate limit without parsing text.
 
 import type { FetchResponse } from './types'
@@ -10,7 +10,7 @@ const MAX_BODY_CHARS = 1_000
 export interface TransportErrorDetails {
   /** HTTP status of the answer (0 when none arrived). */
   readonly status: number
-  /** Machine-readable code: the `x-error-code` header, or `stream_interrupted`. */
+  /** Machine-readable code: `x-error-code`, `stream_interrupted`, or `stream_invalid_frame`. */
   readonly code?: string
   /** Seconds to wait before retrying (`Retry-After`). */
   readonly retryAfter?: number

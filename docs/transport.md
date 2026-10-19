@@ -76,13 +76,18 @@ clients only need `type` (servers may add `index` / `action`):
 { "type": "heartbeat" }               // keep-alive while idle — ignore it
 ```
 
-Clients skip blank lines, malformed lines and frames of any **unknown** `type`
+Clients skip blank lines and frames of any **unknown** `type`
 (forward compatible: servers send `heartbeat` frames so proxies do not idle the
 connection out). Only `error` and `end` terminate a stream. A non-2xx response
 status is a transport error. The last line may omit its newline. A body that
 breaks off or ends before an `end`/`error` frame is **not** a clean finish:
 clients report it (`stream_interrupted`), and a `next` frame whose `data` does
-not decode is an error, not a skip.
+not decode is an error, not a skip. Malformed nonempty JSON lines, missing frame
+types, and invalid known `next` / `error` / `end` fields are transport failures
+(`stream_invalid_frame`), never silently discarded. `next` requires `data`;
+`error` requires an error object with numeric `code` and string `message`;
+`end` carries neither `data` nor `error`. Error metadata, when present, must
+match the declared error-body types.
 
 ## WebSocket / duplex
 

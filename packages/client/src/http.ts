@@ -2,6 +2,8 @@
 // building (params as a JSON body or a multipart `q` field — only an explicit
 // GET puts them in the url) and JSONL frame parsing. See docs/transport.md.
 
+import { TransportError } from './transport-error'
+
 import type {
   CallOpts,
   FetchInit,
@@ -98,17 +100,64 @@ function withoutContentType(headers: HeadersMap): HeadersMap {
   return result
 }
 
-/** Parses one JSONL line; blank or malformed lines yield `null` (skipped). */
-export function parseFrame(line: string): WireFrame | null {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isErrorBody(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    !Number.isInteger(value.code) ||
+    typeof value.message !== 'string'
+  )
+    return false
+  if (value.type !== undefined && typeof value.type !== 'string') return false
+  return (
+    value.fields === undefined ||
+    (isRecord(value.fields) &&
+      Object.values(value.fields).every(
+        (messages) =>
+          Array.isArray(messages) &&
+          messages.every((message: unknown) => typeof message === 'string'),
+      ))
+  )
+}
+
+function isWireFrame(value: unknown): value is WireFrame {
+  if (
+    !isRecord(value) ||
+    typeof value.type !== 'string' ||
+    value.type.length === 0
+  )
+    return false
+  if (value.type === 'next')
+    return Object.hasOwn(value, 'data') && !Object.hasOwn(value, 'error')
+  if (value.type === 'error')
+    return isErrorBody(value.error) && !Object.hasOwn(value, 'data')
+  if (value.type === 'end')
+    return !Object.hasOwn(value, 'data') && !Object.hasOwn(value, 'error')
+  // Heartbeats and future typed frames are intentionally ignored by the caller.
+  return true
+}
+
+/** Blank lines are skipped; malformed protocol frames reject without exposing their payload. */
+export function parseFrame(line: string, status = 0): WireFrame | null {
   if (!line.trim()) return null
+  let frame: unknown
   try {
-    const frame: unknown = JSON.parse(line)
-    if (typeof frame !== 'object' || frame === null) return null
-    if (typeof (frame as { type?: unknown }).type !== 'string') return null
-    return frame as WireFrame
+    frame = JSON.parse(line)
   } catch {
-    return null
+    throw new TransportError('invalid stream frame', {
+      status,
+      code: 'stream_invalid_frame',
+    })
   }
+  if (!isWireFrame(frame))
+    throw new TransportError('invalid stream frame', {
+      status,
+      code: 'stream_invalid_frame',
+    })
+  return frame
 }
 
 function toBlob(file: FileInput): Blob {

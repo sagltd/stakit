@@ -166,6 +166,7 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
+    let searchOffset = 0
     try {
       for (;;) {
         let read: Awaited<ReturnType<typeof reader.read>>
@@ -179,9 +180,14 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
         buffer += read.done
           ? `${decoder.decode()}\n`
           : decoder.decode(read.value, { stream: true })
-        let newline = buffer.indexOf('\n')
+        let newline = buffer.indexOf('\n', searchOffset)
         while (newline >= 0) {
-          const frame = parseFrame(buffer.slice(0, newline))
+          let frame: ReturnType<typeof parseFrame>
+          try {
+            frame = parseFrame(buffer.slice(0, newline), response.status)
+          } catch (error) {
+            throw state.onError(asError(error))
+          }
           buffer = buffer.slice(newline + 1)
           newline = buffer.indexOf('\n')
           if (frame?.type === 'next') {
@@ -196,8 +202,11 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
           } else if (frame?.type === 'end') {
             return
           }
-          // blank, malformed or any other type (e.g. `heartbeat`): skip it
+          // Blank lines and unknown types (e.g. `heartbeat`) are skipped.
         }
+        // This partial line has no newline. Only search newly decoded text
+        // after the next read, rather than rescanning its whole prefix.
+        searchOffset = buffer.length
         if (read.done)
           throw state.onError(
             new TransportError('the stream ended before it finished', {

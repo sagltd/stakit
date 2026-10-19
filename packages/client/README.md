@@ -3,7 +3,7 @@
 Typed TypeScript client for [stakit](../../) routers — HTTP (unary + stream) and
 WebSocket (duplex). Generic over the `Router` type your server emits via
 `router.generate_ts()`. Never throws on an application error (those ride in the
-result and are narrowed with `isOk` / `isError`); only real network failures
+result and are narrowed with `isOk` / `isError`); only transport failures
 reject. See `docs/transport.md` for the wire contract.
 
 ## Create a client
@@ -31,7 +31,10 @@ const client = createClient<Router>({
 Transport failures reject (after `onError`): a failed request, a non-2xx
 answer — a `TransportError` with `status`, `code` (the `x-error-code` header),
 `retryAfter` (seconds) and the start of the `body` — or a stream that breaks off
-before its end (`code: 'stream_interrupted'`). Action errors never reject; they
+before its end (`code: 'stream_interrupted'`). Malformed JSON or invalid known
+stream frames reject with `code: 'stream_invalid_frame'`, without exposing the
+frame payload. Blank lines, heartbeat and unknown future frame types are skipped.
+Action errors never reject; they
 ride in the result (`error.type` is the stable code to branch on).
 
 Calls are `POST` with the params as a JSON body — params never ride in a POST
