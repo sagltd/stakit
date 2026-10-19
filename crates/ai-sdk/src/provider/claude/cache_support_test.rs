@@ -55,36 +55,48 @@ fn nested_one_hour_write_usage_is_preserved_without_double_counting_total_writes
     assert_eq!(usage.cache_create_1h_tokens, 4);
 }
 
-#[test]
-fn streaming_one_hour_write_usage_carries_the_final_lifetime_breakdown() {
+/// An accumulator that saw a message start with a 4-token one-hour write.
+fn started_with_one_hour_write() -> super::Accum {
     let mut accum = super::Accum::default();
     accum.push(&serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":4}}}})).expect("start");
-    accum.push(&serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":7}}})).expect("usage");
-    let events = accum
+    accum
+}
+
+/// The (total, one-hour) cache writes certified after a final `usage` delta.
+fn final_cache_writes(usage: &serde_json::Value) -> (u64, u64) {
+    let mut accum = started_with_one_hour_write();
+    accum
+        .push(&serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":usage}))
+        .expect("usage");
+    match accum
         .push(&serde_json::json!({"type":"message_stop"}))
-        .expect("stop");
-    assert!(
-        matches!(events.last(),Some(crate::StreamEvent::End {usage,..}) if usage.cache_create_tokens == 10 && usage.cache_create_1h_tokens == 7)
-    );
+        .expect("stop")
+        .last()
+    {
+        Some(crate::StreamEvent::End { usage, .. }) => {
+            (usage.cache_create_tokens, usage.cache_create_1h_tokens)
+        }
+        other => panic!("expected End, got {other:?}"),
+    }
+}
+
+#[test]
+fn streaming_one_hour_write_usage_carries_the_final_lifetime_breakdown() {
+    let usage = serde_json::json!({"output_tokens":2,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":7}});
+    assert_eq!(final_cache_writes(&usage), (10, 7));
 }
 
 #[test]
 fn omitted_stream_lifetime_breakdown_retains_the_initial_hour_write_usage() {
-    let mut accum = super::Accum::default();
-    accum.push(&serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":4}}}})).expect("start");
-    accum.push(&serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}})).expect("usage");
-    let events = accum
-        .push(&serde_json::json!({"type":"message_stop"}))
-        .expect("stop");
-    assert!(
-        matches!(events.last(),Some(crate::StreamEvent::End {usage,..}) if usage.cache_create_tokens == 10 && usage.cache_create_1h_tokens == 4)
+    assert_eq!(
+        final_cache_writes(&serde_json::json!({"output_tokens":2})),
+        (10, 4)
     );
 }
 
 #[test]
 fn streaming_usage_progress_is_published_before_the_terminal_event() {
-    let mut accum = super::Accum::default();
-    accum.push(&serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_1h_input_tokens":4}}}})).expect("start");
+    let mut accum = started_with_one_hour_write();
     let events = accum.push(&serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2,"cache_creation":{"ephemeral_1h_input_tokens":7}}})).expect("usage");
     assert!(
         matches!(events.as_slice(), [crate::StreamEvent::Usage { usage }] if usage.input_tokens == 3 && usage.output_tokens == 2 && usage.cache_create_tokens == 10 && usage.cache_create_1h_tokens == 7)

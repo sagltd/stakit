@@ -4,10 +4,10 @@
 )]
 use stakit_ai_sdk::{
     Agent, AgentCx, AgentError, AgentMiddleware, AssistantContent, ChatRequest, Finish, Flow,
-    Message, Outcome, StopReason, StreamEvent, Thinking, Usage, tool,
+    Message, Outcome, StopReason, StreamEvent, Thinking, Usage,
 };
 
-use super::mock::{Scripted, stream_of};
+use super::mock::{CountsEffects, EffectTool, Scripted, stream_of};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -55,15 +55,10 @@ impl AgentMiddleware<Arc<Observed>> for Mutate {
     }
 }
 
-#[derive(serde::Deserialize, stakit_model::Model, stakit_model::JsonSchema)]
-struct EffectArgs {}
-#[tool(name = "effect", description = "Record an effect.")]
-fn effect(
-    cx: &stakit_ai_sdk::ToolCx<Arc<Observed>>,
-    _args: EffectArgs,
-) -> Result<&'static str, ToolError> {
-    cx.ctx().effects.fetch_add(1, Ordering::SeqCst);
-    Ok("done")
+impl CountsEffects for Observed {
+    fn effects(&self) -> &AtomicUsize {
+        &self.effects
+    }
 }
 
 /// Serves `model`, logging every request in `observed`; the run's first
@@ -112,7 +107,7 @@ pub(super) fn agent(
         .provider(recording(&observed, events, "recording"))
         .register_provider(recording(&observed, vec![], "replacement"))
         .system("original system")
-        .register_tool(effect)
+        .register_tool(EffectTool)
         .register_middleware(Mutate(mutation))
         .with_context(vec![Message::user("original prefix")]);
     (agent, observed)

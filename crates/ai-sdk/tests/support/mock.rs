@@ -2,7 +2,7 @@
 //! integration tests. Include with `#[path = "support/mock.rs"] mod mock;`.
 #![allow(dead_code, reason = "each test crate uses a different subset")]
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
@@ -153,6 +153,44 @@ impl<C: Send + Sync + 'static> Tool<C> for EchoTool {
         args: Self::Args,
     ) -> BoxFuture<'a, Result<Self::Output, ToolError>> {
         Box::pin(async move { Ok(args.text) })
+    }
+}
+
+/// An agent context that counts how often the `effect` tool ran.
+pub(crate) trait CountsEffects: Send + Sync + 'static {
+    /// The effect counter.
+    fn effects(&self) -> &AtomicUsize;
+}
+
+impl CountsEffects for AtomicUsize {
+    fn effects(&self) -> &AtomicUsize {
+        self
+    }
+}
+
+#[derive(serde::Deserialize, Model, JsonSchema)]
+pub(crate) struct NoArgs {}
+
+/// The `effect` tool: records one side effect in the context's counter.
+pub(crate) struct EffectTool;
+
+impl<C: CountsEffects> Tool<Arc<C>> for EffectTool {
+    type Args = NoArgs;
+    type Output = &'static str;
+
+    fn name(&self) -> &'static str {
+        "effect"
+    }
+    fn description(&self) -> &'static str {
+        "Record an effect."
+    }
+    fn run<'a>(
+        &'a self,
+        cx: &'a ToolCx<Arc<C>>,
+        _args: Self::Args,
+    ) -> BoxFuture<'a, Result<Self::Output, ToolError>> {
+        cx.ctx().effects().fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok("done") })
     }
 }
 

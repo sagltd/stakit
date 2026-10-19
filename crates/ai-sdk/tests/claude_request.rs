@@ -169,36 +169,34 @@ fn max_tokens_is_clamped_to_the_model_output_limit() {
     assert_eq!(body["max_tokens"], 128_000);
 }
 
+/// Asserts `model` gets the strictest rules: a forced tool choice relaxes to
+/// `auto` and `temperature` is dropped.
+fn assert_strictest_rules(model: &str) {
+    let mut request = forcing_a_tool(model);
+    request.temperature = Some(0.5);
+    let body = claude_body(&request);
+    assert_eq!(
+        body["tool_choice"],
+        json!({ "type": "auto" }),
+        "{model}: {body:#}"
+    );
+    assert!(body.get("temperature").is_none(), "{model}: {body:#}");
+}
+
 #[test]
 fn platform_prefixed_ids_get_the_same_rules() {
     for model in [
         "anthropic.claude-sonnet-5-5",
         "us.anthropic.claude-opus-5-5-v1:0",
     ] {
-        let mut request = forcing_a_tool(model);
-        request.temperature = Some(0.5);
-        let body = claude_body(&request);
-        assert_eq!(
-            body["tool_choice"],
-            json!({ "type": "auto" }),
-            "{model}: {body:#}"
-        );
-        assert!(body.get("temperature").is_none(), "{model}: {body:#}");
+        assert_strictest_rules(model);
     }
 }
 
 #[test]
 fn unknown_and_newer_models_get_the_strictest_rules() {
     for model in ["claude-sonnet-7", "my-gateway-alias"] {
-        let mut request = forcing_a_tool(model);
-        request.temperature = Some(0.5);
-        let body = claude_body(&request);
-        assert_eq!(
-            body["tool_choice"],
-            json!({ "type": "auto" }),
-            "{model}: {body:#}"
-        );
-        assert!(body.get("temperature").is_none(), "{model}: {body:#}");
+        assert_strictest_rules(model);
     }
 }
 

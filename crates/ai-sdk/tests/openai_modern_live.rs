@@ -1,15 +1,12 @@
 //! Explicit live checks for the `OpenAI` models offered by Elios.
 #![cfg(all(feature = "openai", feature = "live-tests"))]
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use stakit_ai_sdk::{
+    AssistantContent, ChatRequest, LLM, Message, OpenAiClient, Provider, StopReason, SystemPrompt,
 };
 
-use stakit_ai_sdk::{
-    Agent, AssistantContent, ChatRequest, Finish, LLM, Message, OpenAiClient, Provider, StopReason,
-    SystemPrompt, tool,
-};
+#[path = "support/live.rs"]
+mod live;
 
 #[tokio::test]
 #[ignore = "requires OPENAI_API_KEY and paid network calls"]
@@ -24,31 +21,11 @@ async fn modern_luna_plain_completion() {
     assert_eq!(text.trim(), "READY");
 }
 
-#[tool(name = "lookup_status", description = "Read the current status once.")]
-fn lookup_status(cx: &stakit_ai_sdk::ToolCx<Arc<AtomicUsize>>) -> Result<&'static str, ToolError> {
-    cx.ctx().fetch_add(1, Ordering::SeqCst);
-    Ok("silver fern 681")
-}
-
 #[tokio::test]
 #[ignore = "requires OPENAI_API_KEY and paid network calls"]
 async fn modern_sol_tool_round_trip() {
     let client = OpenAiClient::from_env().expect("live verification requires OPENAI_API_KEY");
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut agent = Agent::new(Arc::clone(&calls))
-        .provider(client.model("gpt-6-sol"))
-        .system("Use lookup_status exactly once to read the current status, then return its exact value. Never guess it.")
-        .register_tool(lookup_status)
-        .max_tokens(1024)
-        .with_context(vec![Message::user("Read the current status and tell me its value.")]);
-    let outcome = agent.run().await.expect("Sol tool round trip");
-    assert!(
-        matches!(outcome.finish, Finish::EndTurn),
-        "{:?}",
-        outcome.finish
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(outcome.text.contains("silver fern 681"), "{}", outcome.text);
+    live::assert_status_round_trip(client.model("gpt-6-sol"), "silver fern 681").await;
 }
 
 #[tokio::test]

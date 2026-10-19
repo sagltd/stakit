@@ -4,7 +4,8 @@ use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use stakit_ai_sdk::{
     AssistantContent, CacheCapabilities, CacheTtl, ChatRequest, ChatResponse, EventStream,
-    ExplicitCacheCapabilities, Provider, ProviderCapabilities, ProviderError, StopReason, Usage,
+    ExplicitCacheCapabilities, Extraction, ExtractionError, LLM, Provider, ProviderCapabilities,
+    ProviderError, StopReason, Usage,
 };
 
 pub(crate) const SECRET: &str = "PRIVATE-PAYLOAD-DO-NOT-LOG";
@@ -56,9 +57,29 @@ impl Recording {
         self.requests.lock().unwrap().len()
     }
 
+    /// Extracts a [`Person`] from the user message "Dana".
+    pub(crate) async fn extract_dana(&self) -> Extraction<Person> {
+        LLM::new(self.clone())
+            .user("Dana")
+            .extract_with_usage::<Person>()
+            .await
+    }
+
     pub(crate) fn last_request(&self) -> ChatRequest {
         self.requests.lock().unwrap().last().unwrap().clone()
     }
+}
+
+/// Asserts a failed provider call left unknown usage, a payload-free error and
+/// no retry.
+pub(crate) fn assert_provider_failed(outcome: &Extraction<Person>, provider: &Recording) {
+    assert_eq!(outcome.usage, None);
+    assert_eq!(
+        outcome.result.as_ref().err().copied(),
+        Some(ExtractionError::ProviderFailed)
+    );
+    assert!(!format!("{outcome:?}").contains(SECRET));
+    assert_eq!(provider.calls(), 1);
 }
 
 impl Provider for Recording {

@@ -1,7 +1,7 @@
 //! Two bounded origins. Retain only exposure flags, never request material.
 
-use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::io::Write as _;
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -25,35 +25,9 @@ pub(super) struct Snapshot {
     pub is_post: bool,
 }
 
-fn read_request(socket: &mut TcpStream) -> (Vec<u8>, usize) {
-    let mut bytes = Vec::new();
-    let mut buffer = [0; 4096];
-    let header_end = loop {
-        assert!(bytes.len() <= 64 * 1024, "fixture request exceeded bound");
-        if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-            break index + 4;
-        }
-        let count = socket.read(&mut buffer).expect("request headers");
-        assert!(count > 0, "missing headers");
-        bytes.extend_from_slice(&buffer[..count]);
-    };
-    let header = std::str::from_utf8(&bytes[..header_end]).expect("UTF-8 headers");
-    let length = header
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().expect("body length"))
-        })
-        .expect("content length");
-    assert!(length <= 64 * 1024, "fixture body exceeded bound");
-    while bytes.len() - header_end < length {
-        let count = socket.read(&mut buffer).expect("request body");
-        assert!(count > 0, "missing body");
-        bytes.extend_from_slice(&buffer[..count]);
-    }
-    (bytes, header_end)
-}
+#[path = "../../../tests/support/http_request.rs"]
+mod http_request;
+use http_request::read_request;
 
 struct Peer {
     url: String,
@@ -99,7 +73,7 @@ impl Peer {
                 socket
                     .set_write_timeout(Some(Duration::from_secs(2)))
                     .expect("write deadline");
-                let (bytes, end) = read_request(&mut socket);
+                let (bytes, end) = read_request(&mut socket, 64 * 1024);
                 let header = std::str::from_utf8(&bytes[..end]).expect("UTF-8 headers");
                 received.requests.fetch_add(1, Ordering::SeqCst);
                 received

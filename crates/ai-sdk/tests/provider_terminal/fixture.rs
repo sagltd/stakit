@@ -6,10 +6,10 @@ use std::sync::{
 
 use stakit_ai_sdk::{
     Agent, AgentCx, AgentError, AgentMiddleware, Approval, AssistantContent, Finish, Message,
-    PendingToolCall, ProviderError, StopReason, StreamEvent, Usage, event_stream, tool,
+    PendingToolCall, ProviderError, StopReason, StreamEvent, Usage, event_stream,
 };
 
-use super::mock::{Scripted, stream_of, tool_call};
+use super::mock::{CountsEffects, EffectTool, Scripted, stream_of, tool_call};
 
 #[derive(Clone)]
 pub(super) enum Terminal {
@@ -28,16 +28,10 @@ pub(super) struct Observed {
     pub(super) finishes: AtomicUsize,
 }
 
-#[derive(serde::Deserialize, stakit_model::Model, stakit_model::JsonSchema)]
-struct EffectArgs {}
-
-#[tool(name = "effect", description = "Perform the recorded effect.")]
-fn effect(
-    cx: &stakit_ai_sdk::ToolCx<Arc<Observed>>,
-    _args: EffectArgs,
-) -> Result<&'static str, ToolError> {
-    cx.ctx().effects.fetch_add(1, Ordering::SeqCst);
-    Ok("done")
+impl CountsEffects for Observed {
+    fn effects(&self) -> &AtomicUsize {
+        &self.effects
+    }
 }
 
 /// Streams `terminal` on the first request and a plain final answer after.
@@ -103,7 +97,7 @@ pub(super) fn scripted(terminal: Terminal) -> (Agent<Arc<Observed>>, Arc<Observe
     let observed = Arc::new(Observed::default());
     let agent = Agent::new(Arc::clone(&observed))
         .provider(recording(&observed, terminal))
-        .register_tool(effect)
+        .register_tool(EffectTool)
         .register_middleware(ObserveFinish(Arc::clone(&observed)))
         .with_context(vec![Message::user("go")]);
     (agent, observed)

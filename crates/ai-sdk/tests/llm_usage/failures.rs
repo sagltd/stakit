@@ -7,10 +7,7 @@ async fn malformed_typed_payload_keeps_usage_without_echoing_payload() {
     provider.response.content = vec![fixture::tool(
         serde_json::json!({"name": {"private":SECRET}}),
     )];
-    let outcome = LLM::new(provider.clone())
-        .user("Dana")
-        .extract_with_usage::<Person>()
-        .await;
+    let outcome = provider.extract_dana().await;
     assert_eq!(outcome.usage, Some(provider.response.usage));
     let error = outcome.result.err().unwrap();
     assert_eq!(error, ExtractionError::InvalidPayload);
@@ -22,10 +19,7 @@ async fn malformed_typed_payload_keeps_usage_without_echoing_payload() {
 async fn validation_failure_keeps_usage_and_never_returns_an_unchecked_value() {
     let mut provider = Recording::new();
     provider.response.content = vec![fixture::tool(serde_json::json!({"name":"x"}))];
-    let outcome = LLM::new(provider.clone())
-        .user("Dana")
-        .extract_with_usage::<Person>()
-        .await;
+    let outcome = provider.extract_dana().await;
     assert_eq!(outcome.usage, Some(provider.response.usage));
     assert_eq!(
         outcome.result.err(),
@@ -41,10 +35,7 @@ async fn missing_extract_tool_keeps_usage_and_does_not_accept_json_prose() {
     ] {
         let mut provider = Recording::new();
         provider.response.content = content;
-        let outcome = LLM::new(provider.clone())
-            .user("Dana")
-            .extract_with_usage::<Person>()
-            .await;
+        let outcome = provider.extract_dana().await;
         assert_eq!(outcome.usage, Some(provider.response.usage));
         assert_eq!(outcome.result.err(), Some(ExtractionError::MissingTool));
         assert_eq!(provider.calls(), 1);
@@ -68,10 +59,7 @@ async fn refused_or_incomplete_responses_keep_usage_even_with_valid_tool_payload
     ] {
         let mut provider = Recording::new();
         provider.response.stop = stop;
-        let outcome = LLM::new(provider.clone())
-            .user("Dana")
-            .extract_with_usage::<Person>()
-            .await;
+        let outcome = provider.extract_dana().await;
         assert_eq!(outcome.usage, Some(provider.response.usage));
         assert_eq!(outcome.result.err(), Some(expected));
         assert_eq!(provider.calls(), 1);
@@ -88,13 +76,7 @@ async fn provider_failure_has_unknown_usage_and_no_payload_or_retry() {
         .extract_with_usage::<Person>()
         .await;
     assert_eq!(outcome.model, "requested-model");
-    assert_eq!(outcome.usage, None);
-    assert_eq!(
-        outcome.result.as_ref().err().copied(),
-        Some(ExtractionError::ProviderFailed)
-    );
-    assert!(!format!("{outcome:?}").contains(SECRET));
-    assert_eq!(provider.calls(), 1);
+    fixture::assert_provider_failed(&outcome, &provider);
 }
 
 #[tokio::test]

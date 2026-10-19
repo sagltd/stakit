@@ -1,4 +1,4 @@
-use super::fixture::{self, Person, Recording, SECRET};
+use super::fixture::{self, Recording, SECRET};
 use stakit_ai_sdk::{AgentError, ExtractionError, LLM, ProviderError, StopReason};
 
 #[derive(serde::Deserialize, stakit_model::JsonSchema)]
@@ -37,10 +37,7 @@ async fn legacy_extract_preserves_provider_error_details() {
 async fn end_turn_with_an_actual_extract_call_is_accepted_and_metered() {
     let mut provider = Recording::new();
     provider.response.stop = StopReason::EndTurn;
-    let outcome = LLM::new(provider.clone())
-        .user("Dana")
-        .extract_with_usage::<Person>()
-        .await;
+    let outcome = provider.extract_dana().await;
     assert!(outcome.result.is_ok());
     assert_eq!(outcome.usage, Some(provider.response.usage));
 }
@@ -88,17 +85,8 @@ async fn provider_errors_never_invent_usage_or_retain_private_details() {
     for failure in failures {
         let mut provider = Recording::new();
         provider.failure = Some(failure);
-        let outcome = LLM::new(provider.clone())
-            .user("Dana")
-            .extract_with_usage::<Person>()
-            .await;
-        assert_eq!(outcome.usage, None);
-        assert_eq!(
-            outcome.result.as_ref().err().copied(),
-            Some(ExtractionError::ProviderFailed)
-        );
-        assert!(!format!("{outcome:?}").contains(SECRET));
-        assert_eq!(provider.calls(), 1);
+        let outcome = provider.extract_dana().await;
+        fixture::assert_provider_failed(&outcome, &provider);
     }
 }
 
@@ -114,10 +102,7 @@ async fn validated_extraction_rejects_multiple_tool_blocks_but_preserves_usage()
                 name: name.into(),
                 input: serde_json::json!({"name":"Other"}),
             });
-        let outcome = LLM::new(provider.clone())
-            .user("Dana")
-            .extract_with_usage::<Person>()
-            .await;
+        let outcome = provider.extract_dana().await;
         assert_eq!(
             outcome.result.as_ref().err().copied(),
             Some(ExtractionError::InvalidPayload)

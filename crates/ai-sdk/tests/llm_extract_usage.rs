@@ -14,10 +14,7 @@ use stakit_ai_sdk::{
 #[tokio::test]
 async fn success_preserves_all_usage_before_the_value_is_applied() {
     let provider = Recording::new();
-    let outcome = LLM::new(provider.clone())
-        .user("Dana")
-        .extract_with_usage::<Person>()
-        .await;
+    let outcome = provider.extract_dana().await;
     assert_eq!(outcome.model, "flexible");
     assert_eq!(outcome.usage, Some(provider.response.usage));
     assert_eq!(outcome.result.unwrap().name, "Dana");

@@ -1,15 +1,13 @@
 //! Explicit live release checks. Missing credentials fail instead of passing offline.
 #![cfg(all(feature = "claude", feature = "live-tests"))]
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use stakit_ai_sdk::{
+    CacheStrategy, CacheTarget, CacheTtl, ChatRequest, ClaudeClient, LLM, Message, Provider,
+    SystemPrompt,
 };
 
-use stakit_ai_sdk::{
-    Agent, CacheStrategy, CacheTarget, CacheTtl, ChatRequest, ClaudeClient, Finish, LLM, Message,
-    Provider, SystemPrompt, tool,
-};
+#[path = "support/live.rs"]
+mod live;
 
 #[derive(Debug, serde::Deserialize, stakit_model::JsonSchema)]
 struct Person {
@@ -43,31 +41,11 @@ async fn modern_sonnet_extraction_without_forced_tool_choice() {
     assert_eq!(person.name, "Dana");
 }
 
-#[tool(name = "lookup_status", description = "Read the current status once.")]
-fn lookup_status(cx: &ToolCx<Arc<AtomicUsize>>) -> Result<&'static str, ToolError> {
-    cx.ctx().fetch_add(1, Ordering::SeqCst);
-    Ok("copper kite 742")
-}
-
 #[tokio::test]
 #[ignore = "real Sonnet tool loop: requires ANTHROPIC_API_KEY and paid network calls"]
 async fn modern_sonnet_tool_round_trip() {
     let client = ClaudeClient::from_env().expect("live verification requires ANTHROPIC_API_KEY");
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut agent = Agent::new(Arc::clone(&calls))
-        .provider(client.model("claude-sonnet-5-5"))
-        .system("Use lookup_status exactly once to read the current status, then return its exact value. Never guess it.")
-        .register_tool(lookup_status)
-        .max_tokens(1024)
-        .with_context(vec![Message::user("Read the current status and tell me its value.")]);
-    let outcome = agent.run().await.expect("Sonnet tool round trip");
-    assert!(
-        matches!(outcome.finish, Finish::EndTurn),
-        "{:?}",
-        outcome.finish
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(outcome.text.contains("copper kite 742"), "{}", outcome.text);
+    live::assert_status_round_trip(client.model("claude-sonnet-5-5"), "copper kite 742").await;
 }
 
 #[tokio::test]

@@ -1,12 +1,16 @@
 //! One bounded loopback HTTP exchange, shared by adapter contract probes.
 use serde_json::Value;
 use std::{
-    io::{Read, Write},
+    io::Write,
     net::TcpListener,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
+
+#[path = "../support/http_request.rs"]
+mod http_request;
+use http_request::read_request;
 
 pub(super) struct HttpFixture {
     pub(super) base_url: String,
@@ -58,34 +62,8 @@ pub(super) fn http(status: u16, content_type: &str, body: Vec<u8>) -> HttpFixtur
         socket
             .set_write_timeout(Some(Duration::from_secs(5)))
             .expect("write deadline");
-        let mut bytes = Vec::new();
-        let mut buffer = [0; 4096];
-        let header_end = loop {
-            assert!(bytes.len() <= 64 * 1024, "fixture headers too large");
-            if let Some(index) = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                break index + 4;
-            }
-            let count = socket.read(&mut buffer).expect("request headers");
-            assert!(count > 0, "missing request headers");
-            bytes.extend_from_slice(&buffer[..count]);
-        };
-        let header = std::str::from_utf8(&bytes[..header_end]).expect("request header UTF8");
-        let length = header
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().expect("body length"))
-            })
-            .expect("content length");
-        assert!(length <= 1024 * 1024, "fixture body too large");
-        while bytes.len() - header_end < length {
-            let count = socket.read(&mut buffer).expect("request body");
-            assert!(count > 0, "missing request body");
-            bytes.extend_from_slice(&buffer[..count]);
-        }
-        let request =
-            serde_json::from_slice(&bytes[header_end..header_end + length]).expect("request JSON");
+        let (bytes, header_end) = read_request(&mut socket, 1024 * 1024);
+        let request = serde_json::from_slice(&bytes[header_end..]).expect("request JSON");
         sender.send(request).expect("request receiver");
         socket
             .write_all(headers.as_bytes())

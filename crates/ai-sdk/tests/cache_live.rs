@@ -11,7 +11,7 @@
 use stakit_ai_sdk::ClaudeClient;
 #[cfg(feature = "openai")]
 use stakit_ai_sdk::OpenAiClient;
-use stakit_ai_sdk::{Agent, Message};
+use stakit_ai_sdk::{Agent, Message, Outcome, Provider};
 
 /// A stable system fragment, repeated `.repeat(6)` at each call site so the
 /// cached prefix clears the model's minimum cacheable size: 1024 tokens for
@@ -45,6 +45,22 @@ const LARGE_SYSTEM: &str = "You are a helpful, knowledgeable AI assistant specia
     pipelines, data warehousing, and analytics. You are a reliable, accurate, and \
     comprehensive assistant for any technical question.";
 
+/// Asks the same cacheable question twice, each through a fresh agent: the
+/// first call primes the cache, the second should read from it.
+async fn ask_twice<P: Provider + 'static>(provider: impl Fn() -> P) -> (Outcome, Outcome) {
+    let mut outcomes = Vec::new();
+    for call in ["first call", "second call"] {
+        let mut agent = Agent::new(())
+            .provider(provider())
+            .system(LARGE_SYSTEM.repeat(6))
+            .max_tokens(64)
+            .with_context(vec![Message::user("What is 2 + 2?")]);
+        outcomes.push(agent.run().await.expect(call));
+    }
+    let second = outcomes.pop().expect("second outcome");
+    (outcomes.pop().expect("first outcome"), second)
+}
+
 #[cfg(feature = "claude")]
 #[tokio::test]
 #[ignore = "requires ANTHROPIC_API_KEY and paid network calls"]
@@ -55,21 +71,7 @@ async fn claude_second_call_reads_cache() {
     // even for a hand-built request, so it is unsuitable for a caching assertion.
     let model = "claude-sonnet-4-5";
 
-    // First call — primes the cache.
-    let mut agent = Agent::new(())
-        .provider(client.model(model))
-        .system(LARGE_SYSTEM.repeat(6))
-        .max_tokens(64)
-        .with_context(vec![Message::user("What is 2 + 2?")]);
-    let out1 = agent.run().await.expect("first call");
-
-    // Second call — should read from cache.
-    let mut agent2 = Agent::new(())
-        .provider(client.model(model))
-        .system(LARGE_SYSTEM.repeat(6))
-        .max_tokens(64)
-        .with_context(vec![Message::user("What is 2 + 2?")]);
-    let out2 = agent2.run().await.expect("second call");
+    let (out1, out2) = ask_twice(|| client.model(model)).await;
 
     assert!(
         out2.usage.cache_read_tokens > 0,
@@ -89,21 +91,7 @@ async fn openai_second_call_reports_cached_tokens() {
     // gpt-4o-mini supports prompt caching on long repeated prefixes.
     let model = "gpt-4o-mini";
 
-    // First call — primes the cache.
-    let mut agent = Agent::new(())
-        .provider(client.model(model))
-        .system(LARGE_SYSTEM.repeat(6))
-        .max_tokens(64)
-        .with_context(vec![Message::user("What is 2 + 2?")]);
-    let _out1 = agent.run().await.expect("first call");
-
-    // Second call — should read from cache.
-    let mut agent2 = Agent::new(())
-        .provider(client.model(model))
-        .system(LARGE_SYSTEM.repeat(6))
-        .max_tokens(64)
-        .with_context(vec![Message::user("What is 2 + 2?")]);
-    let out2 = agent2.run().await.expect("second call");
+    let (_, out2) = ask_twice(|| client.model(model)).await;
 
     assert!(
         out2.usage.cache_read_tokens > 0,

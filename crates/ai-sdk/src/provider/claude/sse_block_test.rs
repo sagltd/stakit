@@ -146,15 +146,26 @@ async fn malformed_tool_json_fails_without_fabricating_a_complete_tool_block() {
     assert_uncertified(&decoded);
 }
 
-#[tokio::test]
-async fn tool_start_input_is_preserved_when_no_argument_deltas_are_sent() {
-    let events = [
+/// One tool block started with `input`, optionally followed by `deltas`.
+fn single_tool_turn(name: &str, input: &Value, deltas: &[&str]) -> Vec<Value> {
+    let mut events = vec![
         json!({"type":"message_start", "message":{"usage":{"input_tokens":3,"output_tokens":0}}}),
-        json!({"type":"content_block_start", "index":0, "content_block":{"type":"tool_use", "id":"t1", "name":"echo", "input":{"city":"Paris"}}}),
+        json!({"type":"content_block_start", "index":0, "content_block":{"type":"tool_use", "id":"t1", "name":name, "input":input}}),
+    ];
+    for partial in deltas {
+        events.push(json!({"type":"content_block_delta", "index":0, "delta":{"type":"input_json_delta", "partial_json":partial}}));
+    }
+    events.extend([
         json!({"type":"content_block_stop", "index":0}),
         json!({"type":"message_delta", "delta":{"stop_reason":"tool_use"}, "usage":{"output_tokens":1}}),
         json!({"type":"message_stop"}),
-    ];
+    ]);
+    events
+}
+
+#[tokio::test]
+async fn tool_start_input_is_preserved_when_no_argument_deltas_are_sent() {
+    let events = single_tool_turn("echo", &json!({"city":"Paris"}), &[]);
     let decoded = decode_events(&events).await;
     assert_eq!(
         blocks(&decoded),
@@ -171,14 +182,7 @@ async fn tool_start_input_is_preserved_when_no_argument_deltas_are_sent() {
 
 #[tokio::test]
 async fn empty_tool_argument_fragments_preserve_the_initial_empty_object() {
-    let events = [
-        json!({"type":"message_start", "message":{"usage":{"input_tokens":3,"output_tokens":0}}}),
-        json!({"type":"content_block_start", "index":0, "content_block":{"type":"tool_use", "id":"t1", "name":"ping", "input":{}}}),
-        json!({"type":"content_block_delta", "index":0, "delta":{"type":"input_json_delta", "partial_json":""}}),
-        json!({"type":"content_block_stop", "index":0}),
-        json!({"type":"message_delta", "delta":{"stop_reason":"tool_use"}, "usage":{"output_tokens":1}}),
-        json!({"type":"message_stop"}),
-    ];
+    let events = single_tool_turn("ping", &json!({}), &[""]);
     let decoded = decode_events(&events).await;
     assert!(decoded.iter().all(Result::is_ok), "{decoded:?}");
     assert!(decoded.iter().any(|event| matches!(event,

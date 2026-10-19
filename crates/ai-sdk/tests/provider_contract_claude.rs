@@ -3,7 +3,7 @@
 #[path = "provider_contract/http.rs"]
 mod fixture;
 use fixture::{http, sse};
-use serde_json::json;
+use serde_json::{Value, json};
 use stakit_ai_sdk::{
     AssistantContent, ChatRequest, ClaudeClient, Message, ProviderError, StopReason, StreamEvent,
     ToolResultPart, Usage, UserContent,
@@ -67,6 +67,19 @@ async fn fake_claude_completion_preserves_tool_results_and_usage_categories() {
     assert_eq!(sent["messages"][1]["content"][0]["is_error"], true);
 }
 
+/// Streams `events` from a fake Claude endpoint through the public stream
+/// contract; returns the events and the request body that was sent.
+async fn fake_stream(events: &[Value], stop: &StopReason) -> (Vec<StreamEvent>, Value) {
+    let fixture = http(200, "text/event-stream", sse(events));
+    let provider = ClaudeClient::new("fixture-not-a-key")
+        .with_base_url(&fixture.base_url)
+        .model("claude-haiku-5-5");
+    let events = assert_stream(&provider, request(), stop, &usage())
+        .await
+        .expect("stream contract");
+    (events, fixture.finish())
+}
+
 #[tokio::test]
 async fn fake_claude_stream_has_a_real_terminal_and_final_cumulative_usage() {
     let mut events = vec![
@@ -76,15 +89,9 @@ async fn fake_claude_stream_has_a_real_terminal_and_final_cumulative_usage() {
         json!({"type":"content_block_stop","index":0}),
     ];
     events.extend(finish("end_turn"));
-    let fixture = http(200, "text/event-stream", sse(&events));
-    let provider = ClaudeClient::new("fixture-not-a-key")
-        .with_base_url(&fixture.base_url)
-        .model("claude-haiku-5-5");
-    let events = assert_stream(&provider, request(), &StopReason::EndTurn, &usage())
-        .await
-        .expect("stream contract");
+    let (events, sent) = fake_stream(&events, &StopReason::EndTurn).await;
     assert!(events.contains(&StreamEvent::TextDelta("hello".into())));
-    assert_eq!(fixture.finish()["stream"], true);
+    assert_eq!(sent["stream"], true);
 }
 
 #[tokio::test]
@@ -97,15 +104,9 @@ async fn fake_claude_stream_preserves_complete_tool_call_ids_and_argument_fragme
         json!({"type":"content_block_stop","index":0}),
     ];
     events.extend(finish("tool_use"));
-    let fixture = http(200, "text/event-stream", sse(&events));
-    let provider = ClaudeClient::new("fixture-not-a-key")
-        .with_base_url(&fixture.base_url)
-        .model("claude-haiku-5-5");
-    let events = assert_stream(&provider, request(), &StopReason::ToolUse, &usage())
-        .await
-        .expect("tool stream contract");
+    let (events, sent) = fake_stream(&events, &StopReason::ToolUse).await;
     assert!(events.iter().any(|event| matches!(event, StreamEvent::ToolCall { id, name, arguments } if id == "call-1" && name == "lookup" && arguments == "{\"query\":\"weather\"}")));
-    fixture.finish();
+    assert_eq!(sent["stream"], true);
 }
 
 #[tokio::test]

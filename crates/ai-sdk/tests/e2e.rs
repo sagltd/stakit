@@ -366,16 +366,12 @@ async fn e2e_openai_prompt_caching() {
     );
 }
 
-#[tokio::test]
-#[ignore = "requires OPENAI_API_KEY"]
-async fn e2e_openai_streaming_text() {
-    load_env();
-    let Ok(client) = OpenAiClient::from_env() else {
-        return;
-    };
+/// Streams a short counting answer and asserts it arrived as live deltas.
+async fn assert_streams_text(provider: impl Provider + 'static) {
+    let model = provider.model_id().to_owned();
     let mut agent = Agent::new(())
-        .provider(client.model(OPENAI_MODEL))
-        .model(OPENAI_MODEL)
+        .provider(provider)
+        .model(model)
         .max_tokens(64)
         .with_context(vec![Message::user("Count from 1 to 5, words only.")]);
     let events = collect(&mut agent).await;
@@ -389,23 +385,21 @@ async fn e2e_openai_streaming_text() {
 }
 
 #[tokio::test]
+#[ignore = "requires OPENAI_API_KEY"]
+async fn e2e_openai_streaming_text() {
+    load_env();
+    let Ok(client) = OpenAiClient::from_env() else {
+        return;
+    };
+    assert_streams_text(client.model(OPENAI_MODEL)).await;
+}
+
+#[tokio::test]
 #[ignore = "requires ANTHROPIC_API_KEY"]
 async fn e2e_claude_streaming_text() {
     load_env();
     let Ok(client) = ClaudeClient::from_env() else {
         return;
     };
-    let mut agent = Agent::new(())
-        .provider(client.model(CLAUDE_MODEL))
-        .model(CLAUDE_MODEL)
-        .max_tokens(64)
-        .with_context(vec![Message::user("Count from 1 to 5, words only.")]);
-    let events = collect(&mut agent).await;
-    let deltas = events
-        .iter()
-        .filter(|e| matches!(e, AgentEvent::MessageDelta(_)))
-        .count();
-    assert!(deltas > 0, "expected streamed text deltas: {events:?}");
-    let (text, _) = done(&events);
-    assert!(!text.is_empty());
+    assert_streams_text(client.model(CLAUDE_MODEL)).await;
 }
