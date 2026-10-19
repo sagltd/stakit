@@ -113,9 +113,9 @@ pub mod prelude {
     pub use crate::Table;
     pub use crate::error::{Error, Result};
     pub use crate::expr::{
-        ColExpr, Direction, IntoExpr, Order, Predicate, and, any_of, asc, contains, desc, eq, gt,
-        gte, is_null, like, lt, lte, matches, matches_in, matches_tsv, matches_tsv_in, ne, not, or,
-        raw_pred,
+        Arith, ColExpr, Direction, IntoExpr, Numeric, Order, Predicate, add, and, any_of, asc,
+        contains, desc, eq, gt, gte, is_null, like, lt, lte, matches, matches_in, matches_tsv,
+        matches_tsv_in, ne, not, or, raw_pred, sub,
     };
     pub use crate::geo::{
         DistanceUnit, GeoPoint, Geography, Geometry, st_contains, st_distance, st_dwithin,

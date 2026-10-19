@@ -41,6 +41,15 @@ pub enum Operand {
     },
     /// A backend-neutral value bound as a placeholder.
     Value(Value),
+    /// `(lhs <op> rhs)` — numeric arithmetic, built with [`add`] / [`sub`].
+    Arith {
+        /// Left operand.
+        lhs: Box<Self>,
+        /// Operator including surrounding spaces (` + ` / ` - `).
+        op: &'static str,
+        /// Right operand.
+        rhs: Box<Self>,
+    },
 }
 
 impl Operand {
@@ -51,8 +60,81 @@ impl Operand {
                 writer.push_bind(value);
                 Ok(())
             }
+            Self::Arith { lhs, op, rhs } => {
+                writer.push("(");
+                lhs.write_into(writer)?;
+                writer.push(op);
+                rhs.write_into(writer)?;
+                writer.push(")");
+                Ok(())
+            }
         }
     }
+}
+
+/// Column types that support `+` / `-` in SQL expressions.
+pub trait Numeric {}
+
+impl Numeric for i16 {}
+impl Numeric for i32 {}
+impl Numeric for i64 {}
+impl Numeric for f32 {}
+impl Numeric for f64 {}
+impl<T: Numeric> Numeric for Option<T> {}
+
+/// A typed arithmetic expression over a numeric column type `Ty`, usable as an
+/// `UPDATE ... SET` value or as the right side of a comparison.
+///
+/// ```ignore
+/// db.update::<Account>()
+///     .set(Account::balance, add(Account::balance, 50_i64))
+///     .filter(eq(Account::id, "a1"));
+/// ```
+pub struct Arith<Ty> {
+    operand: Operand,
+    marker: core::marker::PhantomData<fn() -> Ty>,
+}
+
+impl<Ty> IntoExpr<Ty> for Arith<Ty> {
+    fn into_operand(self) -> Operand {
+        self.operand
+    }
+}
+
+fn arith<Ty, L, R>(left: L, op: &'static str, right: R) -> Arith<Ty>
+where
+    Ty: Numeric,
+    L: IntoExpr<Ty>,
+    R: IntoExpr<Ty>,
+{
+    Arith {
+        operand: Operand::Arith {
+            lhs: Box::new(left.into_operand()),
+            op,
+            rhs: Box::new(right.into_operand()),
+        },
+        marker: core::marker::PhantomData,
+    }
+}
+
+/// `(left + right)` for numeric columns and values (nestable).
+pub fn add<Ty, L, R>(left: L, right: R) -> Arith<Ty>
+where
+    Ty: Numeric,
+    L: IntoExpr<Ty>,
+    R: IntoExpr<Ty>,
+{
+    arith(left, " + ", right)
+}
+
+/// `(left - right)` for numeric columns and values (nestable).
+pub fn sub<Ty, L, R>(left: L, right: R) -> Arith<Ty>
+where
+    Ty: Numeric,
+    L: IntoExpr<Ty>,
+    R: IntoExpr<Ty>,
+{
+    arith(left, " - ", right)
 }
 
 /// The right-hand side of a comparison against a column of type `Ty`.
