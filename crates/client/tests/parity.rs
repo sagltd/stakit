@@ -19,11 +19,14 @@ use bytes::Bytes;
 use futures::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::net::TcpListener;
 
 use stakit_client::{ActionResult, CallOpts, Client, Method, ServerFrame, TransportError};
 use stakit_model::Model;
 use stakit_router::{ClientAction, Cx, Error, ResponseError, Router, action};
+
+#[path = "support/fixtures.rs"]
+mod fixtures;
+use fixtures::{serve, ws_call};
 
 // ── models ─────────────────────────────────────────────────────────────────
 
@@ -135,17 +138,13 @@ fn progress<'a>(
     cx: &'a Cx<App, Req>,
     params: Count,
 ) -> impl Stream<Item = Result<u32, Error>> + 'a {
-    async_stream::stream! {
-        for i in 0..params.n {
-            match cx.client_call::<ShowToast>(Toast { text: format!("step {i}") }).await {
-                Ok(_ack) => yield Ok(i),
-                Err(error) => {
-                    yield Err(error);
-                    return;
-                }
-            }
-        }
-    }
+    // One `showToast` round trip per item; the item is the step once acked.
+    futures::stream::iter(0..params.n).then(move |i| async move {
+        let toast = Toast {
+            text: format!("step {i}"),
+        };
+        cx.client_call::<ShowToast>(toast).await.map(|_ack| i)
+    })
 }
 
 // ── axum harness ─────────────────────────────────────────────────────────────
@@ -283,12 +282,7 @@ async fn spawn_server(name: &'static str) -> String {
         .route("/stream", post(stream_handler))
         .route("/ws", get(ws_handler))
         .with_state(router);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    format!("http://{addr}")
+    serve(app).await
 }
 
 fn client_for(origin: &str) -> Client {
@@ -368,20 +362,10 @@ async fn stream_error_terminates() {
 #[tokio::test] // 7
 async fn websocket_roundtrip() {
     let client = client_for(&spawn_server("A").await);
-    let mut conn = client.connect(CallOpts::new()).await.unwrap();
-    conn.send(
-        greet,
-        Greet {
-            name: "ws".to_owned(),
-        },
-    )
-    .await
-    .unwrap();
-    let frame = conn.recv().await.unwrap().unwrap();
-    let ServerFrame::Result { result, .. } = frame else {
-        panic!("expected a result frame, got {frame:?}");
+    let params = Greet {
+        name: "ws".to_owned(),
     };
-    let greeting: Greeting = serde_json::from_value(result.ok().unwrap()).unwrap();
+    let (conn, greeting) = ws_call(&client, greet, params).await;
     assert_eq!(greeting.message, "hello ws from A");
     conn.close().await.unwrap();
 }

@@ -15,40 +15,14 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
 use futures::StreamExt as _;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
 
 use stakit_client::{CallOpts, Client, Method, TransportError};
-use stakit_model::Model;
-use stakit_router::{Error, action};
 
-#[derive(Model, Serialize, Deserialize, Debug)]
-struct Greet {
-    name: String,
-}
-
-#[derive(Model, Serialize, Deserialize, Debug)]
-struct Greeting {
-    message: String,
-}
-
-#[derive(Model, Serialize, Deserialize, Debug)]
-struct Count {
-    n: u32,
-}
-
-#[action]
-async fn greet(_params: Greet) -> Result<Greeting, Error> {
-    Ok(Greeting {
-        message: String::new(),
-    })
-}
-
-#[action(stream)]
-fn count(_params: Count) -> impl futures::Stream<Item = Result<u32, Error>> + use<> {
-    async_stream::stream! { yield Ok(0u32); }
-}
+#[path = "support/fixtures.rs"]
+mod fixtures;
+use fixtures::{Count, Greet, count, greet, serve};
 
 /// One request exactly as the server received it.
 #[derive(Debug, Clone)]
@@ -113,16 +87,22 @@ async fn spawn() -> (String, Log) {
         .route("/stream", any(stream))
         .route("/limited", any(limited))
         .with_state(Arc::clone(&log));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), log)
+    (serve(app).await, log)
 }
 
 fn last(log: &Log) -> Seen {
     log.lock().unwrap().last().cloned().unwrap()
+}
+
+/// The last request was a `POST` with exactly `expected` as its JSON body and
+/// nothing in the url.
+fn assert_json_post(log: &Log, expected: &Value) {
+    let seen = last(log);
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.url_query, None, "params must never ride in a POST url");
+    assert_eq!(seen.content_types, vec!["application/json".to_owned()]);
+    let body: Value = serde_json::from_slice(&seen.body).unwrap();
+    assert_eq!(&body, expected);
 }
 
 fn greet_params() -> Greet {
@@ -139,12 +119,7 @@ async fn unary_posts_a_json_body_and_never_puts_params_in_the_url() {
     let result = client.fetch(greet, greet_params()).await.unwrap();
     assert_eq!(result.data().unwrap().message, "ok");
 
-    let seen = last(&log);
-    assert_eq!(seen.method, "POST");
-    assert_eq!(seen.url_query, None, "params must never ride in a POST url");
-    assert_eq!(seen.content_types, vec!["application/json".to_owned()]);
-    let body: Value = serde_json::from_slice(&seen.body).unwrap();
-    assert_eq!(body, json!({ "greet": { "name": "a" } }));
+    assert_json_post(&log, &json!({ "greet": { "name": "a" } }));
 }
 
 #[tokio::test]
@@ -239,12 +214,7 @@ async fn stream_posts_a_json_body_and_never_puts_params_in_the_url() {
         .await;
     assert_eq!(items, vec![7]);
 
-    let seen = last(&log);
-    assert_eq!(seen.method, "POST");
-    assert_eq!(seen.url_query, None, "params must never ride in a POST url");
-    assert_eq!(seen.content_types, vec!["application/json".to_owned()]);
-    let body: Value = serde_json::from_slice(&seen.body).unwrap();
-    assert_eq!(body, json!({ "count": { "n": 1 } }));
+    assert_json_post(&log, &json!({ "count": { "n": 1 } }));
 }
 
 #[tokio::test]

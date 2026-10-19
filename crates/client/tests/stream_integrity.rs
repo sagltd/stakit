@@ -9,22 +9,12 @@ use axum::body::Body;
 use axum::response::Response;
 use axum::routing::post;
 use futures::StreamExt as _;
-use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
 
 use stakit_client::{ActionResult, Client};
-use stakit_model::Model;
-use stakit_router::{Error, action};
 
-#[derive(Model, Serialize, Deserialize, Debug)]
-struct Count {
-    n: u32,
-}
-
-#[action(stream)]
-fn count(_params: Count) -> impl futures::Stream<Item = Result<u32, Error>> + use<> {
-    async_stream::stream! { yield Ok(0u32); }
-}
+#[path = "support/fixtures.rs"]
+mod fixtures;
+use fixtures::{Count, count, serve as serve_app};
 
 /// Serve `lines` (newline-joined, newline-terminated) as the `/stream` body.
 async fn serve(lines: &'static [&'static str]) -> Client {
@@ -35,12 +25,7 @@ async fn serve(lines: &'static [&'static str]) -> Client {
 async fn serve_body(body: String) -> Client {
     let handler = move || async move { Response::new(Body::from(body)) };
     let app = AxumRouter::new().route("/stream", post(handler));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    Client::builder(format!("http://{addr}/stream")).build()
+    Client::builder(format!("{}/stream", serve_app(app).await)).build()
 }
 
 async fn items(client: &Client) -> Vec<ActionResult<u32>> {
