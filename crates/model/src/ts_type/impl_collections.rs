@@ -102,9 +102,9 @@ impl<T: TSType, S> TSType for HashSet<T, S> {
 // --- maps -> `Record<K, V>` ---
 
 macro_rules! ts_map {
-    ($($ty:ty),* $(,)?) => {
+    ($([$($extra:ident),*] $ty:ty),* $(,)?) => {
         $(
-            impl<K: TSType, V: TSType, S> TSType for $ty {
+            impl<K: TSType, V: TSType $(, $extra)*> TSType for $ty {
                 fn ts_ref() -> String {
                     format!("Record<{}, {}>", K::ts_ref(), V::ts_ref())
                 }
@@ -117,17 +117,12 @@ macro_rules! ts_map {
     };
 }
 
-ts_map!(HashMap<K, V, S>, hashbrown::HashMap<K, V, S>, indexmap::IndexMap<K, V, S>);
-
-impl<K: TSType, V: TSType> TSType for BTreeMap<K, V> {
-    fn ts_ref() -> String {
-        format!("Record<{}, {}>", K::ts_ref(), V::ts_ref())
-    }
-    fn ts_declarations(out: &mut Decls) {
-        K::ts_declarations(out);
-        V::ts_declarations(out);
-    }
-}
+ts_map!(
+    [S] HashMap<K, V, S>,
+    [S] hashbrown::HashMap<K, V, S>,
+    [S] indexmap::IndexMap<K, V, S>,
+    [] BTreeMap<K, V>,
+);
 
 // --- tuples -> `[A, B, …]` ---
 
