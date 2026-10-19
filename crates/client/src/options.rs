@@ -29,6 +29,12 @@ impl From<Method> for reqwest::Method {
     }
 }
 
+/// A header as the owned `(name, value)` pair both the client's base headers
+/// and per-call [`CallOpts::headers`] store.
+pub(crate) fn header_pair(name: impl Into<String>, value: impl Into<String>) -> (String, String) {
+    (name.into(), value.into())
+}
+
 /// Options applied to a **single** call. Every field is optional; what you set
 /// overrides the client's base for that call only — the base is never mutated.
 ///
@@ -68,7 +74,7 @@ impl CallOpts {
     /// Adds a per-call header (merged over the base headers).
     #[must_use]
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((name.into(), value.into()));
+        self.headers.push(header_pair(name, value));
         self
     }
 

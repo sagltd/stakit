@@ -9,9 +9,18 @@ use serde::de::DeserializeOwned;
 
 use stakit_router::Endpoint;
 
-use crate::options::{CallOpts, Method};
+use crate::options::{CallOpts, Method, header_pair};
 use crate::result::{ActionResult, Envelope};
 use crate::{TransportError, pool};
+
+/// An [`Endpoint`] the client can call and decode.
+///
+/// Its params serialize and its output (or stream item) deserializes.
+/// Implemented for every such endpoint — it only names the bounds
+/// [`Client::fetch`] and [`Client::stream`] share.
+pub trait ClientEndpoint: Endpoint<Params: Serialize, Output: DeserializeOwned> {}
+
+impl<E> ClientEndpoint for E where E: Endpoint<Params: Serialize, Output: DeserializeOwned> {}
 
 /// A cheap, cloneable handle to a stakit server.
 ///
@@ -75,9 +84,7 @@ impl Client {
         params: E::Params,
     ) -> Result<ActionResult<E::Output>, TransportError>
     where
-        E: Endpoint,
-        E::Params: Serialize,
-        E::Output: DeserializeOwned,
+        E: ClientEndpoint,
     {
         self.fetch_with(endpoint, params, CallOpts::default()).await
     }
@@ -93,9 +100,7 @@ impl Client {
         opts: CallOpts,
     ) -> Result<ActionResult<E::Output>, TransportError>
     where
-        E: Endpoint,
-        E::Params: Serialize,
-        E::Output: DeserializeOwned,
+        E: ClientEndpoint,
     {
         let q = encode_query(E::ACTION, &params)?;
         let response = self.send_payload(q, opts).await?;
@@ -401,7 +406,7 @@ impl Builder {
     /// Adds a base header sent on every call.
     #[must_use]
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((name.into(), value.into()));
+        self.headers.push(header_pair(name, value));
         self
     }
 

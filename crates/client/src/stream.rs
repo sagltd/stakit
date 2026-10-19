@@ -4,10 +4,10 @@ use futures::{Stream, StreamExt as _};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use stakit_router::{Endpoint, ErrorBody};
+use stakit_router::ErrorBody;
 
 use crate::TransportError;
-use crate::client::{Client, encode_query, with_payload};
+use crate::client::{Client, ClientEndpoint, encode_query, with_payload};
 use crate::options::CallOpts;
 use crate::result::ActionResult;
 
@@ -97,9 +97,7 @@ impl Client {
         params: E::Params,
     ) -> Result<impl Stream<Item = ActionResult<E::Output>> + use<E>, TransportError>
     where
-        E: Endpoint,
-        E::Params: serde::Serialize,
-        E::Output: DeserializeOwned,
+        E: ClientEndpoint,
     {
         self.stream_with(endpoint, params, CallOpts::default())
             .await
@@ -116,9 +114,7 @@ impl Client {
         opts: CallOpts,
     ) -> Result<impl Stream<Item = ActionResult<E::Output>> + use<E>, TransportError>
     where
-        E: Endpoint,
-        E::Params: serde::Serialize,
-        E::Output: DeserializeOwned,
+        E: ClientEndpoint,
     {
         let q = encode_query(E::ACTION, &params)?;
         let method = opts.method.unwrap_or_default();
