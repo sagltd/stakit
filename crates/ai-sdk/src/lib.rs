@@ -30,12 +30,14 @@ mod usage;
 
 pub use agent::{Agent, AgentRun};
 pub use agent_cx::AgentCx;
-pub use cache::{CacheStrategy, CacheTarget, CacheTtl};
+pub use cache::{
+    CacheCapabilities, CacheStrategy, CacheTarget, CacheTtl, ExplicitCacheCapabilities,
+};
 pub use cancel::CancelToken;
 pub use control::{Approval, Flow};
 pub use cx::ToolCx;
 pub use error::{AgentError, ProviderError, ToolError};
-pub use llm::LLM;
+pub use llm::{Extraction, ExtractionError, LLM};
 pub use loop_event::{
     AgentEvent, Finish, Outcome, PendingToolCall, Step, StopCond, ToolCallRecord, ToolOutcome,
 };
@@ -45,12 +47,12 @@ pub use message::{
 };
 pub use middleware::AgentMiddleware;
 pub use provider::{
-    ChatRequest, ChatResponse, EventStream, Provider, StopReason, StreamEvent, ThinkingConfig,
-    ToolChoice, ToolDef, event_stream,
+    ChatRequest, ChatResponse, EventStream, Provider, ProviderCapabilities, StopReason,
+    StreamEvent, ThinkingConfig, ThinkingSupport, ToolChoice, ToolDef, event_stream,
 };
 pub use retry::{RetryPolicy, Retryable, classify};
 pub use skill::{Skill, SkillContent, SkillLoader};
-pub use tool::{Tool, ToolDyn, ToolRegistry, ToolSet, TypedTool};
+pub use tool::{NoToolArgs, Tool, ToolDyn, ToolRegistry, ToolSet, TypedTool};
 pub use usage::{ModelPrice, Pricing, Usage};
 
 /// A boxed, `Send` future — the return type of [`Tool::run`].
@@ -71,6 +73,8 @@ pub use provider::openai::{OpenAiClient, OpenAiModel};
 /// the stable public API; shapes may change without notice.
 #[doc(hidden)]
 pub mod test_support {
+    /// Bounded offline assertions for third-party provider implementations.
+    pub mod contract;
     /// Builds the Anthropic request body for a [`crate::ChatRequest`].
     #[cfg(feature = "claude")]
     pub use crate::provider::claude::build_request_body as claude_body;

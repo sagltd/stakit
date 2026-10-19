@@ -1,17 +1,22 @@
 //! One-shot LLM calls (no agent loop): structured extraction or plain text.
 //!
-//! [`LLM`] wraps a [`Provider`] and exposes two terminal methods:
-//! - [`LLM::extract`] — forces a single tool call and deserialises the input
+//! [`LLM`] wraps a [`Provider`] and exposes one-shot terminal methods:
+//! - [`LLM::extract`] — requests a single tool call and deserialises the input
 //!   into a typed `T: JsonSchema + DeserializeOwned`.
+//! - [`LLM::extract_with_usage`] — retains observed accounting metadata even when
+//!   extraction fails, and validates the decoded value.
 //! - [`LLM::text`] — collects all assistant text blocks and concatenates them.
 //!
-//! Neither method starts an agent loop; each fires exactly one [`Provider::complete`]
-//! call and returns.
+//! No method starts an agent loop or retries. Each fires one [`Provider::complete`]
+//! call after request preflight succeeds.
 
 use std::sync::Arc;
 
+mod extraction;
+pub use extraction::{Extraction, ExtractionError};
+
 use crate::{
-    AssistantContent, Provider, SystemPrompt,
+    AssistantContent, CacheStrategy, Provider, SystemPrompt,
     error::AgentError,
     message::Message,
     provider::{ChatRequest, ToolChoice, ToolDef},
@@ -28,6 +33,7 @@ pub struct LLM<P: Provider> {
     user: Option<Arc<str>>,
     max_tokens: u32,
     temperature: Option<f32>,
+    cache: CacheStrategy,
 }
 
 impl<P: Provider> LLM<P> {
@@ -40,6 +46,7 @@ impl<P: Provider> LLM<P> {
             user: None,
             max_tokens: 1024,
             temperature: None,
+            cache: CacheStrategy::Auto,
         }
     }
 
@@ -81,7 +88,15 @@ impl<P: Provider> LLM<P> {
         self
     }
 
-    /// Builds the base [`ChatRequest`] shared by both terminal methods.
+    /// Sets prompt-cache controls (default: [`CacheStrategy::Auto`]).
+    /// Unsupported explicit controls fail before the provider call.
+    #[must_use]
+    pub fn cache(mut self, cache: CacheStrategy) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// Builds the base [`ChatRequest`] shared by all terminal methods.
     ///
     /// Returns an error when no user message has been set.
     fn build_request(
@@ -107,15 +122,36 @@ impl<P: Provider> LLM<P> {
         req.tool_choice = tool_choice;
         req.max_tokens = self.max_tokens;
         req.temperature = self.temperature;
+        req.cache = self.cache.clone();
+        req.fit_to(&self.provider.capabilities_for(&req.model));
+        req.validate_cache(&self.provider.cache_capabilities_for(&req.model))?;
         Ok(req)
     }
 
-    /// Fires one request and returns a structured `T` by forcing the model to
-    /// call a synthetic tool whose input schema is `T::schema()`.
+    fn extraction_request<T: stakit_model::JsonSchema>(&self) -> Result<ChatRequest, AgentError> {
+        let tool = ToolDef::new("extract", "Return the structured result.", T::schema());
+        let mut req = self.build_request(Arc::from([tool]), ToolChoice::Tool("extract".into()))?;
+        if req.tool_choice == ToolChoice::Auto {
+            let instruction = "Return the structured result by calling the extract tool. \
+                Do not answer with prose or a JSON text block.";
+            let system = req.system.get_or_insert_with(|| SystemPrompt::from(""));
+            system.text = if system.text.is_empty() {
+                instruction.into()
+            } else {
+                format!("{}\n\n{instruction}", system.text).into()
+            };
+        }
+
+        Ok(req)
+    }
+
+    /// Fires one request and returns a structured `T` using a synthetic tool
+    /// whose input schema is `T::schema()`.
     ///
-    /// The request uses <code>[`ToolChoice::Tool`]("extract")</code> so the model *must*
-    /// produce a tool-use block. The block's `input` field is then
-    /// deserialised into `T`.
+    /// Forces the tool when the provider supports it. Otherwise uses auto tool
+    /// choice and an explicit system instruction. Both paths require an actual
+    /// `extract` tool-use block and deserialize its input into `T`; prose is
+    /// never accepted as a structured result. No retries or extra calls are made.
     ///
     /// # Errors
     ///
@@ -125,24 +161,19 @@ impl<P: Provider> LLM<P> {
     pub async fn extract<T: stakit_model::JsonSchema + serde::de::DeserializeOwned>(
         self,
     ) -> Result<T, AgentError> {
-        let tool = ToolDef::new("extract", "Return the structured result.", T::schema());
-        let req = self.build_request(Arc::from([tool]), ToolChoice::Tool("extract".into()))?;
+        let req = self.extraction_request::<T>()?;
 
         let resp = self.provider.complete(req).await?;
 
-        // Find the first ToolUse block named "extract".
-        let input = resp
-            .content
-            .into_iter()
-            .find_map(|block| match block {
-                AssistantContent::ToolUse { name, input, .. } if &*name == "extract" => Some(input),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                AgentError::Schema(
-                    "LLM::extract: provider response contained no 'extract' tool-use block".into(),
-                )
-            })?;
+        let input = extraction::tool_input(&resp.stop, resp.content, false).map_err(|error| {
+            let message = match error {
+                ExtractionError::Refused | ExtractionError::Incomplete => {
+                    "LLM::extract: provider refused or did not finish the structured result"
+                }
+                _ => "LLM::extract: provider response contained no 'extract' tool-use block",
+            };
+            AgentError::Schema(message.into())
+        })?;
 
         serde_json::from_value::<T>(input).map_err(|e| AgentError::Schema(e.to_string()))
     }

@@ -1,10 +1,11 @@
-#![cfg(feature = "live-tests")]
-//! Live prompt-cache checks. Skipped (return early) when API keys are absent.
+//! Explicit live prompt-cache checks; missing required keys fail.
 //!
 //! Run with:
 //! ```bash
-//! cargo nextest run -p stakit-ai-sdk --features live-tests -E 'test(cache)'
+//! cargo nextest run -p stakit-ai-sdk --features live-tests --run-ignored only --test cache_live
 //! ```
+
+#![cfg(feature = "live-tests")]
 
 #[cfg(feature = "claude")]
 use stakit_ai_sdk::ClaudeClient;
@@ -46,11 +47,8 @@ const LARGE_SYSTEM: &str = "You are a helpful, knowledgeable AI assistant specia
 
 #[cfg(feature = "claude")]
 #[tokio::test]
+#[ignore = "requires ANTHROPIC_API_KEY and paid network calls"]
 async fn claude_second_call_reads_cache() {
-    if std::env::var("ANTHROPIC_API_KEY").is_err() {
-        return;
-    }
-
     let client = ClaudeClient::from_env().expect("ANTHROPIC_API_KEY must be set");
     // Use a model that supports prompt caching. Verified via raw API: sonnet-4-5
     // writes/reads the cache; `claude-haiku-4-5` did NOT cache on this account
@@ -85,11 +83,8 @@ async fn claude_second_call_reads_cache() {
 
 #[cfg(feature = "openai")]
 #[tokio::test]
+#[ignore = "requires OPENAI_API_KEY and paid network calls"]
 async fn openai_second_call_reports_cached_tokens() {
-    if std::env::var("OPENAI_API_KEY").is_err() {
-        return;
-    }
-
     let client = OpenAiClient::from_env().expect("OPENAI_API_KEY must be set");
     // gpt-4o-mini supports prompt caching on long repeated prefixes.
     let model = "gpt-4o-mini";

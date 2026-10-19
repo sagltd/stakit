@@ -2,41 +2,51 @@
 //!
 //! Maps the unified [`ChatRequest`] to the Anthropic wire format and back,
 //! including streaming SSE: per-block argument fragments (`input_json_delta`)
-//! are accumulated so a whole [`StreamEvent::ToolCall`] is emitted on
+//! are accumulated so a whole [`crate::StreamEvent::ToolCall`] is emitted on
 //! `content_block_stop`, and the cumulative `output_tokens` from `message_delta`
 //! is taken as the running total (not added).
 
-use futures::StreamExt;
 use serde_json::{Map, Value, json};
 
-use crate::cache::{CacheStrategy, CacheTarget};
+use crate::cache::{
+    CacheCapabilities, CacheStrategy, CacheTarget, CacheTtl, ExplicitCacheCapabilities,
+};
 use crate::message::{AssistantContent, Image, Message, Thinking, ToolResultPart, UserContent};
 use crate::provider::{
-    ChatRequest, ChatResponse, EventStream, Provider, StopReason, StreamEvent, ThinkingConfig,
-    ToolChoice, ToolDef, parse_retry_after,
+    ChatRequest, ChatResponse, EventStream, Provider, ProviderCapabilities, StopReason,
+    ThinkingConfig, ToolChoice, ToolDef, parse_retry_after,
 };
 use crate::usage::Usage;
 use crate::{ProviderError, SystemPrompt};
+
+mod accum;
+mod block;
+#[cfg(test)]
+#[path = "claude/cache_support_test.rs"]
+mod cache_support_test;
+mod models;
+mod usage;
+#[cfg(test)]
+mod usage_presence_test;
+use accum::Accum;
+mod sse;
+
+use models::{ThinkingOff, rules_for};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Upper bound on a single un-terminated SSE line. A stream that never sends a
 /// newline would otherwise grow `buf` without bound; past this we bail with a
 /// decode error rather than buffering unboundedly.
-const MAX_SSE_LINE: usize = 1024 * 1024;
 /// Max in-flight tool-call buffers a stream may open. A hostile stream could
 /// otherwise allocate `content_block_start` entries without bound.
-const MAX_INFLIGHT_TOOLS: usize = 64;
-/// Max accumulated argument bytes for a single tool call. A hostile stream could
-/// otherwise grow one tool's argument buffer past the per-line SSE cap.
-const MAX_TOOL_ARGS: usize = 1024 * 1024;
-
+const MAX_INFLIGHT_TOOLS: usize = crate::provider::MAX_STREAM_OPEN_BLOCKS;
 /// A handle to the Anthropic API. Cheap to clone; mints per-model handles.
 #[derive(Clone)]
 pub struct ClaudeClient {
     api_key: String,
     base_url: String,
-    http: reqwest::Client,
+    http: Option<reqwest::Client>,
 }
 
 // Hand-written so the API key never leaks through `{:?}` (logs, panics, tests).
@@ -99,12 +109,37 @@ impl Provider for ClaudeModel {
         &self.model
     }
 
+    fn capabilities(&self) -> ProviderCapabilities {
+        rules_for(&self.model).capabilities
+    }
+
+    fn capabilities_for(&self, model: &str) -> ProviderCapabilities {
+        let model = if model.is_empty() { &self.model } else { model };
+        rules_for(model).capabilities
+    }
+
+    fn cache_capabilities(&self) -> CacheCapabilities {
+        CacheCapabilities::Known {
+            implicit: false,
+            explicit: Some(ExplicitCacheCapabilities {
+                max_points: MAX_BREAKPOINTS,
+                ttls: vec![CacheTtl::FiveMin, CacheTtl::OneHour],
+            }),
+        }
+    }
+
+    fn cache_capabilities_for(&self, _model: &str) -> CacheCapabilities {
+        self.cache_capabilities()
+    }
+
     fn complete(
         &self,
-        request: ChatRequest,
+        mut request: ChatRequest,
     ) -> futures::future::BoxFuture<'_, Result<ChatResponse, ProviderError>> {
         Box::pin(async move {
             let model = self.pick_model(&request);
+            request.fit_to(&rules_for(&model).capabilities);
+            request.validate_cache(&self.cache_capabilities_for(&model))?;
             let body = build_body(&model, &request, false);
             let resp = self.send(body).await?;
             let status = resp.status();
@@ -120,16 +155,18 @@ impl Provider for ClaudeModel {
                 err: e.to_string(),
                 body: text.clone(),
             })?;
-            Ok(parse_response(&value))
+            parse_response(&value)
         })
     }
 
     fn stream(
         &self,
-        request: ChatRequest,
+        mut request: ChatRequest,
     ) -> futures::future::BoxFuture<'_, Result<EventStream, ProviderError>> {
         Box::pin(async move {
             let model = self.pick_model(&request);
+            request.fit_to(&rules_for(&model).capabilities);
+            request.validate_cache(&self.cache_capabilities_for(&model))?;
             let body = build_body(&model, &request, true);
             let resp = self.send(body).await?;
             let status = resp.status();
@@ -138,59 +175,7 @@ impl Provider for ClaudeModel {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(api_error(status.as_u16(), &text, retry_after));
             }
-            let mut bytes = resp.bytes_stream();
-            let stream = async_stream::stream! {
-                let mut buf = String::new();
-                // Bytes already scanned for a newline (the prefix is newline-free
-                // by the drain invariant below), so each chunk only scans the new
-                // tail — keeping the overflow guard O(1) amortized, not O(n²).
-                let mut scanned = 0usize;
-                let mut accum = Accum::default();
-                while let Some(chunk) = bytes.next().await {
-                    let chunk = match chunk {
-                        Ok(c) => c,
-                        Err(e) => {
-                            yield Err(ProviderError::Transport(e.to_string()));
-                            return;
-                        }
-                    };
-                    buf.push_str(&String::from_utf8_lossy(&chunk));
-                    // Guard against an SSE stream that never terminates a line.
-                    if sse_line_overflow(&buf, scanned) {
-                        yield Err(ProviderError::Decode {
-                            err: format!("SSE line exceeded {MAX_SSE_LINE} bytes without a newline"),
-                            body: String::new(),
-                        });
-                        return;
-                    }
-                    while let Some(nl) = buf.find('\n') {
-                        let line: String = buf.drain(..=nl).collect();
-                        let line = line.trim_end();
-                        let Some(data) = line.strip_prefix("data:") else { continue };
-                        let data = data.trim();
-                        if data.is_empty() {
-                            continue;
-                        }
-                        if let Ok(event) = serde_json::from_str::<Value>(data) {
-                            match accum.push(&event) {
-                                Ok(evs) => {
-                                    for ev in evs {
-                                        yield Ok(ev);
-                                    }
-                                }
-                                Err(e) => {
-                                    yield Err(e);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    // After draining whole lines, the remainder holds no newline,
-                    // so it is fully scanned — the next chunk starts from its end.
-                    scanned = buf.len();
-                }
-            };
-            Ok(stream.boxed())
+            Ok(sse::decode(resp.bytes_stream()))
         })
     }
 }
@@ -206,9 +191,10 @@ impl ClaudeModel {
     }
 
     async fn send(&self, body: Value) -> Result<reqwest::Response, ProviderError> {
-        self.client
-            .http
-            .post(format!("{}/v1/messages", self.client.base_url))
+        let http = self.client.http.as_ref().ok_or_else(|| {
+            ProviderError::Transport("provider HTTP client initialization failed".into())
+        })?;
+        http.post(format!("{}/v1/messages", self.client.base_url))
             .header("x-api-key", &self.client.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&body)
@@ -243,22 +229,10 @@ fn api_error(status: u16, body: &str, retry_after: Option<std::time::Duration>) 
     }
 }
 
-/// Whether the SSE buffer holds a single, still-unterminated line longer than
-/// [`MAX_SSE_LINE`] — i.e. the peer is streaming an unbounded line.
-///
-/// `scanned` is the length already known to be newline-free (the buffer prefix),
-/// so only the new tail is scanned. Given the caller's invariant that
-/// `buf[..scanned]` contains no newline, this is equivalent to
-/// `!buf.contains('\n') && buf.len() > MAX_SSE_LINE` but amortized O(1) per
-/// chunk instead of O(n) — the whole stream is scanned once, not per chunk.
-fn sse_line_overflow(buf: &str, scanned: usize) -> bool {
-    let tail = buf.get(scanned..).unwrap_or("");
-    !tail.contains('\n') && buf.len() > MAX_SSE_LINE
-}
-
 // --- request mapping -------------------------------------------------------
 
-/// Builds the Anthropic (non-streaming) request body for a [`ChatRequest`].
+/// Builds the Anthropic (non-streaming) request body for a [`ChatRequest`],
+/// fitted to the request model's capabilities exactly as a real call is.
 ///
 /// Exposed for offline body/cache-shape tests; the request's `model` field is
 /// used (falling back to an empty model id), so callers need only pass the
@@ -266,10 +240,43 @@ fn sse_line_overflow(buf: &str, scanned: usize) -> bool {
 #[doc(hidden)]
 #[must_use]
 pub fn build_request_body(req: &ChatRequest) -> Value {
-    build_body(&req.model, req, false)
+    let mut fitted = req.clone();
+    fitted.fit_to(&rules_for(&req.model).capabilities);
+    build_body(&req.model, &fitted, false)
 }
 
-/// Builds the Anthropic request body from a unified [`ChatRequest`].
+/// `xhigh` / `max` effort cannot run with thinking turned off (a 400), so
+/// thinking-off leaves the model's adaptive thinking on there.
+fn effort_requires_thinking(extra: &Map<String, Value>) -> bool {
+    let effort = extra
+        .get("output_config")
+        .and_then(|config| config.get("effort"))
+        .and_then(Value::as_str);
+    matches!(effort, Some("xhigh" | "max"))
+}
+
+/// The `thinking` field for a fitted request, if any.
+fn thinking_field(
+    thinking: ThinkingConfig,
+    off: ThinkingOff,
+    extra: &Map<String, Value>,
+) -> Option<Value> {
+    match thinking {
+        ThinkingConfig::Adaptive => Some(json!({ "type": "adaptive" })),
+        ThinkingConfig::Budget(budget) => {
+            Some(json!({ "type": "enabled", "budget_tokens": budget }))
+        }
+        ThinkingConfig::Off if effort_requires_thinking(extra) => None,
+        ThinkingConfig::Off => match off {
+            ThinkingOff::Omit => None,
+            ThinkingOff::Disabled => Some(json!({ "type": "disabled" })),
+            ThinkingOff::BetweenTools => Some(json!({ "type": "between_tools" })),
+        },
+    }
+}
+
+/// Builds the Anthropic request body from a unified [`ChatRequest`] already
+/// fitted to the model's capabilities ([`ChatRequest::fit_to`]).
 fn build_body(model: &str, req: &ChatRequest, stream: bool) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
@@ -279,42 +286,48 @@ fn build_body(model: &str, req: &ChatRequest, stream: bool) -> Value {
     // Resolve the cache breakpoints once (prefix order: tools → system →
     // messages), enforcing Anthropic's max of four across the whole request.
     let plan = CachePlan::resolve(req);
-
-    body.insert(
-        "messages".into(),
-        json!(map_messages(&req.messages, plan.rolling_message)),
-    );
-
-    if let Some(system) = &req.system {
-        body.insert("system".into(), map_system(system, plan.cache_system));
-    }
+    let ttl = match req.cache {
+        CacheStrategy::Off => None,
+        CacheStrategy::Breakpoints { ttl, .. } => Some(ttl),
+        CacheStrategy::Auto => Some(CacheTtl::FiveMin),
+    };
+    let mut cache_budget = MAX_BREAKPOINTS;
     if !req.tools.is_empty() {
         body.insert(
             "tools".into(),
-            json!(map_tools(&req.tools, plan.cache_last_tool)),
+            json!(map_tools(
+                &req.tools,
+                plan.cache_last_tool,
+                ttl,
+                &mut cache_budget
+            )),
         );
         body.insert("tool_choice".into(), map_tool_choice(&req.tool_choice));
     }
+    if let Some(system) = &req.system {
+        body.insert(
+            "system".into(),
+            map_system(system, plan.cache_system, ttl, &mut cache_budget),
+        );
+    }
+    body.insert(
+        "messages".into(),
+        json!(map_messages(
+            &req.messages,
+            &plan.message_breakpoints,
+            ttl,
+            &mut cache_budget
+        )),
+    );
     if let Some(temp) = req.temperature {
         body.insert("temperature".into(), json!(temp));
     }
     if !req.stop_sequences.is_empty() {
         body.insert("stop_sequences".into(), json!(req.stop_sequences));
     }
-    match req.thinking {
-        ThinkingConfig::Off => {}
-        ThinkingConfig::Adaptive => {
-            body.insert(
-                "thinking".into(),
-                json!({ "type": "enabled", "budget_tokens": 2048 }),
-            );
-        }
-        ThinkingConfig::Budget(n) => {
-            body.insert(
-                "thinking".into(),
-                json!({ "type": "enabled", "budget_tokens": n }),
-            );
-        }
+    if let Some(thinking) = thinking_field(req.thinking, rules_for(model).thinking_off, &req.extra)
+    {
+        body.insert("thinking".into(), thinking);
     }
     for (k, v) in &req.extra {
         body.insert(k.clone(), v.clone());
@@ -333,8 +346,8 @@ struct CachePlan {
     cache_last_tool: bool,
     /// Place a breakpoint after the system prompt block.
     cache_system: bool,
-    /// Place a rolling breakpoint on the last block of this message index.
-    rolling_message: Option<usize>,
+    /// Distinct message indices in prefix order, capped at the global maximum.
+    message_breakpoints: Vec<usize>,
 }
 
 impl CachePlan {
@@ -344,54 +357,32 @@ impl CachePlan {
             CacheStrategy::Off => Self {
                 cache_last_tool: false,
                 cache_system: false,
-                rolling_message: None,
+                message_breakpoints: Vec::new(),
             },
             CacheStrategy::Auto => Self::auto(req),
             CacheStrategy::Breakpoints { points, .. } => Self::explicit(req, points),
         }
     }
 
-    /// `Auto`: cache the shared prefix — the tools block, the system block, and
-    /// a rolling breakpoint on the previous turn's boundary — capped at four.
+    /// `Auto`: cache the shared prefix and the newest user/tool-result turn.
+    /// The mapping functions share one budget, including author-forced flags.
     fn auto(req: &ChatRequest) -> Self {
-        let has_tools = !req.tools.is_empty();
-        let has_system = req.system.is_some();
-        // The rolling breakpoint sits on the previous turn's boundary: the last
-        // message at/before the second-to-last user message (so the in-progress
-        // turn — the last user message and what follows — stays out of the cached
-        // prefix while everything stable before it is cached).
-        let rolling = previous_turn_boundary(&req.messages);
-
-        // Budget already consumed by author-forced breakpoints (per-tool
-        // `cache`, `system.cache`) so the total never exceeds four.
-        let forced = forced_breakpoints(req);
-        let mut budget = MAX_BREAKPOINTS.saturating_sub(forced);
-
-        // Fill in prefix order so the earliest, most-reused blocks win the cap.
-        let cache_last_tool = has_tools && take(&mut budget);
-        let cache_system = has_system && take(&mut budget);
-        let rolling_message = rolling.filter(|_| take(&mut budget));
-
         Self {
-            cache_last_tool,
-            cache_system,
-            rolling_message,
+            cache_last_tool: !req.tools.is_empty(),
+            cache_system: req.system.is_some(),
+            message_breakpoints: last_user_message(&req.messages).into_iter().collect(),
         }
     }
 
     /// `Breakpoints`: place at exactly the requested targets, capped at four in
     /// prefix order (tools → system → messages).
     fn explicit(req: &ChatRequest, points: &[CacheTarget]) -> Self {
-        let mut budget = MAX_BREAKPOINTS.saturating_sub(forced_breakpoints(req));
+        let cache_last_tool = !req.tools.is_empty() && points.contains(&CacheTarget::Tools);
+        let cache_system = req.system.is_some() && points.contains(&CacheTarget::System);
 
-        let cache_last_tool =
-            !req.tools.is_empty() && points.contains(&CacheTarget::Tools) && take(&mut budget);
-        let cache_system =
-            req.system.is_some() && points.contains(&CacheTarget::System) && take(&mut budget);
-
-        // Resolve the lowest-index message target (one rolling slot), preferring
-        // an explicit index, then the last user message.
-        let mut rolling_message = None;
+        // Resolve distinct targets in prefix order; duplicate requests consume
+        // one slot and invalid indices consume none.
+        let mut message_breakpoints = Vec::new();
         let last_user = last_user_message(&req.messages);
         for target in points {
             let idx = match target {
@@ -400,17 +391,17 @@ impl CachePlan {
                 _ => None,
             };
             if let Some(i) = idx {
-                if take(&mut budget) {
-                    rolling_message = Some(i);
-                }
-                break;
+                message_breakpoints.push(i);
             }
         }
+        message_breakpoints.sort_unstable();
+        message_breakpoints.dedup();
+        message_breakpoints.truncate(MAX_BREAKPOINTS);
 
         Self {
             cache_last_tool,
             cache_system,
-            rolling_message,
+            message_breakpoints,
         }
     }
 }
@@ -425,47 +416,43 @@ const fn take(budget: &mut usize) -> bool {
     }
 }
 
-/// Counts breakpoints forced by author flags (per-tool `cache`, `system.cache`),
-/// which are placed regardless of strategy and so consume the global budget.
-fn forced_breakpoints(req: &ChatRequest) -> usize {
-    let tools = req.tools.iter().filter(|t| t.cache).count();
-    let system = usize::from(req.system.as_ref().is_some_and(|s| s.cache));
-    tools + system
-}
-
 /// The index of the last user message, if any.
 fn last_user_message(messages: &[Message]) -> Option<usize> {
     messages.iter().rposition(|m| matches!(m, Message::User(_)))
 }
 
-/// The previous-turn boundary for the rolling breakpoint: the index of the
-/// second-to-last user message. `None` when fewer than two user turns exist
-/// (nothing before the in-progress turn is worth a rolling breakpoint).
-fn previous_turn_boundary(messages: &[Message]) -> Option<usize> {
-    let mut user_indices = messages
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| matches!(m, Message::User(_)))
-        .map(|(i, _)| i);
-    // Take the last two user indices; the second-to-last is the boundary.
-    let mut last_two = user_indices.by_ref().rev().take(2);
-    let _last = last_two.next()?;
-    last_two.next()
+fn cache_control(ttl: CacheTtl) -> Value {
+    match ttl {
+        CacheTtl::FiveMin => json!({ "type": "ephemeral" }),
+        CacheTtl::OneHour => json!({ "type": "ephemeral", "ttl": "1h" }),
+        // Public transport entry points reject this unsupported TTL. Keep the
+        // requested value explicit in the offline body helper; never map to 5m.
+        CacheTtl::ThirtyMin => json!({ "type": "ephemeral", "ttl": "30m" }),
+    }
 }
 
-fn cache_control() -> Value {
-    json!({ "type": "ephemeral" })
-}
-
-fn map_system(system: &SystemPrompt, cache: bool) -> Value {
-    if cache || system.cache {
-        json!([{ "type": "text", "text": system.text, "cache_control": cache_control() }])
+fn map_system(
+    system: &SystemPrompt,
+    cache: bool,
+    ttl: Option<CacheTtl>,
+    budget: &mut usize,
+) -> Value {
+    if let Some(ttl) = ttl
+        && (cache || system.cache)
+        && take(budget)
+    {
+        json!([{ "type": "text", "text": system.text, "cache_control": cache_control(ttl) }])
     } else {
         json!(system.text)
     }
 }
 
-fn map_tools(tools: &[ToolDef], cache_last: bool) -> Vec<Value> {
+fn map_tools(
+    tools: &[ToolDef],
+    cache_last: bool,
+    ttl: Option<CacheTtl>,
+    budget: &mut usize,
+) -> Vec<Value> {
     let last = tools.len().saturating_sub(1);
     tools
         .iter()
@@ -478,8 +465,11 @@ fn map_tools(tools: &[ToolDef], cache_last: bool) -> Vec<Value> {
             if t.strict {
                 obj.insert("strict".into(), json!(true));
             }
-            if t.cache || (cache_last && i == last) {
-                obj.insert("cache_control".into(), cache_control());
+            if let Some(ttl) = ttl
+                && (t.cache || (cache_last && i == last))
+                && take(budget)
+            {
+                obj.insert("cache_control".into(), cache_control(ttl));
             }
             Value::Object(obj)
         })
@@ -498,15 +488,22 @@ fn map_tool_choice(choice: &ToolChoice) -> Value {
 }
 
 /// Maps the conversation, placing a rolling `cache_control` breakpoint on the
-/// last content block of message `rolling` (when set).
-fn map_messages(messages: &[Message], rolling: Option<usize>) -> Vec<Value> {
+/// last content block of every selected message, within the shared budget.
+fn map_messages(
+    messages: &[Message],
+    targets: &[usize],
+    ttl: Option<CacheTtl>,
+    budget: &mut usize,
+) -> Vec<Value> {
     messages
         .iter()
         .enumerate()
         .map(|(i, m)| {
             let mut mapped = map_message(m);
-            if rolling == Some(i) {
-                mark_last_block(&mut mapped);
+            if let Some(ttl) = ttl
+                && targets.contains(&i)
+            {
+                mark_last_block(&mut mapped, ttl, budget);
             }
             mapped
         })
@@ -514,14 +511,15 @@ fn map_messages(messages: &[Message], rolling: Option<usize>) -> Vec<Value> {
 }
 
 /// Attaches a cache breakpoint to the last content block of a mapped message.
-fn mark_last_block(message: &mut Value) {
+fn mark_last_block(message: &mut Value, ttl: CacheTtl, budget: &mut usize) {
     if let Some(block) = message
         .get_mut("content")
         .and_then(Value::as_array_mut)
         .and_then(|blocks| blocks.last_mut())
         .and_then(Value::as_object_mut)
+        && take(budget)
     {
-        block.insert("cache_control".into(), cache_control());
+        block.insert("cache_control".into(), cache_control(ttl));
     }
 }
 
@@ -610,8 +608,12 @@ fn map_image(img: &Image) -> Value {
 // --- response mapping ------------------------------------------------------
 
 /// Parses a non-streamed Anthropic response into the unified shape. Missing or
-/// unexpected fields degrade gracefully rather than erroring.
-fn parse_response(value: &Value) -> ChatResponse {
+/// unexpected content fields are ignored; mandatory usage must be observed.
+fn parse_response(value: &Value) -> Result<ChatResponse, ProviderError> {
+    let raw_usage = value
+        .get("usage")
+        .ok_or_else(|| sse::decode_error("Claude response requires usage"))?;
+    usage::require_complete(raw_usage)?;
     let content = value
         .get("content")
         .and_then(Value::as_array)
@@ -623,12 +625,12 @@ fn parse_response(value: &Value) -> ChatResponse {
         .map_or(StopReason::EndTurn, |s| {
             map_stop_reason(s, value.get("stop_sequence").and_then(Value::as_str))
         });
-    let usage = value.get("usage").map(map_usage).unwrap_or_default();
-    ChatResponse {
+    let usage = map_usage(raw_usage);
+    Ok(ChatResponse {
         content,
         stop,
         usage,
-    }
+    })
 }
 
 fn parse_assistant_block(block: &Value) -> Option<AssistantContent> {
@@ -681,6 +683,11 @@ fn map_usage(usage: &Value) -> Usage {
         input_tokens: n("input_tokens"),
         output_tokens: n("output_tokens"),
         cache_create_tokens: n("cache_creation_input_tokens"),
+        cache_create_1h_tokens: usage
+            .get("cache_creation")
+            .and_then(|creation| creation.get("ephemeral_1h_input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         cache_read_tokens: n("cache_read_input_tokens"),
         reasoning_tokens: usage
             .get("output_tokens_details")
@@ -690,167 +697,10 @@ fn map_usage(usage: &Value) -> Usage {
     }
 }
 
-// --- streaming accumulator -------------------------------------------------
-
-#[derive(Default)]
-struct Accum {
-    usage: Usage,
-    tools: hashbrown::HashMap<u64, ToolBuf>,
-    stop: Option<StopReason>,
-}
-
-struct ToolBuf {
-    id: String,
-    name: String,
-    json: String,
-}
-
-impl Accum {
-    fn push(&mut self, event: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
-        match event.get("type").and_then(Value::as_str) {
-            Some("message_start") => {
-                if let Some(u) = event.get("message").and_then(|m| m.get("usage")) {
-                    self.usage = map_usage(u);
-                }
-                Ok(vec![StreamEvent::Start { usage: self.usage }])
-            }
-            Some("content_block_start") => {
-                if let Some(block) = event.get("content_block") {
-                    if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                        if let Some(idx) = event.get("index").and_then(Value::as_u64) {
-                            // Bound in-flight tool buffers against a hostile stream.
-                            if !self.tools.contains_key(&idx)
-                                && self.tools.len() >= MAX_INFLIGHT_TOOLS
-                            {
-                                return Err(ProviderError::Decode {
-                                    err: format!(
-                                        "stream opened more than {MAX_INFLIGHT_TOOLS} concurrent tool calls"
-                                    ),
-                                    body: String::new(),
-                                });
-                            }
-                            self.tools.insert(
-                                idx,
-                                ToolBuf {
-                                    id: block
-                                        .get("id")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default()
-                                        .to_owned(),
-                                    name: block
-                                        .get("name")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default()
-                                        .to_owned(),
-                                    json: String::new(),
-                                },
-                            );
-                        }
-                    }
-                }
-                Ok(Vec::new())
-            }
-            Some("content_block_delta") => self.on_delta(event),
-            Some("content_block_stop") => {
-                let idx = event.get("index").and_then(Value::as_u64);
-                Ok(idx
-                    .and_then(|i| self.tools.remove(&i))
-                    .map_or_else(Vec::new, |buf| {
-                        // Empty argument streams mean "no arguments"; normalize to
-                        // an empty object. Otherwise forward the raw text and let
-                        // the agent parse + validate it once at dispatch.
-                        let arguments = if buf.json.trim().is_empty() {
-                            "{}".to_owned()
-                        } else {
-                            buf.json
-                        };
-                        vec![StreamEvent::ToolCall {
-                            id: buf.id,
-                            name: buf.name,
-                            arguments,
-                        }]
-                    }))
-            }
-            Some("message_delta") => {
-                if let Some(u) = event.get("usage") {
-                    // output_tokens here is the cumulative running total.
-                    let delta = map_usage(u);
-                    self.usage.output_tokens = delta.output_tokens;
-                    if delta.cache_read_tokens > 0 {
-                        self.usage.cache_read_tokens = delta.cache_read_tokens;
-                    }
-                    if delta.reasoning_tokens > 0 {
-                        self.usage.reasoning_tokens = delta.reasoning_tokens;
-                    }
-                }
-                if let Some(reason) = event
-                    .get("delta")
-                    .and_then(|d| d.get("stop_reason"))
-                    .and_then(Value::as_str)
-                {
-                    let seq = event
-                        .get("delta")
-                        .and_then(|d| d.get("stop_sequence"))
-                        .and_then(Value::as_str);
-                    self.stop = Some(map_stop_reason(reason, seq));
-                }
-                Ok(Vec::new())
-            }
-            Some("message_stop") => Ok(vec![StreamEvent::End {
-                stop: self.stop.clone().unwrap_or(StopReason::EndTurn),
-                usage: self.usage,
-            }]),
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    fn on_delta(&mut self, event: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
-        let Some(delta) = event.get("delta") else {
-            return Ok(Vec::new());
-        };
-        match delta.get("type").and_then(Value::as_str) {
-            Some("text_delta") => Ok(delta
-                .get("text")
-                .and_then(Value::as_str)
-                .map(|t| vec![StreamEvent::TextDelta(t.to_owned())])
-                .unwrap_or_default()),
-            Some("thinking_delta") => Ok(delta
-                .get("thinking")
-                .and_then(Value::as_str)
-                .map(|t| vec![StreamEvent::ReasoningDelta(t.to_owned())])
-                .unwrap_or_default()),
-            Some("signature_delta") => Ok(delta
-                .get("signature")
-                .and_then(Value::as_str)
-                .map(|s| vec![StreamEvent::SignatureDelta(s.to_owned())])
-                .unwrap_or_default()),
-            Some("input_json_delta") => {
-                if let (Some(idx), Some(partial)) = (
-                    event.get("index").and_then(Value::as_u64),
-                    delta.get("partial_json").and_then(Value::as_str),
-                ) {
-                    if let Some(buf) = self.tools.get_mut(&idx) {
-                        // Bound one tool's argument buffer against a hostile stream
-                        // (this path bypasses the per-line SSE cap).
-                        if buf.json.len().saturating_add(partial.len()) > MAX_TOOL_ARGS {
-                            return Err(ProviderError::Decode {
-                                err: format!("tool-call arguments exceeded {MAX_TOOL_ARGS} bytes"),
-                                body: String::new(),
-                            });
-                        }
-                        buf.json.push_str(partial);
-                    }
-                }
-                Ok(Vec::new())
-            }
-            _ => Ok(Vec::new()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StreamEvent;
     use crate::message::UserContent;
 
     #[test]
@@ -869,16 +719,20 @@ mod tests {
     }
 
     #[test]
-    fn thinking_config_maps_to_anthropic_thinking_budget() {
-        use crate::provider::ThinkingConfig;
-        let mut req = ChatRequest::new("claude-opus-4-8");
+    fn thinking_config_maps_to_the_model_thinking_shape() {
+        let mut req = ChatRequest::new("claude-haiku-4-5-20251001");
         req.thinking = ThinkingConfig::Budget(3000);
-        let body = build_body("claude-opus-4-8", &req, false);
+        let body = build_request_body(&req);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 3000);
 
+        // Opus 4.8 rejects budgets: the same request is sent as adaptive.
+        req.model = "claude-opus-4-8".into();
+        let body = build_request_body(&req);
+        assert_eq!(body["thinking"], json!({ "type": "adaptive" }));
+
         req.thinking = ThinkingConfig::Off;
-        let body = build_body("claude-opus-4-8", &req, false);
+        let body = build_request_body(&req);
         assert!(body.get("thinking").is_none(), "Off must omit thinking");
     }
 
@@ -908,7 +762,7 @@ mod tests {
             "stop_reason": "tool_use",
             "usage": { "input_tokens": 10, "output_tokens": 7, "cache_read_input_tokens": 3 }
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value).expect("valid response");
         assert_eq!(resp.stop, StopReason::ToolUse);
         assert_eq!(resp.usage.input_tokens, 10);
         assert_eq!(resp.usage.output_tokens, 7);
@@ -967,6 +821,12 @@ mod tests {
     #[test]
     fn accumulator_streams_text() {
         let mut accum = Accum::default();
+        // A delta belongs to an opened block; complete-block replay must retain
+        // that same block rather than relying on an orphaned UI fragment.
+        accum
+            .push(&json!({ "type":"content_block_start", "index":0,
+            "content_block":{"type":"text", "text":""} }))
+            .expect("start");
         let evs = accum
             .push(&json!({
                 "type": "content_block_delta", "index": 0,
@@ -1000,7 +860,7 @@ mod tests {
                 "content_block": { "type": "tool_use", "id": "t0", "name": "wx", "input": {} } }))
             .expect("start ok");
         // A single oversized argument fragment must trip the decode error.
-        let huge = "x".repeat(MAX_TOOL_ARGS + 1);
+        let huge = "x".repeat(crate::provider::MAX_STREAM_BLOCK_BYTES + 1);
         let err = accum
             .push(&json!({ "type": "content_block_delta", "index": 0,
                 "delta": { "type": "input_json_delta", "partial_json": huge } }))
@@ -1048,31 +908,5 @@ mod tests {
         let model = client.model("claude-opus-4-8");
         let dbg = format!("{model:?}");
         assert!(!dbg.contains("sk-secret-LEAK"), "{dbg}");
-    }
-
-    #[test]
-    fn sse_line_overflow_trips_only_past_the_cap_without_newline() {
-        // A short un-terminated line is fine.
-        assert!(!sse_line_overflow("data: partial", 0));
-        // A huge line with a newline has been delimited — not an overflow.
-        let mut delimited = "x".repeat(MAX_SSE_LINE + 10);
-        delimited.push('\n');
-        assert!(!sse_line_overflow(&delimited, 0));
-        // A huge line with no newline is the pathological case we guard.
-        assert!(sse_line_overflow(&"x".repeat(MAX_SSE_LINE + 1), 0));
-    }
-
-    #[test]
-    fn sse_line_overflow_scans_only_the_unscanned_tail() {
-        // A newline lies in the already-scanned prefix; the tail is newline-free
-        // and over the cap. With the prefix excluded this still must NOT trip,
-        // matching `!buf.contains('\n')` under the caller's drain invariant.
-        let mut buf = String::from("\n");
-        buf.push_str(&"x".repeat(MAX_SSE_LINE + 1));
-        // scanned = 0 sees the leading newline → no overflow.
-        assert!(!sse_line_overflow(&buf, 0));
-        // Even scanning only the tail (after the newline), the result is the same
-        // boolean the O(n) form would have produced for this whole buffer.
-        assert!(sse_line_overflow(&buf, 1));
     }
 }

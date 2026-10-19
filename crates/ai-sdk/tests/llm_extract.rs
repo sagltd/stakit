@@ -3,7 +3,9 @@
 //! These tests assert that the [`ChatRequest`] built by `LLM::extract::<T>()`
 //! is serialised correctly by both the Claude and `OpenAI` providers — specifically
 //! that the `"extract"` tool is present with the right schema, and that
-//! `tool_choice` forces that tool. No network is involved.
+//! `tool_choice` forces that tool where the model allows it (Claude Opus and
+//! Sonnet 5.5 get `auto`; `LLM::extract` then asks for the call in the prompt).
+//! No network is involved.
 #![cfg(all(feature = "claude", feature = "openai"))]
 
 use serde_json::Value;
@@ -12,6 +14,11 @@ use stakit_ai_sdk::{
     test_support::{claude_body, openai_body},
 };
 use stakit_model::{JsonSchema, Model};
+
+/// A Claude model that accepts a forced tool choice.
+const CLAUDE_FORCING: &str = "claude-haiku-5-5";
+/// An `OpenAI` model (every Chat Completions model accepts a forced function).
+const OPENAI_MODEL: &str = "gpt-4o";
 
 // ── Test subject ─────────────────────────────────────────────────────────────
 
@@ -38,11 +45,11 @@ struct User {
 /// ```
 ///
 /// `build_request` in turn sets: model, system, `messages=[user(text)]`,
-/// tools, `tool_choice`, `max_tokens=1024`, temperature. We use a fixed model id
-/// so the serialised body is deterministic.
-fn extract_request() -> ChatRequest {
+/// tools, `tool_choice`, `max_tokens=1024`, temperature. The model id decides
+/// what the provider may force.
+fn extract_request(model: &str) -> ChatRequest {
     let tool = ToolDef::new("extract", "Return the structured result.", User::schema());
-    let mut req = ChatRequest::new("test-model");
+    let mut req = ChatRequest::new(model);
     req.messages = vec![Message::user("Bob is 30")];
     req.tools = std::sync::Arc::from([tool]);
     req.tool_choice = ToolChoice::Tool("extract".into());
@@ -75,14 +82,14 @@ fn openai_extract_function(body: &Value) -> &Value {
 
 #[test]
 fn claude_extract_tool_name_is_extract() {
-    let body = claude_body(&extract_request());
+    let body = claude_body(&extract_request(CLAUDE_FORCING));
     let tool = claude_extract_tool(&body);
     assert_eq!(tool["name"], "extract");
 }
 
 #[test]
 fn claude_extract_tool_input_schema_matches_user_schema() {
-    let body = claude_body(&extract_request());
+    let body = claude_body(&extract_request(CLAUDE_FORCING));
     let tool = claude_extract_tool(&body);
     // Claude uses `input_schema` for the JSON Schema object.
     let schema = &tool["input_schema"];
@@ -95,7 +102,7 @@ fn claude_extract_tool_input_schema_matches_user_schema() {
 
 #[test]
 fn claude_tool_choice_forces_extract_tool() {
-    let body = claude_body(&extract_request());
+    let body = claude_body(&extract_request(CLAUDE_FORCING));
     // Anthropic forced-tool format: {"type":"tool","name":"extract"}
     assert_eq!(
         body["tool_choice"]["type"], "tool",
@@ -107,18 +114,30 @@ fn claude_tool_choice_forces_extract_tool() {
     );
 }
 
+#[test]
+fn claude_opus_and_sonnet_5_5_get_auto_tool_choice_for_extract() {
+    for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+        let body = claude_body(&extract_request(model));
+        assert_eq!(
+            body["tool_choice"]["type"], "auto",
+            "{model} rejects forced tool choice; body={body:#}"
+        );
+        assert_eq!(claude_extract_tool(&body)["name"], "extract");
+    }
+}
+
 // ── OpenAI assertions ─────────────────────────────────────────────────────────
 
 #[test]
 fn openai_extract_function_name_is_extract() {
-    let body = openai_body(&extract_request());
+    let body = openai_body(&extract_request(OPENAI_MODEL));
     let function = openai_extract_function(&body);
     assert_eq!(function["function"]["name"], "extract");
 }
 
 #[test]
 fn openai_extract_function_parameters_match_user_schema() {
-    let body = openai_body(&extract_request());
+    let body = openai_body(&extract_request(OPENAI_MODEL));
     let function = openai_extract_function(&body);
     // OpenAI uses `parameters` for the JSON Schema object.
     let parameters = &function["function"]["parameters"];
@@ -131,7 +150,7 @@ fn openai_extract_function_parameters_match_user_schema() {
 
 #[test]
 fn openai_tool_choice_forces_extract_function() {
-    let body = openai_body(&extract_request());
+    let body = openai_body(&extract_request(OPENAI_MODEL));
     // OpenAI forced-function format: {"type":"function","function":{"name":"extract"}}
     assert_eq!(
         body["tool_choice"]["type"], "function",

@@ -10,6 +10,7 @@
 //! condition fires, a middleware stops, or it is cancelled (drop the run / cancel
 //! the token).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,10 @@ use crate::message::{
     AssistantContent, Message, SystemPrompt, Thinking, ToolResultPart, UserContent,
 };
 use crate::middleware::AgentMiddleware;
-use crate::provider::{ChatRequest, Provider, StopReason, StreamEvent, ToolChoice, ToolDef};
+use crate::provider::{
+    ChatRequest, MAX_STREAM_BLOCK_BYTES, MAX_STREAM_RESPONSE_BLOCKS, MAX_STREAM_RESPONSE_BYTES,
+    Provider, StopReason, StreamEvent, ToolChoice, ToolDef, assistant_content_bytes,
+};
 use crate::retry::RetryPolicy;
 use crate::skill::{Skill, SkillLoader};
 use crate::tool::{Tool, ToolDyn, TypedTool};
@@ -49,6 +53,68 @@ const CANCELLED_TOOL_RESULT: &str = "tool call cancelled: run stopped";
 
 /// A closure producing a prompt-cache key from the app context.
 type CacheKeyFn<Ctx> = Arc<dyn Fn(&Ctx) -> Option<Arc<str>> + Send + Sync>;
+
+/// A completed provider response must explicitly authorize its queued tools.
+const fn terminal_failure(stop: &StopReason, has_tools: bool) -> Option<&'static str> {
+    match stop {
+        StopReason::ToolUse if has_tools => None,
+        StopReason::EndTurn | StopReason::StopSequence(_) if !has_tools => None,
+        StopReason::Refusal => Some("provider refused the request"),
+        StopReason::MaxTokens => Some("provider reached its output limit"),
+        StopReason::Pause => Some("provider paused the turn"),
+        StopReason::Other(_) => Some("provider returned an unsupported stop reason"),
+        StopReason::ToolUse => Some("provider requested tools without any tool calls"),
+        StopReason::EndTurn | StopReason::StopSequence(_) => {
+            Some("provider stopped without authorizing its tool calls")
+        }
+    }
+}
+
+/// Signed history attests to this request context and its unchanged prefix.
+/// Appending tool results and later turns is safe; rewriting the bound prefix is not.
+struct ReplayBinding {
+    model: String,
+    system: Option<SystemPrompt>,
+    tools: Arc<[ToolDef]>,
+    messages: Vec<Message>,
+}
+
+impl ReplayBinding {
+    fn from_request(request: &ChatRequest) -> Self {
+        Self {
+            model: request.model.clone(),
+            system: request.system.clone(),
+            tools: Arc::clone(&request.tools),
+            messages: request.messages.clone(),
+        }
+    }
+
+    fn accepts(&self, request: &ChatRequest) -> bool {
+        self.model == request.model
+            && self.system == request.system
+            && self.tools == request.tools
+            && request.messages.starts_with(&self.messages)
+    }
+}
+
+const fn is_signed(content: &AssistantContent) -> bool {
+    matches!(
+        content,
+        AssistantContent::Thinking(
+            Thinking::Visible {
+                signature: Some(_),
+                ..
+            } | Thinking::Redacted { .. }
+        )
+    )
+}
+
+fn has_signed_history(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        matches!(message,
+        Message::Assistant(blocks) if blocks.iter().any(is_signed))
+    })
+}
 
 /// A stateful agent session.
 ///
@@ -70,11 +136,14 @@ pub struct Agent<Ctx> {
     middleware: Vec<Box<dyn AgentMiddleware<Ctx>>>,
     system: Option<String>,
     messages: Vec<Message>,
+    replay_binding: Option<ReplayBinding>,
     cache: CacheStrategy,
     cache_key: Option<CacheKeyFn<Ctx>>,
     retry: RetryPolicy,
     pricing: Pricing,
     usage: Usage,
+    /// Sum of request costs; never reprice earlier requests when model/tier changes.
+    total_cost: Option<f64>,
     max_tokens: u32,
     cancel: CancelToken,
 }
@@ -96,11 +165,13 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
             middleware: Vec::new(),
             system: None,
             messages: Vec::new(),
+            replay_binding: None,
             cache: CacheStrategy::Auto,
             cache_key: None,
             retry: RetryPolicy::default(),
             pricing: Pricing::new(),
             usage: Usage::default(),
+            total_cost: Some(0.0),
             max_tokens: 4096,
             cancel: CancelToken::new(),
         }
@@ -172,6 +243,11 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
     }
 
     /// Seeds the conversation (e.g. the new turn).
+    ///
+    /// Signed or redacted history attests that the caller supplied the original
+    /// model, system prompt and tools. The provider verifies its signatures.
+    /// After `on_start` loads history, this agent freezes that context and prefix
+    /// against later mutation; appending new turns remains supported.
     #[must_use]
     pub fn with_context(mut self, messages: Vec<Message>) -> Self {
         self.messages = messages;
@@ -241,6 +317,34 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
         &self.messages
     }
 
+    /// Accumulated cost, unknown if a consumed request or current model is unpriced.
+    fn current_cost(&self) -> Option<f64> {
+        self.total_cost
+            .filter(|_| self.pricing.price(&self.current_model).is_some())
+    }
+
+    /// Meter a single request at its own model and prompt-size rate.
+    fn record_usage(&mut self, usage: &Usage) -> Option<f64> {
+        let cost = self.pricing.cost(&self.current_model, usage);
+        self.total_cost = self.total_cost.zip(cost).map(|(total, step)| total + step);
+        self.usage.merge(usage);
+        cost
+    }
+
+    /// Keep interrupted text and usage, but never checkpoint uncompleted tool
+    /// or signed-thinking blocks into a conversation that may be resumed.
+    fn record_partial(&mut self, step: &StepAccum, final_text: &mut String) {
+        let _ = self.record_usage(&step.partial_usage());
+        if step.text.is_empty() {
+            return;
+        }
+        self.messages
+            .push(Message::Assistant(vec![AssistantContent::Text(Arc::from(
+                step.text.as_str(),
+            ))]));
+        final_text.clone_from(&step.text);
+    }
+
     /// Accumulated token usage across runs.
     #[must_use]
     pub const fn usage(&self) -> &Usage {
@@ -305,12 +409,13 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
 
             let mut total_steps: u32 = 0;
             let mut final_text = String::new();
+            let mut keep_partial_text = false;
             // The terminal finish; every exit path below assigns it before use.
             let finish: Finish;
 
             macro_rules! cost_now {
                 () => {
-                    self.pricing.cost(&self.current_model, &self.usage)
+                    self.current_cost()
                 };
             }
 
@@ -376,6 +481,14 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                     }
                 }
 
+                // Loading signed history is a caller-owned provenance boundary.
+                // Once loading ends, later middleware must preserve its context.
+                if self.replay_binding.is_none() && has_signed_history(&self.messages) {
+                    self.replay_binding = Some(ReplayBinding::from_request(&self.build_request(
+                        run_tools.clone(), self.build_system(), run_cache_key.clone(),
+                    )));
+                }
+
                 // ── Step loop ──────────────────────────────────────────────
                 let mut last_step: Option<Step> = None;
                 loop {
@@ -431,6 +544,20 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                         break 'run;
                     };
 
+                    if let Err(error) = request.validate_cache(&provider.cache_capabilities_for(&request.model)) {
+                        finish = Finish::Stopped { message: Some(format!("provider error: {error}")) };
+                        break 'run;
+                    }
+
+                    if self.replay_binding.as_ref().is_some_and(|binding| !binding.accepts(&request)) {
+                        keep_partial_text = true;
+                        finish = Finish::Stopped {
+                            message: Some("signed assistant context was changed; original model, system, tools and message prefix are required".into()),
+                        };
+                        break 'run;
+                    }
+                    let mut replay_context = ReplayBinding::from_request(&request);
+
                     // Acquire the provider stream with retry + per-attempt
                     // timeout (no events have been yielded yet, so retry is
                     // safe). Once events flow they are forwarded live below.
@@ -445,7 +572,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                         AcquireOutcome::Cancelled { prompt_tokens } => {
                             // A request already in flight may be billed: meter
                             // its estimated prompt (0 when none was sent).
-                            self.usage.merge(&Usage {
+                            let _ = self.record_usage(&Usage {
                                 input_tokens: prompt_tokens,
                                 ..Usage::default()
                             });
@@ -493,32 +620,74 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                         if let Some(delta) = acc.apply(event) {
                             yield delta;
                         }
+                        if acc.stop.is_some() || acc.protocol_error.is_some() {
+                            break;
+                        }
                     }
+
+                    acc.capture_complete_text();
 
                     // A step cut short still used its prompt (and whatever it
                     // streamed): meter it, or stopping every reply early would
                     // spend without ever counting.
                     if cancelled {
-                        self.usage.merge(&acc.partial_usage());
+                        self.record_partial(&acc, &mut final_text);
                         finish = Finish::Cancelled;
                         break 'run;
                     }
                     if let Some(e) = step_error {
-                        self.usage.merge(&acc.partial_usage());
+                        self.record_partial(&acc, &mut final_text);
+                        keep_partial_text = true;
                         finish = Finish::Stopped {
                             message: Some(format!("provider error: {e}")),
                         };
                         break 'run;
                     }
 
+                    if let Some(message) = acc.validate_blocks() {
+                        self.record_partial(&acc, &mut final_text);
+                        keep_partial_text = true;
+                        finish = Finish::Stopped { message: Some(message.into()) };
+                        break 'run;
+                    }
+                    let Some(stop_reason) = acc.stop.take() else {
+                        self.record_partial(&acc, &mut final_text);
+                        keep_partial_text = true;
+                        finish = Finish::Stopped {
+                            message: Some("provider stream ended before its terminal event".into()),
+                        };
+                        break 'run;
+                    };
+                    let terminal_failure = terminal_failure(&stop_reason, !acc.tool_calls.is_empty());
+                    if terminal_failure.is_some() {
+                        acc.tool_calls.clear();
+                        acc.reasoning.clear();
+                        acc.saw_signature = false;
+                        acc.complete_blocks.clear();
+                    }
                     let StepAccum {
                         text,
                         reasoning,
-                        signature,
                         tool_calls,
                         step_usage,
-                        stop,
+                        complete_blocks,
+                        ..
                     } = acc;
+
+                    let (text, reasoning) = if complete_blocks.is_empty() {
+                        (text, reasoning)
+                    } else {
+                        let mut text = String::new();
+                        let mut reasoning = String::new();
+                        for block in complete_blocks.values() {
+                            match block {
+                                AssistantContent::Text(value) => text.push_str(value),
+                                AssistantContent::Thinking(Thinking::Visible { text, .. }) => reasoning.push_str(text),
+                                _ => {}
+                            }
+                        }
+                        (text, reasoning)
+                    };
 
                     // Convert the accumulated text/reasoning to `Arc<str>` ONCE,
                     // then share that `Arc` across the assistant block, the `Step`
@@ -534,7 +703,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                     if let Some(reasoning) = &reasoning_arc {
                         blocks.push(AssistantContent::Thinking(Thinking::Visible {
                             text: Arc::clone(reasoning),
-                            signature: signature.map(Into::into),
+                            signature: None,
                         }));
                     }
                     if let Some(text) = &text_arc {
@@ -552,12 +721,19 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                     // step (no text/reasoning/tool calls) would otherwise push
                     // `Assistant(vec![])`, which an `on_step_done` checkpoint would
                     // persist — some providers 400 on resending an empty turn.
+                    if !complete_blocks.is_empty() {
+                        blocks = complete_blocks.into_values().collect();
+                    }
+                    let signed_response = blocks.iter().any(is_signed);
                     if !blocks.is_empty() {
                         self.messages.push(Message::Assistant(blocks));
                     }
+                    if signed_response {
+                        replay_context.messages.clone_from(&self.messages);
+                        self.replay_binding = Some(replay_context);
+                    }
 
-                    self.usage.merge(&step_usage);
-                    let step_cost = self.pricing.cost(&self.current_model, &step_usage);
+                    let step_cost = self.record_usage(&step_usage);
 
                     // ── Tool calls ─────────────────────────────────────────
                     // Every `tool_use` id in this assistant turn, captured before
@@ -687,7 +863,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                         reasoning: reasoning_arc.clone(),
                         text: Arc::clone(&step_text),
                         tool_calls: records,
-                        stop: stop.clone(),
+                        stop: stop_reason.clone(),
                     };
                     total_steps += 1;
 
@@ -730,6 +906,12 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
                         break 'run;
                     }
 
+                    if let Some(message) = terminal_failure {
+                        keep_partial_text = true;
+                        finish = Finish::Stopped { message: Some(message.into()) };
+                        break 'run;
+                    }
+
                     // No tool calls → the model ended its turn.
                     if !had_tool_calls {
                         finish = Finish::EndTurn;
@@ -749,6 +931,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
             run_on_finish(&mw, started, self, total_steps).await;
 
             let text = match &finish {
+                _ if keep_partial_text && !final_text.is_empty() => final_text,
                 Finish::Stopped { message } => message.clone().unwrap_or_else(|| final_text.clone()),
                 _ => final_text,
             };
@@ -761,7 +944,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
 
     /// Constructs a fresh middleware context borrowing the agent's run state.
     fn agent_cx<'b>(&'b mut self, index: u32, last_step: Option<&'b Step>) -> AgentCx<'b, Ctx> {
-        let cost = self.pricing.cost(&self.current_model, &self.usage);
+        let cost = self.current_cost();
         AgentCx::new(
             &self.ctx,
             &mut self.messages,
@@ -1062,17 +1245,40 @@ impl ParsedCall {
 struct StepAccum {
     text: String,
     reasoning: String,
-    signature: Option<String>,
+    saw_signature: bool,
     tool_calls: Vec<ParsedCall>,
     step_usage: Usage,
-    stop: StopReason,
+    stop: Option<StopReason>,
+    complete_blocks: BTreeMap<u64, AssistantContent>,
+    complete_bytes: usize,
+    delta_bytes: usize,
+    protocol_error: Option<&'static str>,
 }
 
 impl StepAccum {
     /// Folds one event into the accumulator, returning a delta to yield live.
     fn apply(&mut self, event: StreamEvent) -> Option<AgentEvent> {
+        let delta_bytes = match &event {
+            StreamEvent::TextDelta(text)
+            | StreamEvent::ReasoningDelta(text)
+            | StreamEvent::SignatureDelta(text) => text.len(),
+            StreamEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => id
+                .len()
+                .saturating_add(name.len())
+                .saturating_add(arguments.len()),
+            _ => 0,
+        };
+        self.delta_bytes = self.delta_bytes.saturating_add(delta_bytes);
+        if delta_bytes > MAX_STREAM_BLOCK_BYTES || self.delta_bytes > MAX_STREAM_RESPONSE_BYTES {
+            self.protocol_error = Some("provider response exceeded its content limit");
+            return None;
+        }
         match event {
-            StreamEvent::Start { usage } => {
+            StreamEvent::Start { usage } | StreamEvent::Usage { usage } => {
                 self.step_usage = usage;
                 None
             }
@@ -1084,8 +1290,25 @@ impl StepAccum {
                 self.reasoning.push_str(&t);
                 Some(AgentEvent::ReasoningDelta(t))
             }
-            StreamEvent::SignatureDelta(s) => {
-                self.signature.get_or_insert_with(String::new).push_str(&s);
+            StreamEvent::SignatureDelta(_) => {
+                // Unindexed fragments cannot safely be attributed to blocks.
+                // Complete blocks carry exact signatures; this is only a marker.
+                self.saw_signature = true;
+                None
+            }
+            StreamEvent::AssistantBlock { index, content } => {
+                let bytes = assistant_content_bytes(&content);
+                self.complete_bytes = self.complete_bytes.saturating_add(bytes);
+                if bytes > MAX_STREAM_BLOCK_BYTES
+                    || self.complete_bytes > MAX_STREAM_RESPONSE_BYTES
+                    || self.complete_blocks.len() >= MAX_STREAM_RESPONSE_BLOCKS
+                    || self.complete_blocks.contains_key(&index)
+                {
+                    self.protocol_error =
+                        Some("provider returned duplicate or oversized assistant blocks");
+                } else {
+                    self.complete_blocks.insert(index, content);
+                }
                 None
             }
             StreamEvent::ToolCall {
@@ -1093,17 +1316,85 @@ impl StepAccum {
                 name,
                 arguments,
             } => {
+                if self.tool_calls.len() >= MAX_STREAM_RESPONSE_BLOCKS {
+                    self.protocol_error = Some("provider returned too many tool calls");
+                    return None;
+                }
                 let call = ParsedCall::parse(id.clone(), name.clone(), &arguments);
                 let args = call.args.clone();
                 self.tool_calls.push(call);
                 Some(AgentEvent::ToolCall { id, name, args })
             }
             StreamEvent::End { stop, usage } => {
-                self.stop = stop;
+                self.stop = Some(stop);
                 self.step_usage = usage;
                 None
             }
         }
+    }
+
+    /// Complete-only providers need no duplicate text deltas. On interruption,
+    /// keep their useful text while withholding incomplete tools and reasoning.
+    fn capture_complete_text(&mut self) {
+        if self.text.is_empty() {
+            for block in self.complete_blocks.values() {
+                if let AssistantContent::Text(text) = block {
+                    self.text.push_str(text);
+                }
+            }
+        }
+        if self.reasoning.is_empty() {
+            for block in self.complete_blocks.values() {
+                if let AssistantContent::Thinking(Thinking::Visible { text, .. }) = block {
+                    self.reasoning.push_str(text);
+                }
+            }
+        }
+    }
+
+    /// Complete blocks are authoritative replay data, never reconstructed from
+    /// unindexed reasoning/signature deltas. A partial protocol cannot run tools.
+    fn validate_blocks(&mut self) -> Option<&'static str> {
+        if self.protocol_error.is_some() {
+            return self.protocol_error;
+        }
+        if self.saw_signature && !self.complete_blocks.values().any(is_signed) {
+            return Some("signed provider output requires complete assistant blocks");
+        }
+        if self.complete_blocks.is_empty() {
+            return None;
+        }
+        for (expected, index) in (0_u64..).zip(self.complete_blocks.keys()) {
+            if expected != *index {
+                return Some("provider returned incomplete assistant block indices");
+            }
+        }
+        let mut ordered_calls = Vec::new();
+        for block in self.complete_blocks.values() {
+            if let AssistantContent::ToolUse { id, name, input } = block {
+                if ordered_calls
+                    .iter()
+                    .any(|call: &ParsedCall| call.id == **id)
+                {
+                    return Some("provider returned duplicate tool call ids");
+                }
+                let Some(position) = self.tool_calls.iter().position(|call| {
+                    call.id == **id
+                        && call.name == **name
+                        && call.args == *input
+                        && call.parse_error.is_none()
+                }) else {
+                    return Some("complete assistant tool block does not match its tool call");
+                };
+                ordered_calls.push(self.tool_calls.remove(position));
+            }
+        }
+        if !self.tool_calls.is_empty() {
+            // Retain no partial complete-block protocol in resumable history.
+            return Some("provider omitted complete assistant tool blocks");
+        }
+        self.tool_calls = ordered_calls;
+        None
     }
 
     /// What a step cut short (stopped, or failed mid-stream) used: the
@@ -1119,6 +1410,19 @@ impl StepAccum {
             ..self.step_usage
         }
     }
+}
+
+/// Reuse the production replay checks in the offline provider contract, so a
+/// provider cannot pass conformance with blocks the agent would reject.
+pub(crate) fn validate_stream_replay(events: &[StreamEvent]) -> Option<&'static str> {
+    let mut step = StepAccum::default();
+    for event in events {
+        let _ = step.apply(event.clone());
+        if step.protocol_error.is_some() {
+            return step.protocol_error;
+        }
+    }
+    step.validate_blocks()
 }
 
 /// Bytes per token in the rough estimates used where a provider reported no
@@ -1197,10 +1501,11 @@ enum AcquireOutcome {
 /// with backoff. No tokens are emitted before this returns.
 async fn acquire_stream(
     provider: &dyn Provider,
-    request: ChatRequest,
+    mut request: ChatRequest,
     retry: &RetryPolicy,
     cancel: &CancelToken,
 ) -> AcquireOutcome {
+    request.fit_to(&provider.capabilities_for(&request.model));
     let attempts = retry.max_retries.saturating_add(1);
     let mut last_err: Option<crate::error::ProviderError> = None;
     // The classification of the most recent failure decides the next delay (so a
@@ -1256,15 +1561,11 @@ async fn acquire_stream(
             }
             Ok(Ok((first, stream))) => match first {
                 None => {
-                    // Empty stream: nothing to retry on; treat as a clean,
-                    // empty step by synthesizing an End.
-                    return AcquireOutcome::Ready {
-                        first: StreamEvent::End {
-                            stop: StopReason::EndTurn,
-                            usage: Usage::default(),
-                        },
-                        stream,
-                    };
+                    // An accepted but empty response is incomplete, never an
+                    // implicit success or an automatically retried safety turn.
+                    return AcquireOutcome::Error(crate::error::ProviderError::Transport(
+                        "provider stream ended before its terminal event".into(),
+                    ));
                 }
                 Some(Ok(ev)) => return AcquireOutcome::Ready { first: ev, stream },
                 Some(Err(e)) => {

@@ -23,6 +23,9 @@ use crate::cx::ToolCx;
 use crate::error::ToolError;
 use crate::provider::ToolDef;
 
+mod no_args;
+pub use no_args::NoToolArgs;
+
 /// A strongly-typed, context-aware tool.
 ///
 /// Usually produced by `#[tool]`, but hand-implementable. `Args` derives

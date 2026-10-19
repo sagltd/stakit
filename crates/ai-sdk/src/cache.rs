@@ -1,33 +1,34 @@
-//! Prompt-cache strategy.
+//! Prompt-cache controls shared by provider adapters.
 //!
-//! Both major providers cache server-side: Anthropic via explicit
-//! `cache_control` breakpoints, `OpenAI` automatically over a stable prefix. The
-//! SDK does not build its own token cache — it keeps a stable, append-only
-//! prefix and (for Anthropic) places breakpoints per this strategy. On
-//! providers with automatic caching the strategy is a no-op, but cache hits
-//! still surface uniformly via [`Usage::cache_read_tokens`](crate::Usage).
+//! The SDK does not build a token cache. Adapters declare the implicit caching
+//! and explicit breakpoint controls they actually implement using
+//! [`CacheCapabilities`]. Eligibility, retention and cache hits remain under
+//! the provider's control. In particular, [`CacheStrategy::Off`] suppresses
+//! explicit markers; it does not promise to disable provider-managed caching.
+//! Hits surface uniformly via [`Usage::cache_read_tokens`](crate::Usage).
 
 use serde::{Deserialize, Serialize};
+
+mod capabilities;
+pub use capabilities::{CacheCapabilities, ExplicitCacheCapabilities};
 
 /// How prompt caching is applied to a request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CacheStrategy {
-    /// No explicit caching.
+    /// No explicit caching, including author-supplied cache markers.
+    /// Provider-managed implicit caching may still occur.
     Off,
-    /// Automatically place cache breakpoints (the default; maximizes cache hits
-    /// with zero configuration).
+    /// Use the adapter's best available caching behavior (the default).
     ///
-    /// **Claude:** up to three breakpoints are placed in priority order — after
-    /// tool definitions (if any), after the system prompt (if any), and rolling
-    /// on the previous-turn boundary — subject to the provider's 4-breakpoint
-    /// cap.
-    ///
-    /// **`OpenAI`:** a stable `prompt_cache_key` is derived from the session and
-    /// the provider caches the prefix automatically; no explicit breakpoints are
-    /// written.
+    /// An adapter may place explicit breakpoints, use implicit prefix caching,
+    /// or have no cache support. This is not a cache-hit or retention guarantee.
     #[default]
     Auto,
     /// Place explicit breakpoints at the given targets.
+    ///
+    /// Requires declared explicit support for this TTL; unsupported controls
+    /// return an error before transport. Targets beyond the declared maximum
+    /// may be capped in the adapter's documented priority order.
     Breakpoints {
         /// Cache lifetime for the written entries.
         ttl: CacheTtl,
@@ -39,10 +40,12 @@ pub enum CacheStrategy {
 /// Prompt-cache entry lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CacheTtl {
-    /// Five-minute cache (cheaper writes).
+    /// Five-minute explicit cache, only where the adapter declares support.
     #[default]
     FiveMin,
-    /// One-hour cache (more expensive writes, longer reuse).
+    /// Thirty-minute explicit cache, only where the adapter declares support.
+    ThirtyMin,
+    /// One-hour explicit cache, only where the adapter declares support.
     OneHour,
 }
 

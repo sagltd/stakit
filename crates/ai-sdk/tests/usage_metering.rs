@@ -17,6 +17,7 @@ const START_USAGE: Usage = Usage {
     input_tokens: 1_000,
     output_tokens: 1,
     cache_create_tokens: 0,
+    cache_create_1h_tokens: 0,
     cache_read_tokens: 500,
     reasoning_tokens: 0,
 };

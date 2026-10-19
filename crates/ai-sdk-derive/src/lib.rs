@@ -13,7 +13,9 @@
 //! `#[tool(name = "…")]`); the description defaults to the function's
 //! doc-comment (override with `#[tool(description = "…")]`). A tool without a
 //! `cx` parameter is implemented generically over any context type. The
-//! arguments type must derive `Model` + `JsonSchema`.
+//! arguments type must derive `Model` + `JsonSchema`. Functions without an
+//! arguments parameter use the SDK's empty object `NoToolArgs`, so provider
+//! function schemas and runtime decoding agree on `{}`.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -111,7 +113,7 @@ fn expand(func: &ItemFn, args: &ToolArgs) -> syn::Result<proc_macro2::TokenStrea
     let cx_bind = cx.as_ref().map_or_else(|| quote!(_cx), |(p, _)| quote!(#p));
     let (args_ty, args_bind) = match &params {
         Some((p, ty)) => (quote!(#ty), quote!(#p)),
-        None => (quote!(()), quote!(_args)),
+        None => (quote!(::stakit_ai_sdk::NoToolArgs), quote!(_args)),
     };
 
     let (impl_header, ctx_ty) = match &cx {

@@ -14,12 +14,44 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AssistantContent, CacheStrategy, Message, ProviderError, SystemPrompt, Usage};
+use crate::{
+    AssistantContent, CacheCapabilities, CacheStrategy, Message, ProviderError, SystemPrompt, Usage,
+};
 
+mod capabilities;
 #[cfg(feature = "claude")]
 pub(crate) mod claude;
 #[cfg(feature = "openai")]
 pub(crate) mod openai;
+#[cfg(any(feature = "claude", feature = "openai"))]
+mod sse;
+
+pub use capabilities::{ProviderCapabilities, ThinkingSupport};
+
+/// Maximum bytes retained for one complete streamed assistant block.
+pub(crate) const MAX_STREAM_BLOCK_BYTES: usize = 1024 * 1024;
+/// Maximum complete assistant content retained for one response.
+pub(crate) const MAX_STREAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum concurrently open provider content blocks.
+#[cfg(any(feature = "claude", feature = "openai"))]
+pub(crate) const MAX_STREAM_OPEN_BLOCKS: usize = 64;
+/// Maximum complete blocks in one response, including empty blocks.
+pub(crate) const MAX_STREAM_RESPONSE_BLOCKS: usize = 1024;
+
+/// Exact content bytes retained for replay (including opaque signatures).
+pub(crate) fn assistant_content_bytes(content: &AssistantContent) -> usize {
+    match content {
+        AssistantContent::Text(text) => text.len(),
+        AssistantContent::Thinking(crate::Thinking::Visible { text, signature }) => text
+            .len()
+            .saturating_add(signature.as_ref().map_or(0, |value| value.len())),
+        AssistantContent::Thinking(crate::Thinking::Redacted { data }) => data.len(),
+        AssistantContent::ToolUse { id, name, input } => id
+            .len()
+            .saturating_add(name.len())
+            .saturating_add(input.to_string().len()),
+    }
+}
 
 /// A tool definition as sent to the provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,15 +97,20 @@ pub enum ToolChoice {
     Tool(String),
 }
 
-/// Extended-thinking / reasoning configuration.
+/// Extended-thinking / reasoning configuration, fitted to each model's
+/// [`ThinkingSupport`] before sending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ThinkingConfig {
-    /// No extended thinking.
+    /// No extended thinking, where the model allows it. Models whose thinking
+    /// cannot be turned off (Claude Opus 5.5, Fable, Mythos) run at their
+    /// lowest setting instead; lower the effort there (`output_config.effort`
+    /// through [`ChatRequest::extra`]) to think less.
     #[default]
     Off,
-    /// Enable with a provider-chosen budget.
+    /// The model decides how much to think (adaptive thinking).
     Adaptive,
-    /// Enable with an explicit token budget.
+    /// An explicit token budget (budget-style models; adaptive models treat it
+    /// as [`ThinkingConfig::Adaptive`]).
     Budget(u32),
 }
 
@@ -125,16 +162,25 @@ pub struct ChatRequest {
     /// Prompt-cache strategy.
     pub cache: CacheStrategy,
     /// Opaque cache-routing key for this conversation. Providers with
-    /// key-routed automatic caching (e.g. `OpenAI`'s `prompt_cache_key`) use it
-    /// to pin one conversation to a single cache shard so a shared prefix keeps
-    /// hitting across many concurrent users. `None` lets the provider route by
-    /// content alone.
+    /// key-routed caching (e.g. `OpenAI`'s `prompt_cache_key`) can use it to
+    /// scope cache accounting and, on some models, influence routing. Cache hits
+    /// still depend on provider capacity and prefix matching. `None` uses the
+    /// provider's default routing and accounting scope.
     pub cache_key: Option<Arc<str>>,
     /// Raw per-provider passthrough merged into the request body.
     pub extra: serde_json::Map<String, Value>,
 }
 
 impl ChatRequest {
+    /// Validates explicit cache controls against the selected model's adapter.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::InvalidArgument`] instead of silently changing
+    /// unsupported explicit cache modes or lifetimes.
+    pub fn validate_cache(&self, capabilities: &CacheCapabilities) -> Result<(), ProviderError> {
+        capabilities.validate(&self.cache)
+    }
+
     /// A request for `model` with sensible defaults (4096 max tokens, auto
     /// tool-choice, auto caching).
     pub fn new(model: impl Into<String>) -> Self {
@@ -156,22 +202,38 @@ impl ChatRequest {
 }
 
 /// A non-streamed provider response.
+///
+/// A successful response contains observed, final mandatory input and output
+/// usage for all returned content. Missing or partial counters are a provider
+/// error, not a zero-cost response. An explicit zero is valid only when it was
+/// actually observed from the backend.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
     /// Normalized assistant output blocks.
     pub content: Vec<AssistantContent>,
     /// Why generation stopped.
     pub stop: StopReason,
-    /// Token usage for this request.
+    /// Observed final normalized usage for this entire request.
     pub usage: Usage,
 }
 
 /// A normalized streaming event.
+///
+/// Start and progress tallies may be partial. Only a valid terminal
+/// [`StreamEvent::End`] certifies final usage; a default or synthetic zero tally
+/// does not establish that the backend reported zero usage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     /// Stream opened; carries the initial (input) usage where available.
     Start {
         /// Partial usage known at start (e.g. input tokens).
+        usage: Usage,
+    },
+    /// Latest cumulative usage known during this response. Progress metadata
+    /// does not complete the response or authorize queued tools. Providers
+    /// retain previously known counts when a wire delta omits those fields.
+    Usage {
+        /// Full normalized tally so far; replaces, rather than adds to, prior usage.
         usage: Usage,
     },
     /// A chunk of assistant text.
@@ -180,7 +242,21 @@ pub enum StreamEvent {
     ReasoningDelta(String),
     /// A reasoning integrity signature chunk (Anthropic).
     SignatureDelta(String),
+    /// One complete assistant block, with its original response position.
+    ///
+    /// Providers emitting these events must supply every replay block. Deltas
+    /// still drive live output; complete blocks preserve exact ordering and
+    /// integrity signatures, including empty signed and redacted reasoning.
+    AssistantBlock {
+        /// Original zero-based position in the assistant response.
+        index: u64,
+        /// Complete replayable content, unchanged from the provider.
+        content: AssistantContent,
+    },
     /// A complete tool call (argument fragments are accumulated internally).
+    ///
+    /// This queues a candidate call; it does not authorize tool execution. The
+    /// agent must wait for a valid terminal [`StreamEvent::End`].
     ToolCall {
         /// Tool-call id.
         id: String,
@@ -194,6 +270,13 @@ pub enum StreamEvent {
         arguments: String,
     },
     /// Stream finished; carries the stop reason and final cumulative usage.
+    ///
+    /// Every content block must be closed, and this tally must cover all content
+    /// emitted by this response, including tool arguments and reasoning where
+    /// the backend counts them. Mandatory input and output counters must be
+    /// observed and final. Emit an error instead of this event when that cannot
+    /// be established; an EOF, partial tally or synthetic zero is not completion.
+    /// No content or tool-call events may follow this event.
     End {
         /// Why generation stopped.
         stop: StopReason,
@@ -220,13 +303,27 @@ pub fn event_stream(events: Vec<Result<StreamEvent, ProviderError>>) -> EventStr
 /// instead of hanging forever (streams send keep-alive pings well within it;
 /// generous enough for a long non-streamed completion).
 #[cfg(any(feature = "claude", feature = "openai"))]
-pub(crate) fn http_client() -> reqwest::Client {
+pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+        // The application owns attempt authorization, including protocol NACKs.
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_secs(300))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
 }
+
+#[cfg(any(feature = "claude", feature = "openai"))]
+pub(crate) fn http_client() -> Option<reqwest::Client> {
+    // Never replace a failed configured client with one that restores retries.
+    http_client_builder().build().ok()
+}
+
+#[cfg(all(test, any(feature = "claude", feature = "openai")))]
+#[path = "provider/http_client_test.rs"]
+mod http_client_test;
+
+#[cfg(all(test, feature = "claude", feature = "openai"))]
+mod redirect_test;
 
 /// Parses the `Retry-After` response header (delta-seconds form) into a
 /// [`Duration`](std::time::Duration). HTTP-date forms and unparseable values
@@ -247,17 +344,71 @@ pub(crate) fn parse_retry_after(
 
 /// A chat-completion backend. Object-safe so the agent can hold
 /// `Box<dyn Provider>` and switch providers at runtime.
+///
+/// A new backend maps the unified request/response to its wire format and
+/// declares [`capabilities`](Provider::capabilities) and implemented
+/// [`cache_capabilities`](Provider::cache_capabilities); shared callers use the
+/// request-model variants. Adapters also call [`ChatRequest::validate_cache`]
+/// before direct `complete`/`stream` transport so unsupported explicit controls
+/// cannot be silently dropped. `test_support::contract` checks the promises
+/// the agent loop relies on.
+///
+/// # Completion and usage contract
+///
+/// Built-in and custom implementations must return [`ChatResponse`] success or
+/// emit [`StreamEvent::End`] only after observing final mandatory input and
+/// output counters for the entire response. Normalize counters into [`Usage`]
+/// without inventing missing values. Explicit zero counters are accepted only
+/// as actual backend evidence; partial progress and [`Usage::default()`] do not
+/// prove final zero usage. If final counters or stream completion are missing,
+/// return a [`ProviderError`] and preserve any already emitted progress instead
+/// of certifying success. The agent must not execute queued tools before a valid
+/// terminal `End`. These obligations do not require additional public flags.
+///
+/// Final counters need not all appear in the last wire frame: earlier observed
+/// input may be retained when the backend protocol establishes it is final for
+/// the whole response. Final output must cover the last emitted content; an
+/// earlier partial output tally cannot stand in for that final evidence.
+///
+/// The numeric [`Usage`] value alone cannot prove where its counts came from;
+/// custom adapters are responsible for enforcing this boundary.
 pub trait Provider: Send + Sync {
     /// The model id this provider serves (registry key).
     fn model_id(&self) -> &str;
 
-    /// One non-streaming completion.
+    /// What this provider's model accepts. The agent loop and [`LLM`](crate::LLM)
+    /// fit every request to it ([`ChatRequest::fit_to`]); the default takes the
+    /// unified request as it is (see [`ProviderCapabilities::default`]).
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
+
+    /// Capabilities for the model selected on a request. Providers that allow
+    /// overriding their bound model should resolve that model here; fixed-model
+    /// providers can keep the default. Shared callers use this method so an
+    /// [`LLM::model`](crate::LLM::model) override cannot apply the wrong rules.
+    fn capabilities_for(&self, _model: &str) -> ProviderCapabilities {
+        self.capabilities()
+    }
+
+    /// Cache controls implemented for the bound model. The default preserves
+    /// source compatibility while making no unsupported caching guarantees.
+    fn cache_capabilities(&self) -> CacheCapabilities {
+        CacheCapabilities::Unknown
+    }
+
+    /// Cache controls for the actual request model (including model overrides).
+    fn cache_capabilities_for(&self, _model: &str) -> CacheCapabilities {
+        self.cache_capabilities()
+    }
+
+    /// One non-streaming completion with observed final usage on success.
     fn complete(
         &self,
         req: ChatRequest,
     ) -> futures::future::BoxFuture<'_, Result<ChatResponse, ProviderError>>;
 
-    /// A streaming completion.
+    /// A streaming completion obeying the terminal [`StreamEvent::End`] contract.
     fn stream(
         &self,
         req: ChatRequest,

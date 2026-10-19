@@ -1,16 +1,16 @@
 //! Offline prompt-cache tests: build provider request bodies and assert on the
 //! resulting JSON (no network).
 //!
-//! These prove the scale-correct caching behavior from the design (§12):
-//! Claude `Auto` breakpoint placement (tools → system → a rolling previous-turn
-//! breakpoint), the `OpenAI` `prompt_cache_key`, and — critically — that the
+//! These validate cache request shapes and prefix stability from the design (§12):
+//! Claude `Auto` breakpoint placement (tools → system → a rolling breakpoint on
+//! the newest message), the `OpenAI` `prompt_cache_key`, and — critically — that the
 //! shared tools+system prefix is byte-identical across users and stable as a
 //! conversation grows, so many concurrent users keep hitting one cached prefix.
 #![cfg(all(feature = "claude", feature = "openai"))]
 
 use serde_json::{Value, json};
 use stakit_ai_sdk::{
-    CacheStrategy, ChatRequest, Message, SystemPrompt, ToolDef, UserContent,
+    CacheStrategy, CacheTarget, CacheTtl, ChatRequest, Message, SystemPrompt, ToolDef, UserContent,
     test_support::{claude_body, openai_body},
 };
 
@@ -86,7 +86,7 @@ fn system_is_cached(body: &Value) -> bool {
 }
 
 // 1. Claude `Auto` places breakpoints after tools, after system, plus a rolling
-//    one on the previous turn; the total is within Anthropic's [1, 4] cap.
+//    one on the newest message; the total is within Anthropic's [1, 4] cap.
 #[test]
 fn claude_auto_breakpoints_after_tools_and_system_and_rolling() {
     let req = claude_request(3, two_turn_history("first question", "follow-up question"));
@@ -100,27 +100,30 @@ fn claude_auto_breakpoints_after_tools_and_system_and_rolling() {
     assert!(last_tool_is_cached(&body), "tools block must be cached");
     assert!(system_is_cached(&body), "system block must be cached");
 
-    // The rolling breakpoint sits on the previous turn's boundary — the
-    // second-to-last user message (index 0 here), not the trailing user turn.
+    // The rolling breakpoint sits on the newest message's last block: this
+    // request writes the whole prefix, the next one (this turn + a reply + a
+    // new question) reads it. A breakpoint one turn behind would bill every
+    // new segment at full price once and again as a cache write (~2.25x).
     let msgs = body["messages"].as_array().expect("messages array");
-    assert!(
-        msgs[0]["content"]
-            .as_array()
-            .and_then(|c| c.last())
-            .is_some_and(|b| b.get("cache_control").is_some()),
-        "rolling breakpoint must be on the previous turn's last block: {body:#}"
-    );
     assert!(
         msgs.last()
             .and_then(|m| m["content"].as_array())
             .and_then(|c| c.last())
+            .is_some_and(|b| b.get("cache_control").is_some()),
+        "rolling breakpoint must be on the newest message's last block: {body:#}"
+    );
+    assert!(
+        msgs[0]["content"]
+            .as_array()
+            .and_then(|c| c.last())
             .is_some_and(|b| b.get("cache_control").is_none()),
-        "the in-progress (last) turn must NOT be cached: {body:#}"
+        "only one rolling breakpoint: {body:#}"
     );
 }
 
 // 2. `OpenAI` `Auto` routes the conversation to a cache shard via
-//    `prompt_cache_key`, taken from the request's `cache_key`.
+//    `prompt_cache_key`, taken from the request's `cache_key` (routing influence,
+//    not a cache-hit guarantee).
 #[test]
 fn openai_auto_sets_prompt_cache_key() {
     let mut req = ChatRequest::new("gpt-4o");
@@ -198,9 +201,12 @@ fn claude_breakpoints_stable_across_turns() {
         "system breakpoint must not move when a turn is appended"
     );
 
-    // The newer turn additionally gains a rolling breakpoint that the
-    // single-turn request did not have.
-    assert_eq!(count_cache_control(&body1), 2, "one-turn: tools + system");
+    // Both carry tools + system + a rolling breakpoint on their newest message.
+    assert_eq!(
+        count_cache_control(&body1),
+        3,
+        "one-turn: tools + system + rolling"
+    );
     assert_eq!(
         count_cache_control(&body2),
         3,
@@ -221,8 +227,8 @@ fn claude_off_places_no_breakpoints() {
     );
 }
 
-// Bonus: an in-turn user message with a tool result still receives the rolling
-// breakpoint on its last block (covers the non-text trailing block path).
+// Bonus: inside a tool loop the newest message is the tool-result turn; the
+// rolling breakpoint lands on its last block (the non-text block path).
 #[test]
 fn claude_rolling_breakpoint_on_tool_result_turn() {
     // user(q) → assistant(tool_use) → user(tool_result) → assistant → user(q2)
@@ -238,19 +244,94 @@ fn claude_rolling_breakpoint_on_tool_result_turn() {
             content: vec![stakit_ai_sdk::ToolResultPart::Text("result".into())],
             is_error: false,
         }]),
-        Message::Assistant(vec![stakit_ai_sdk::AssistantContent::Text("done".into())]),
-        Message::user("another question"),
     ];
     let req = claude_request(2, messages);
     let body = claude_body(&req);
 
-    // Second-to-last user message is the tool-result turn (index 2).
+    // The newest message is the tool-result turn (index 2).
     let msgs = body["messages"].as_array().unwrap();
     assert!(
         msgs[2]["content"]
             .as_array()
             .and_then(|c| c.last())
             .is_some_and(|b| b.get("cache_control").is_some()),
-        "rolling breakpoint must land on the previous-turn tool-result block: {body:#}"
+        "rolling breakpoint must land on the newest tool-result block: {body:#}"
+    );
+}
+
+// Explicit one-hour breakpoints are sent with their TTL, on every breakpoint
+// (one-hour entries must come before five-minute ones).
+#[test]
+fn claude_one_hour_ttl_is_sent_on_every_breakpoint() {
+    let mut req = claude_request(2, two_turn_history("q1", "q2"));
+    req.cache = CacheStrategy::Breakpoints {
+        ttl: CacheTtl::OneHour,
+        points: vec![
+            CacheTarget::Tools,
+            CacheTarget::System,
+            CacheTarget::LastUserMessage,
+        ],
+    };
+    let body = claude_body(&req);
+    let one_hour = json!({ "type": "ephemeral", "ttl": "1h" });
+    assert_eq!(body["tools"][1]["cache_control"], one_hour, "{body:#}");
+    assert_eq!(body["system"][0]["cache_control"], one_hour, "{body:#}");
+    assert_eq!(
+        body["messages"][2]["content"][0]["cache_control"], one_hour,
+        "{body:#}"
+    );
+}
+
+// Author-forced tool breakpoints never push a request past Anthropic's four.
+#[test]
+fn claude_forced_tool_breakpoints_are_capped_at_four() {
+    let mut req = claude_request(6, two_turn_history("q1", "q2"));
+    req.tools = tools(6)
+        .into_iter()
+        .map(|mut tool| {
+            tool.cache = true;
+            tool
+        })
+        .collect::<Vec<_>>()
+        .into();
+    let body = claude_body(&req);
+    assert_eq!(count_cache_control(&body), 4, "{body:#}");
+}
+
+#[test]
+fn claude_cache_off_overrides_author_cache_flags() {
+    let mut req = claude_request(1, vec![Message::user("question")]);
+    req.cache = CacheStrategy::Off;
+    req.system.as_mut().unwrap().cache = true;
+    let mut flagged = tools(1);
+    flagged.first_mut().unwrap().cache = true;
+    req.tools = flagged.into();
+    assert_eq!(count_cache_control(&claude_body(&req)), 0);
+}
+
+#[test]
+fn claude_explicit_message_targets_are_all_honored_without_duplicate_slots() {
+    let mut req = claude_request(0, two_turn_history("q1", "q2"));
+    req.system = None;
+    req.cache = CacheStrategy::Breakpoints {
+        ttl: CacheTtl::FiveMin,
+        points: vec![
+            CacheTarget::MessageIndex(0),
+            CacheTarget::MessageIndex(2),
+            CacheTarget::LastUserMessage,
+            CacheTarget::MessageIndex(99),
+        ],
+    };
+    let body = claude_body(&req);
+    assert_eq!(count_cache_control(&body), 2, "{body:#}");
+    assert!(
+        body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_some()
+    );
+    assert!(
+        body["messages"][2]["content"][0]
+            .get("cache_control")
+            .is_some()
     );
 }

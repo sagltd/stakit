@@ -50,6 +50,7 @@ fn pricing(model: &str) -> Pricing {
             output: 5.0,
             cache_read: 0.1,
             cache_write: 1.25,
+            cache_write_1h: None,
         },
     )
 }

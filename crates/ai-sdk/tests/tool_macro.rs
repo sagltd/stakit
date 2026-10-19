@@ -68,8 +68,63 @@ async fn no_arg_tool_with_overridden_name_and_description() {
     assert_eq!(def.description, "returns pong");
     let cx = ToolCx::new(());
     let out = TypedTool(ping)
-        .call_json(&cx, serde_json::Value::Null)
+        .call_json(&cx, serde_json::json!({}))
         .await
         .expect("call");
     assert_eq!(out, serde_json::json!("pong"));
+}
+
+#[tool(description = "Read and increment the context counter.")]
+async fn context_only(cx: &ToolCx<std::sync::atomic::AtomicUsize>) -> Result<usize, ToolError> {
+    Ok(cx.ctx().fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1)
+}
+
+#[test]
+fn tools_without_arguments_advertise_a_closed_empty_object() {
+    let expected = serde_json::json!({
+        "type": "object", "properties": {}, "required": [], "additionalProperties": false
+    });
+    assert_eq!(ToolDyn::<()>::def(&TypedTool(ping)).parameters, expected);
+    assert_eq!(
+        ToolDyn::<std::sync::atomic::AtomicUsize>::def(&TypedTool(context_only)).parameters,
+        expected
+    );
+}
+
+#[tokio::test]
+async fn context_only_tool_accepts_empty_object_and_runs_once() {
+    let cx = ToolCx::new(std::sync::atomic::AtomicUsize::new(0));
+    let output = TypedTool(context_only)
+        .call_json(&cx, serde_json::json!({}))
+        .await
+        .expect("call");
+    assert_eq!(output, serde_json::json!(1));
+    assert_eq!(cx.ctx().load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn tools_without_arguments_reject_unexpected_input_before_effects() {
+    let cx = ToolCx::new(std::sync::atomic::AtomicUsize::new(0));
+    for input in [
+        serde_json::json!({"unexpected": true}),
+        serde_json::Value::Null,
+        serde_json::json!([]),
+        serde_json::json!(false),
+        serde_json::json!(1),
+        serde_json::json!("text"),
+    ] {
+        assert!(
+            TypedTool(context_only)
+                .call_json(&cx, input.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            TypedTool(ping)
+                .call_json(&ToolCx::new(()), input)
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(cx.ctx().load(std::sync::atomic::Ordering::SeqCst), 0);
 }

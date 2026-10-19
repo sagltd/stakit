@@ -4,38 +4,44 @@
 //! back. Tool results become separate `role: "tool"` messages; assistant tool
 //! calls live in a `tool_calls` array with stringified JSON arguments (parsed on
 //! ingest). Streaming accumulates per-index `tool_calls` argument fragments and
-//! emits a whole [`StreamEvent::ToolCall`] when the call finishes; usage arrives
+//! emits a whole [`crate::StreamEvent::ToolCall`] when the call finishes; usage arrives
 //! in a trailing chunk via `stream_options.include_usage`.
 
-use futures::StreamExt;
 use serde_json::{Map, Value, json};
 
 use crate::message::{AssistantContent, Image, Message, ToolResultPart, UserContent};
 use crate::provider::{
-    ChatRequest, ChatResponse, EventStream, Provider, StopReason, StreamEvent, ToolChoice, ToolDef,
+    ChatRequest, ChatResponse, EventStream, Provider, StopReason, ToolChoice, ToolDef,
     parse_retry_after,
 };
 use crate::usage::Usage;
-use crate::{ProviderError, SystemPrompt};
+use crate::{CacheCapabilities, ProviderCapabilities, ProviderError, SystemPrompt};
+
+mod accum;
+mod capabilities;
+mod response;
+mod sse;
+mod usage;
+#[cfg(test)]
+mod usage_presence_test;
+use accum::Accum;
+use response::parse_response;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
-/// Upper bound on a single un-terminated SSE line. A stream that never sends a
-/// newline would otherwise grow `buf` without bound; past this we bail with a
-/// decode error rather than buffering unboundedly.
-const MAX_SSE_LINE: usize = 1024 * 1024;
 /// Max in-flight tool-call buffers a stream may open. A hostile stream could
 /// otherwise allocate per-index entries without bound.
-const MAX_INFLIGHT_TOOLS: usize = 64;
+const MAX_INFLIGHT_TOOLS: usize = crate::provider::MAX_STREAM_OPEN_BLOCKS;
 /// Max accumulated argument bytes for a single tool call. A hostile stream could
 /// otherwise grow one tool's argument buffer past the per-line SSE cap.
-const MAX_TOOL_ARGS: usize = 1024 * 1024;
+#[cfg(test)]
+const MAX_TOOL_ARGS: usize = crate::provider::MAX_STREAM_BLOCK_BYTES;
 
 /// A handle to the `OpenAI` API. Cheap to clone; mints per-model handles.
 #[derive(Clone)]
 pub struct OpenAiClient {
     api_key: String,
     base_url: String,
-    http: reqwest::Client,
+    http: Option<reqwest::Client>,
 }
 
 // Hand-written so the API key never leaks through `{:?}` (logs, panics, tests).
@@ -98,27 +104,54 @@ impl Provider for OpenAiModel {
         &self.model
     }
 
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.capabilities_for(&self.model)
+    }
+
+    fn capabilities_for(&self, model: &str) -> ProviderCapabilities {
+        capabilities::model_capabilities(model)
+    }
+
+    fn cache_capabilities(&self) -> CacheCapabilities {
+        self.cache_capabilities_for(&self.model)
+    }
+
+    fn cache_capabilities_for(&self, model: &str) -> CacheCapabilities {
+        capabilities::cache_capabilities(model)
+    }
+
     fn complete(
         &self,
         request: ChatRequest,
     ) -> futures::future::BoxFuture<'_, Result<ChatResponse, ProviderError>> {
         Box::pin(async move {
+            request.validate_cache(&self.cache_capabilities_for(&self.pick_model(&request)))?;
             let body = build_body(&self.pick_model(&request), &request, false);
+            validate_body(&body)?;
             let resp = self.send(body).await?;
             let status = resp.status();
             let retry_after = parse_retry_after(resp.headers());
-            let text = resp
-                .text()
+            let bytes = resp
+                .bytes()
                 .await
                 .map_err(|e| ProviderError::Transport(e.to_string()))?;
             if !status.is_success() {
-                return Err(api_error(status.as_u16(), &text, retry_after));
+                return Err(api_error(
+                    status.as_u16(),
+                    &String::from_utf8_lossy(&bytes),
+                    retry_after,
+                ));
             }
-            let value: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Decode {
-                err: e.to_string(),
-                body: text.clone(),
-            })?;
-            Ok(parse_response(&value))
+            let value: Value =
+                serde_json::from_slice(&bytes).map_err(|error| ProviderError::Decode {
+                    err: format!(
+                        "invalid OpenAI response JSON at line {} column {}",
+                        error.line(),
+                        error.column()
+                    ),
+                    body: String::new(),
+                })?;
+            parse_response(&value)
         })
     }
 
@@ -127,7 +160,9 @@ impl Provider for OpenAiModel {
         request: ChatRequest,
     ) -> futures::future::BoxFuture<'_, Result<EventStream, ProviderError>> {
         Box::pin(async move {
+            request.validate_cache(&self.cache_capabilities_for(&self.pick_model(&request)))?;
             let body = build_body(&self.pick_model(&request), &request, true);
+            validate_body(&body)?;
             let resp = self.send(body).await?;
             let status = resp.status();
             if !status.is_success() {
@@ -135,73 +170,7 @@ impl Provider for OpenAiModel {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(api_error(status.as_u16(), &text, retry_after));
             }
-            let mut bytes = resp.bytes_stream();
-            let stream = async_stream::stream! {
-                let mut buf = String::new();
-                // Bytes already scanned for a newline (the prefix is newline-free
-                // by the drain invariant below), so each chunk only scans the new
-                // tail — keeping the overflow guard O(1) amortized, not O(n²).
-                let mut scanned = 0usize;
-                let mut accum = Accum::default();
-                let mut started = false;
-                while let Some(chunk) = bytes.next().await {
-                    let chunk = match chunk {
-                        Ok(c) => c,
-                        Err(e) => {
-                            yield Err(ProviderError::Transport(e.to_string()));
-                            return;
-                        }
-                    };
-                    buf.push_str(&String::from_utf8_lossy(&chunk));
-                    // Guard against an SSE stream that never terminates a line.
-                    if sse_line_overflow(&buf, scanned) {
-                        yield Err(ProviderError::Decode {
-                            err: format!("SSE line exceeded {MAX_SSE_LINE} bytes without a newline"),
-                            body: String::new(),
-                        });
-                        return;
-                    }
-                    while let Some(nl) = buf.find('\n') {
-                        let line: String = buf.drain(..=nl).collect();
-                        let line = line.trim();
-                        let Some(data) = line.strip_prefix("data:") else { continue };
-                        let data = data.trim();
-                        if data.is_empty() {
-                            continue;
-                        }
-                        if data == "[DONE]" {
-                            for ev in accum.finish() {
-                                yield Ok(ev);
-                            }
-                            return;
-                        }
-                        if let Ok(event) = serde_json::from_str::<Value>(data) {
-                            if !started {
-                                started = true;
-                                yield Ok(StreamEvent::Start { usage: Usage::default() });
-                            }
-                            match accum.push(&event) {
-                                Ok(evs) => {
-                                    for ev in evs {
-                                        yield Ok(ev);
-                                    }
-                                }
-                                Err(e) => {
-                                    yield Err(e);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    // After draining whole lines, the remainder holds no newline,
-                    // so it is fully scanned — the next chunk starts from its end.
-                    scanned = buf.len();
-                }
-                for ev in accum.finish() {
-                    yield Ok(ev);
-                }
-            };
-            Ok(stream.boxed())
+            Ok(sse::decode(resp.bytes_stream()))
         })
     }
 }
@@ -216,9 +185,10 @@ impl OpenAiModel {
     }
 
     async fn send(&self, body: Value) -> Result<reqwest::Response, ProviderError> {
-        self.client
-            .http
-            .post(format!("{}/v1/chat/completions", self.client.base_url))
+        let http = self.client.http.as_ref().ok_or_else(|| {
+            ProviderError::Transport("provider HTTP client initialization failed".into())
+        })?;
+        http.post(format!("{}/v1/chat/completions", self.client.base_url))
             .bearer_auth(&self.client.api_key)
             .json(&body)
             .send()
@@ -252,19 +222,6 @@ fn api_error(status: u16, body: &str, retry_after: Option<std::time::Duration>) 
     }
 }
 
-/// Whether the SSE buffer holds a single, still-unterminated line longer than
-/// [`MAX_SSE_LINE`] — i.e. the peer is streaming an unbounded line.
-///
-/// `scanned` is the length already known to be newline-free (the buffer prefix),
-/// so only the new tail is scanned. Given the caller's invariant that
-/// `buf[..scanned]` contains no newline, this is equivalent to
-/// `!buf.contains('\n') && buf.len() > MAX_SSE_LINE` but amortized O(1) per
-/// chunk instead of O(n) — the whole stream is scanned once, not per chunk.
-fn sse_line_overflow(buf: &str, scanned: usize) -> bool {
-    let tail = buf.get(scanned..).unwrap_or("");
-    !tail.contains('\n') && buf.len() > MAX_SSE_LINE
-}
-
 // --- request mapping -------------------------------------------------------
 
 /// Builds the `OpenAI` (non-streaming) request body for a [`ChatRequest`].
@@ -277,10 +234,37 @@ pub fn build_request_body(req: &ChatRequest) -> Value {
     build_body(&req.model, req, false)
 }
 
+/// Validate the effective body after extras: extras must not bypass known-model
+/// restrictions, including overriding the generated reasoning mode with null.
+fn validate_body(body: &Value) -> Result<(), ProviderError> {
+    let known = body["model"]
+        .as_str()
+        .is_some_and(capabilities::is_registered_chat_model);
+    let tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    if known && tools && body["reasoning_effort"].as_str() != Some("none") {
+        return Err(ProviderError::InvalidArgument(
+            "this Chat Completions model requires reasoning_effort=none when using tools".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn build_body(model: &str, req: &ChatRequest, stream: bool) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
-    body.insert("max_completion_tokens".into(), json!(req.max_tokens));
+    let capabilities = capabilities::model_capabilities(model);
+    let max_tokens = capabilities
+        .max_output_tokens
+        .map_or(req.max_tokens, |limit| req.max_tokens.min(limit));
+    body.insert("max_completion_tokens".into(), json!(max_tokens));
+    if capabilities::is_registered_chat_model(model) {
+        // These models allow Chat Completions tools only without reasoning.
+        // Reasoning with tools requires a separate Responses API adapter.
+        body.insert("reasoning_effort".into(), json!("none"));
+    }
     body.insert(
         "messages".into(),
         json!(map_messages(req.system.as_ref(), &req.messages)),
@@ -289,14 +273,14 @@ fn build_body(model: &str, req: &ChatRequest, stream: bool) -> Value {
         body.insert("tools".into(), json!(map_tools(&req.tools)));
         body.insert("tool_choice".into(), map_tool_choice(&req.tool_choice));
     }
-    if let Some(temp) = req.temperature {
+    if let Some(temp) = req.temperature.filter(|_| capabilities.sampling_params) {
         body.insert("temperature".into(), json!(temp));
     }
     if !req.stop_sequences.is_empty() {
         body.insert("stop".into(), json!(req.stop_sequences));
     }
-    // OpenAI auto-caches stable prefixes; the cache key only routes a
-    // conversation to one cache shard (it does not enable caching itself).
+    // Caching is provider-managed. A stable opaque key scopes cache accounting;
+    // on earlier models it also influences routing, without guaranteeing a hit.
     if let Some(key) = &req.cache_key {
         body.insert("prompt_cache_key".into(), json!(&**key));
     }
@@ -461,66 +445,6 @@ fn map_tool_choice(choice: &ToolChoice) -> Value {
 
 // --- response mapping ------------------------------------------------------
 
-fn parse_response(value: &Value) -> ChatResponse {
-    let choice = value.get("choices").and_then(|c| c.get(0));
-    let message = choice.and_then(|c| c.get("message"));
-    let mut content = Vec::new();
-    if let Some(text) = message
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_str)
-    {
-        if !text.is_empty() {
-            content.push(AssistantContent::Text(text.into()));
-        }
-    }
-    if let Some(calls) = message
-        .and_then(|m| m.get("tool_calls"))
-        .and_then(Value::as_array)
-    {
-        for call in calls {
-            if let Some(block) = parse_tool_call(call) {
-                content.push(block);
-            }
-        }
-    }
-    let stop = choice
-        .and_then(|c| c.get("finish_reason"))
-        .and_then(Value::as_str)
-        .map_or(StopReason::EndTurn, map_finish_reason);
-    let usage = value.get("usage").map(map_usage).unwrap_or_default();
-    ChatResponse {
-        content,
-        stop,
-        usage,
-    }
-}
-
-fn parse_tool_call(call: &Value) -> Option<AssistantContent> {
-    let function = call.get("function")?;
-    let arguments = function
-        .get("arguments")
-        .and_then(Value::as_str)
-        .unwrap_or("{}");
-    Some(AssistantContent::ToolUse {
-        id: call
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .into(),
-        name: function
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .into(),
-        // Non-streaming `complete()` builds a `ChatResponse` for direct callers
-        // (e.g. structured extraction); it performs no tool dispatch, so a
-        // malformed-args failure has no tool-result channel to surface on. The
-        // agentic path uses `stream()`, where the raw arguments flow through
-        // unparsed and the agent turns a parse failure into a tool error.
-        input: serde_json::from_str(arguments).unwrap_or_else(|_| json!({})),
-    })
-}
-
 fn map_finish_reason(reason: &str) -> StopReason {
     match reason {
         "stop" => StopReason::EndTurn,
@@ -533,15 +457,19 @@ fn map_finish_reason(reason: &str) -> StopReason {
 
 fn map_usage(usage: &Value) -> Usage {
     let n = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let details = &usage["prompt_tokens_details"];
+    let cache_read_tokens = details["cached_tokens"].as_u64().unwrap_or(0);
+    let cache_create_tokens = details["cache_write_tokens"].as_u64().unwrap_or(0);
     Usage {
-        input_tokens: n("prompt_tokens"),
+        // OpenAI prompt_tokens includes cache reads and writes. The shared
+        // contract stores disjoint buckets so Pricing never bills them twice.
+        input_tokens: n("prompt_tokens")
+            .saturating_sub(cache_read_tokens)
+            .saturating_sub(cache_create_tokens),
         output_tokens: n("completion_tokens"),
-        cache_create_tokens: 0,
-        cache_read_tokens: usage
-            .get("prompt_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        cache_create_tokens,
+        cache_create_1h_tokens: 0,
+        cache_read_tokens,
         reasoning_tokens: usage
             .get("completion_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))
@@ -550,108 +478,10 @@ fn map_usage(usage: &Value) -> Usage {
     }
 }
 
-// --- streaming accumulator -------------------------------------------------
-
-#[derive(Default)]
-struct Accum {
-    usage: Usage,
-    tools: indexmap::IndexMap<u64, ToolBuf>,
-    stop: Option<StopReason>,
-}
-
-#[derive(Default)]
-struct ToolBuf {
-    id: String,
-    name: String,
-    args: String,
-}
-
-impl Accum {
-    fn push(&mut self, event: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
-        if let Some(usage) = event.get("usage").filter(|u| !u.is_null()) {
-            self.usage = map_usage(usage);
-        }
-        let Some(choice) = event.get("choices").and_then(|c| c.get(0)) else {
-            return Ok(Vec::new());
-        };
-        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-            self.stop = Some(map_finish_reason(reason));
-        }
-        let Some(delta) = choice.get("delta") else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::new();
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            if !text.is_empty() {
-                out.push(StreamEvent::TextDelta(text.to_owned()));
-            }
-        }
-        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-            for call in calls {
-                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
-                // Bound in-flight tool buffers against a hostile stream.
-                if !self.tools.contains_key(&index) && self.tools.len() >= MAX_INFLIGHT_TOOLS {
-                    return Err(ProviderError::Decode {
-                        err: format!(
-                            "stream opened more than {MAX_INFLIGHT_TOOLS} concurrent tool calls"
-                        ),
-                        body: String::new(),
-                    });
-                }
-                let buf = self.tools.entry(index).or_default();
-                if let Some(id) = call.get("id").and_then(Value::as_str) {
-                    id.clone_into(&mut buf.id);
-                }
-                if let Some(function) = call.get("function") {
-                    if let Some(name) = function.get("name").and_then(Value::as_str) {
-                        buf.name.push_str(name);
-                    }
-                    if let Some(args) = function.get("arguments").and_then(Value::as_str) {
-                        // Bound one tool's argument buffer against a hostile stream
-                        // (this path bypasses the per-line SSE cap).
-                        if buf.args.len().saturating_add(args.len()) > MAX_TOOL_ARGS {
-                            return Err(ProviderError::Decode {
-                                err: format!("tool-call arguments exceeded {MAX_TOOL_ARGS} bytes"),
-                                body: String::new(),
-                            });
-                        }
-                        buf.args.push_str(args);
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Emits the accumulated tool calls and the terminal `End` event.
-    fn finish(&mut self) -> Vec<StreamEvent> {
-        let mut out = Vec::new();
-        for (_, buf) in std::mem::take(&mut self.tools) {
-            // Empty argument streams mean "no arguments"; normalize to an empty
-            // object. Otherwise forward the raw text and let the agent parse +
-            // validate it once at dispatch.
-            let arguments = if buf.args.trim().is_empty() {
-                "{}".to_owned()
-            } else {
-                buf.args
-            };
-            out.push(StreamEvent::ToolCall {
-                id: buf.id,
-                name: buf.name,
-                arguments,
-            });
-        }
-        out.push(StreamEvent::End {
-            stop: self.stop.take().unwrap_or(StopReason::EndTurn),
-            usage: self.usage,
-        });
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StreamEvent;
 
     #[test]
     fn build_body_maps_system_and_tool_messages() {
@@ -699,9 +529,9 @@ mod tests {
             "usage": { "prompt_tokens": 12, "completion_tokens": 4,
                        "prompt_tokens_details": { "cached_tokens": 8 } }
         });
-        let resp = parse_response(&value);
+        let resp = parse_response(&value).expect("valid response");
         assert_eq!(resp.stop, StopReason::ToolUse);
-        assert_eq!(resp.usage.input_tokens, 12);
+        assert_eq!(resp.usage.input_tokens, 4);
         assert_eq!(resp.usage.cache_read_tokens, 8);
         assert_eq!(
             resp.content[0],
@@ -725,7 +555,7 @@ mod tests {
                 &json!({ "choices": [], "usage": { "prompt_tokens": 5, "completion_tokens": 2 } }),
             )
             .expect("push ok");
-        let out = accum.finish();
+        let out = accum.finish().expect("valid terminal");
         assert_eq!(
             out[0],
             StreamEvent::ToolCall {
@@ -813,23 +643,12 @@ mod tests {
         let dbg = format!("{model:?}");
         assert!(!dbg.contains("sk-secret-LEAK"), "{dbg}");
     }
-
-    #[test]
-    fn sse_line_overflow_trips_only_past_the_cap_without_newline() {
-        assert!(!sse_line_overflow("data: partial", 0));
-        let mut delimited = "x".repeat(MAX_SSE_LINE + 10);
-        delimited.push('\n');
-        assert!(!sse_line_overflow(&delimited, 0));
-        assert!(sse_line_overflow(&"x".repeat(MAX_SSE_LINE + 1), 0));
-    }
-
-    #[test]
-    fn sse_line_overflow_scans_only_the_unscanned_tail() {
-        // A newline lies in the already-scanned prefix; the tail is newline-free
-        // and over the cap. With the prefix excluded this still must NOT trip.
-        let mut buf = String::from("\n");
-        buf.push_str(&"x".repeat(MAX_SSE_LINE + 1));
-        assert!(!sse_line_overflow(&buf, 0));
-        assert!(sse_line_overflow(&buf, 1));
-    }
 }
+
+#[cfg(test)]
+#[path = "openai/usage_test.rs"]
+mod usage_test;
+
+#[cfg(test)]
+#[path = "openai/model_test.rs"]
+mod model_test;
