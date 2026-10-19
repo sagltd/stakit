@@ -1,0 +1,25 @@
+{
+  "path": ["crates", "packages", "examples"],
+  "format": ["rust", "typescript", "tsx", "javascript"],
+  "ignore": [
+    "**/target/**",
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/generated/**",
+    "**/*.generated.*",
+    "**/snapshots/**",
+    "**/*.snap",
+    "**/*.d.ts"
+  ],
+  "ignorePattern": [
+    "(pub(\\(crate\\))? )?use [^;]*;",
+    "import [^;\\n]*from [^;\\n]*;?"
+  ],
+  "minTokens": 50,
+  "minLines": 5,
+  "threshold": 0,
+  "exitCode": 1,
+  "gitignore": true,
+  "reporters": ["console"]
+}

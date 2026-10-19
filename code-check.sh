@@ -11,6 +11,9 @@ if ! ls crates/*/Cargo.toml >/dev/null 2>&1; then
   exit 0
 fi
 
+echo "==> jscpd duplicate check (Rust + TypeScript, see .jscpd.json)"
+bun run dup
+
 echo "==> rustfmt (check)"
 cargo fmt --all -- --check
 
