@@ -699,30 +699,36 @@ fn create_object_sql(table: &Table) -> String {
     sql
 }
 
+/// `ALTER TABLE … ADD COLUMN`, plus the column's index when it has one.
+fn add_column_sql(table: &str, column: &Column) -> String {
+    let mut sql = format!(
+        "alter table {} add column {};",
+        quote(table),
+        column_ddl(column)
+    );
+    if column.index {
+        sql.push('\n');
+        sql.push_str(&create_index_sql(table, column));
+    }
+    sql
+}
+
+/// `ALTER TABLE … DROP COLUMN`.
+fn drop_column_sql(table: &str, column: &str) -> String {
+    format!(
+        "alter table {} drop column {};",
+        quote(table),
+        quote(column)
+    )
+}
+
 /// Render the forward (up) SQL for a change.
 fn up(change: &Change) -> String {
     match change {
         Change::CreateTable(table) => create_object_sql(table),
         Change::DropTable(table) => format!("drop table {};", quote(&table.name)),
-        Change::AddColumn { table, column } => {
-            let mut sql = format!(
-                "alter table {} add column {};",
-                quote(table),
-                column_ddl(column)
-            );
-            if column.index {
-                sql.push('\n');
-                sql.push_str(&create_index_sql(table, column));
-            }
-            sql
-        }
-        Change::DropColumn { table, column } => {
-            format!(
-                "alter table {} drop column {};",
-                quote(table),
-                quote(&column.name)
-            )
-        }
+        Change::AddColumn { table, column } => add_column_sql(table, column),
+        Change::DropColumn { table, column } => drop_column_sql(table, &column.name),
         Change::AlterType { table, to, .. } => alter_type_sql(table, to),
         Change::RenameColumn {
             table, from, to, ..
@@ -761,26 +767,11 @@ fn down(change: &Change) -> String {
     match change {
         Change::CreateTable(table) => format!("drop table {};", quote(&table.name)),
         Change::DropTable(table) => create_object_sql(table),
-        Change::AddColumn { table, column } => {
-            format!(
-                "alter table {} drop column {};",
-                quote(table),
-                quote(&column.name)
-            )
-        }
+        Change::AddColumn { table, column } => drop_column_sql(table, &column.name),
         Change::DropColumn { table, column } => {
             // Mirror `up(AddColumn)`: re-add the column *and* recreate its index, so
             // dropping an indexed column is faithfully reversible.
-            let mut sql = format!(
-                "alter table {} add column {};",
-                quote(table),
-                column_ddl(column)
-            );
-            if column.index {
-                sql.push('\n');
-                sql.push_str(&create_index_sql(table, column));
-            }
-            sql
+            add_column_sql(table, column)
         }
         Change::AlterType { table, from, .. } => alter_type_sql(table, from),
         Change::RenameColumn {
@@ -881,13 +872,17 @@ mod tests {
         }
     }
 
+    fn table_def(name: &str, columns: Vec<Column>) -> Table {
+        Table {
+            name: name.to_owned(),
+            columns,
+            ..Table::default()
+        }
+    }
+
     fn table(name: &str, columns: Vec<Column>) -> Schema {
         Schema {
-            tables: vec![Table {
-                name: name.to_owned(),
-                columns,
-                ..Table::default()
-            }],
+            tables: vec![table_def(name, columns)],
             ..Schema::default()
         }
     }
@@ -904,6 +899,15 @@ mod tests {
         fn rename_target(&mut self, _: &str, _: &Column, candidates: &[Column]) -> Option<String> {
             candidates.first().map(|c| c.name.clone())
         }
+    }
+
+    /// The up SQL creating `logs (id, user_id)` with `user_id` indexed.
+    fn logs_with_indexed_user_id_up() -> String {
+        let new = table(
+            "logs",
+            vec![col("id", "bigint"), indexed_col("user_id", "bigint")],
+        );
+        up_sql(&diff(&Schema::default(), &new, &mut NeverRename))
     }
 
     fn indexed_col(name: &str, ty: &str) -> Column {
@@ -967,11 +971,7 @@ mod tests {
 
     #[test]
     fn bare_index_has_no_using_clause() {
-        let new = table(
-            "logs",
-            vec![col("id", "bigint"), indexed_col("user_id", "bigint")],
-        );
-        let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
+        let up = logs_with_indexed_user_id_up();
         assert!(up.contains(r#"create index "idx_logs_user_id" on "logs" ("user_id");"#));
         assert!(
             !up.contains("using"),
@@ -981,11 +981,7 @@ mod tests {
 
     #[test]
     fn create_table_emits_create_index_for_indexed_columns() {
-        let new = table(
-            "logs",
-            vec![col("id", "bigint"), indexed_col("user_id", "bigint")],
-        );
-        let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
+        let up = logs_with_indexed_user_id_up();
         assert!(up.contains("create table \"logs\""));
         assert!(
             up.contains("create index \"idx_logs_user_id\" on \"logs\" (\"user_id\");"),
@@ -1104,21 +1100,15 @@ mod tests {
         // `accounts`, so the referenced table must be created first.
         let new = Schema {
             tables: vec![
-                Table {
-                    name: "account_invites".to_owned(),
-                    columns: vec![col("id", "uuid"), fk_col("account_id", "accounts")],
-                    ..Table::default()
-                },
-                Table {
-                    name: "accounts".to_owned(),
-                    columns: vec![col("id", "uuid"), fk_col("owner_id", "users")],
-                    ..Table::default()
-                },
-                Table {
-                    name: "users".to_owned(),
-                    columns: vec![col("id", "uuid")],
-                    ..Table::default()
-                },
+                table_def(
+                    "account_invites",
+                    vec![col("id", "uuid"), fk_col("account_id", "accounts")],
+                ),
+                table_def(
+                    "accounts",
+                    vec![col("id", "uuid"), fk_col("owner_id", "users")],
+                ),
+                table_def("users", vec![col("id", "uuid")]),
             ],
             ..Schema::default()
         };
@@ -1142,16 +1132,11 @@ mod tests {
         let old = table("users", vec![col("id", "uuid")]);
         let new = Schema {
             tables: vec![
-                Table {
-                    name: "posts".to_owned(),
-                    columns: vec![col("id", "uuid"), fk_col("author_id", "users")],
-                    ..Table::default()
-                },
-                Table {
-                    name: "users".to_owned(),
-                    columns: vec![col("id", "uuid")],
-                    ..Table::default()
-                },
+                table_def(
+                    "posts",
+                    vec![col("id", "uuid"), fk_col("author_id", "users")],
+                ),
+                table_def("users", vec![col("id", "uuid")]),
             ],
             ..Schema::default()
         };
@@ -1166,16 +1151,11 @@ mod tests {
         // child must be dropped first (and `down` must recreate the parent first).
         let old = Schema {
             tables: vec![
-                Table {
-                    name: "a_parent".to_owned(),
-                    columns: vec![col("id", "uuid")],
-                    ..Table::default()
-                },
-                Table {
-                    name: "z_child".to_owned(),
-                    columns: vec![col("id", "uuid"), fk_col("parent_id", "a_parent")],
-                    ..Table::default()
-                },
+                table_def("a_parent", vec![col("id", "uuid")]),
+                table_def(
+                    "z_child",
+                    vec![col("id", "uuid"), fk_col("parent_id", "a_parent")],
+                ),
             ],
             ..Schema::default()
         };
@@ -1238,6 +1218,21 @@ mod tests {
         }
     }
 
+    fn grant(role: &str, privileges: &[Privilege]) -> Grant {
+        Grant {
+            role: role.to_owned(),
+            privileges: privileges.to_vec(),
+        }
+    }
+
+    /// `posts (id)` with `grants`.
+    fn posts_with_grants(grants: Vec<Grant>) -> Table {
+        Table {
+            grants,
+            ..table_def("posts", vec![col("id", "uuid")])
+        }
+    }
+
     fn schema_with(tables: Vec<Table>, roles: Vec<Role>) -> Schema {
         Schema { tables, roles }
     }
@@ -1265,15 +1260,7 @@ mod tests {
 
     #[test]
     fn role_is_created_before_a_table_grant_that_references_it() {
-        let posts = Table {
-            name: "posts".to_owned(),
-            columns: vec![col("id", "uuid")],
-            grants: vec![Grant {
-                role: "app_user".to_owned(),
-                privileges: vec![Privilege::Select],
-            }],
-            ..Table::default()
-        };
+        let posts = posts_with_grants(vec![grant("app_user", &[Privilege::Select])]);
         let new = schema_with(vec![posts], vec![role("app_user")]);
         let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
         let role_at = up.find("create role").expect("create role");
@@ -1289,23 +1276,14 @@ mod tests {
         // posts grants to app_user; removing both the grant and the role must revoke
         // before dropping the role (Postgres refuses to drop a role with privileges).
         let old = schema_with(
-            vec![Table {
-                name: "posts".to_owned(),
-                columns: vec![col("id", "uuid")],
-                grants: vec![Grant {
-                    role: "app_user".to_owned(),
-                    privileges: vec![Privilege::Select],
-                }],
-                ..Table::default()
-            }],
+            vec![posts_with_grants(vec![grant(
+                "app_user",
+                &[Privilege::Select],
+            )])],
             vec![role("app_user")],
         );
         let new = schema_with(
-            vec![Table {
-                name: "posts".to_owned(),
-                columns: vec![col("id", "uuid")],
-                ..Table::default()
-            }],
+            vec![table_def("posts", vec![col("id", "uuid")])],
             Vec::new(),
         );
         let up = up_sql(&diff(&old, &new, &mut NeverRename));
@@ -1323,10 +1301,7 @@ mod tests {
             name: "posts".to_owned(),
             columns: vec![col("id", "uuid"), col("author_id", "uuid")],
             rls: true,
-            grants: vec![Grant {
-                role: "app_user".to_owned(),
-                privileges: vec![Privilege::Select],
-            }],
+            grants: vec![grant("app_user", &[Privilege::Select])],
             policies: vec![select_policy(
                 "posts_owner",
                 "app_user",
@@ -1376,10 +1351,7 @@ mod tests {
             name: "posts".to_owned(),
             columns: vec![col("id", "uuid")],
             rls: true,
-            grants: vec![Grant {
-                role: "app_user".to_owned(),
-                privileges: vec![Privilege::Select],
-            }],
+            grants: vec![grant("app_user", &[Privilege::Select])],
             policies: vec![select_policy("posts_owner", "app_user", "true")],
             ..Table::default()
         };
@@ -1406,11 +1378,34 @@ mod tests {
     }
 
     fn plain_table(name: &str) -> Table {
+        table_def(name, vec![col("id", "uuid")])
+    }
+
+    /// `posts` with row-level security on and `policies`.
+    fn rls_posts(policies: Vec<Policy>) -> Table {
         Table {
-            name: name.to_owned(),
-            columns: vec![col("id", "uuid")],
-            ..Table::default()
+            rls: true,
+            policies,
+            ..plain_table("posts")
         }
+    }
+
+    /// The up SQL creating `table` in an empty schema.
+    fn created_up(table: Table) -> String {
+        up_sql(&diff(
+            &Schema::default(),
+            &schema_with(vec![table], Vec::new()),
+            &mut NeverRename,
+        ))
+    }
+
+    /// The changes turning a schema holding only `old` into one holding only `new`.
+    fn diff_tables(old: Table, new: Table) -> Vec<Change> {
+        diff(
+            &schema_with(vec![old], Vec::new()),
+            &schema_with(vec![new], Vec::new()),
+            &mut NeverRename,
+        )
     }
 
     #[test]
@@ -1437,11 +1432,7 @@ mod tests {
         let mut new_table = plain_table("posts");
         new_table.rls = true;
         new_table.force_rls = true;
-        let changes = diff(
-            &schema_with(vec![old_table], Vec::new()),
-            &schema_with(vec![new_table], Vec::new()),
-            &mut NeverRename,
-        );
+        let changes = diff_tables(old_table, new_table);
         assert_eq!(
             up_sql(&changes),
             r#"alter table "posts" force row level security;"#
@@ -1456,14 +1447,8 @@ mod tests {
     fn add_policy_to_existing_table() {
         let mut old_table = plain_table("posts");
         old_table.rls = true;
-        let mut new_table = plain_table("posts");
-        new_table.rls = true;
-        new_table.policies = vec![select_policy("p", "app_user", "true")];
-        let changes = diff(
-            &schema_with(vec![old_table], Vec::new()),
-            &schema_with(vec![new_table], Vec::new()),
-            &mut NeverRename,
-        );
+        let new_table = rls_posts(vec![select_policy("p", "app_user", "true")]);
+        let changes = diff_tables(old_table, new_table);
         assert_eq!(
             up_sql(&changes),
             r#"create policy "p" on "posts" for select to "app_user" using (true);"#
@@ -1473,17 +1458,9 @@ mod tests {
 
     #[test]
     fn changing_a_policy_drops_then_recreates_it() {
-        let mut old_table = plain_table("posts");
-        old_table.rls = true;
-        old_table.policies = vec![select_policy("p", "app_user", "old_expr")];
-        let mut new_table = plain_table("posts");
-        new_table.rls = true;
-        new_table.policies = vec![select_policy("p", "app_user", "new_expr")];
-        let changes = diff(
-            &schema_with(vec![old_table], Vec::new()),
-            &schema_with(vec![new_table], Vec::new()),
-            &mut NeverRename,
-        );
+        let old_table = rls_posts(vec![select_policy("p", "app_user", "old_expr")]);
+        let new_table = rls_posts(vec![select_policy("p", "app_user", "new_expr")]);
+        let changes = diff_tables(old_table, new_table);
         let up = up_sql(&changes);
         let drop_at = up.find("drop policy").expect("drop");
         let create_at = up.find("create policy").expect("create");
@@ -1505,14 +1482,8 @@ mod tests {
             using: None,
             check: Some("author_id = current_user_id()".to_owned()),
         };
-        let mut table = plain_table("posts");
-        table.rls = true;
-        table.policies = vec![policy];
-        let up = up_sql(&diff(
-            &Schema::default(),
-            &schema_with(vec![table], Vec::new()),
-            &mut NeverRename,
-        ));
+        let table = rls_posts(vec![policy]);
+        let up = created_up(table);
         assert!(
             up.contains(
                 r#"create policy "ins" on "posts" for insert to "app_user" with check (author_id = current_user_id());"#
@@ -1530,14 +1501,8 @@ mod tests {
             using: Some("true".to_owned()),
             check: None,
         };
-        let mut table = plain_table("posts");
-        table.rls = true;
-        table.policies = vec![policy];
-        let up = up_sql(&diff(
-            &Schema::default(),
-            &schema_with(vec![table], Vec::new()),
-            &mut NeverRename,
-        ));
+        let table = rls_posts(vec![policy]);
+        let up = created_up(table);
         assert!(
             up.contains(r#"create policy "all_read" on "posts" for select using (true);"#),
             "public policy must omit TO:\n{up}"
@@ -1553,14 +1518,8 @@ mod tests {
             using: Some("true".to_owned()),
             check: None,
         };
-        let mut table = plain_table("posts");
-        table.rls = true;
-        table.policies = vec![policy];
-        let up = up_sql(&diff(
-            &Schema::default(),
-            &schema_with(vec![table], Vec::new()),
-            &mut NeverRename,
-        ));
+        let table = rls_posts(vec![policy]);
+        let up = created_up(table);
         assert!(up.contains(r#"for all to "a", "b" using (true)"#), "{up}");
     }
 
@@ -1568,10 +1527,7 @@ mod tests {
     fn add_grant_to_existing_table() {
         let old = schema_with(vec![plain_table("posts")], Vec::new());
         let mut new_table = plain_table("posts");
-        new_table.grants = vec![Grant {
-            role: "app_user".to_owned(),
-            privileges: vec![Privilege::Select, Privilege::Insert],
-        }];
+        new_table.grants = vec![grant("app_user", &[Privilege::Select, Privilege::Insert])];
         let changes = diff(
             &old,
             &schema_with(vec![new_table], Vec::new()),
@@ -1590,10 +1546,7 @@ mod tests {
     #[test]
     fn all_privileges_grant_renders_all_privileges() {
         let mut new_table = plain_table("posts");
-        new_table.grants = vec![Grant {
-            role: "app_user".to_owned(),
-            privileges: vec![Privilege::All],
-        }];
+        new_table.grants = vec![grant("app_user", &[Privilege::All])];
         let up = up_sql(&diff(
             &schema_with(vec![plain_table("posts")], Vec::new()),
             &schema_with(vec![new_table], Vec::new()),
@@ -1605,20 +1558,10 @@ mod tests {
     #[test]
     fn changing_a_grant_revokes_then_grants() {
         let mut old_table = plain_table("posts");
-        old_table.grants = vec![Grant {
-            role: "app_user".to_owned(),
-            privileges: vec![Privilege::Select],
-        }];
+        old_table.grants = vec![grant("app_user", &[Privilege::Select])];
         let mut new_table = plain_table("posts");
-        new_table.grants = vec![Grant {
-            role: "app_user".to_owned(),
-            privileges: vec![Privilege::Select, Privilege::Update],
-        }];
-        let changes = diff(
-            &schema_with(vec![old_table], Vec::new()),
-            &schema_with(vec![new_table], Vec::new()),
-            &mut NeverRename,
-        );
+        new_table.grants = vec![grant("app_user", &[Privilege::Select, Privilege::Update])];
+        let changes = diff_tables(old_table, new_table);
         let up = up_sql(&changes);
         let revoke_at = up.find("revoke").expect("revoke");
         let grant_at = up.find("grant").expect("grant");
@@ -1632,10 +1575,7 @@ mod tests {
     #[test]
     fn removing_a_grant_revokes_it() {
         let mut old_table = plain_table("posts");
-        old_table.grants = vec![Grant {
-            role: "app_user".to_owned(),
-            privileges: vec![Privilege::Select],
-        }];
+        old_table.grants = vec![grant("app_user", &[Privilege::Select])];
         let changes = diff(
             &schema_with(vec![old_table], Vec::new()),
             &schema_with(vec![plain_table("posts")], Vec::new()),
@@ -1668,10 +1608,7 @@ mod tests {
     fn unchanged_rls_table_produces_no_changes() {
         let mut table = plain_table("posts");
         table.rls = true;
-        table.grants = vec![Grant {
-            role: "app_user".to_owned(),
-            privileges: vec![Privilege::Select],
-        }];
+        table.grants = vec![grant("app_user", &[Privilege::Select])];
         table.policies = vec![select_policy("p", "app_user", "true")];
         let schema = schema_with(vec![table], vec![role("app_user")]);
         assert!(diff(&schema, &schema, &mut NeverRename).is_empty());

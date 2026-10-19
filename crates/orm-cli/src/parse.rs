@@ -141,21 +141,16 @@ fn child_base_dir(path: &Path) -> PathBuf {
 
 /// Read the `#[path = "..."]` attribute of a module, if present.
 fn mod_path_attr(attrs: &[Attribute]) -> Option<String> {
-    for attr in attrs {
-        if !attr.path().is_ident("path") {
-            continue;
-        }
-        if let syn::Meta::NameValue(nv) = &attr.meta {
-            if let syn::Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Str(s),
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("path"))
+        .find_map(|attr| match &attr.meta.require_name_value().ok()?.value {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(path),
                 ..
-            }) = &nv.value
-            {
-                return Some(s.value());
-            }
-        }
-    }
-    None
+            }) => Some(path.value()),
+            _ => None,
+        })
 }
 
 /// Resolve a `mod name;` to a file: `#[path]` (relative to the declaring file's dir)
@@ -772,6 +767,25 @@ fn parse_reference(
 mod tests {
     use super::{parse_schema, parse_schema_path, undeclared_role_refs, validate_schema};
 
+    /// A `docs` table with a pk and the given extra `column` (attributes + field).
+    fn docs_schema(column: &str) -> String {
+        format!(
+            r#"#[derive(Table)] #[table(name = "docs")]
+            struct Doc {{ #[column(pk)] id: i64, {column} }}"#
+        )
+    }
+
+    /// A `parent` table and a `child` table with a pk and the given extra
+    /// `column` (typically a foreign key to `Parent::id`).
+    fn parent_child_schema(column: &str) -> String {
+        format!(
+            r#"#[derive(Table)] #[table(name = "parent")]
+            struct Parent {{ #[column(pk)] id: i64 }}
+            #[derive(Table)] #[table(name = "child")]
+            struct Child {{ #[column(pk)] id: i64, {column} }}"#
+        )
+    }
+
     #[test]
     fn follows_file_and_inline_modules_across_the_tree() {
         // Build a temp module tree:
@@ -850,15 +864,9 @@ mod tests {
 
     #[test]
     fn parses_index_method_and_opclass() {
-        let source = r#"
-            #[derive(Table)]
-            #[table(name = "docs")]
-            struct Doc {
-                #[column(pk)] id: i64,
-                #[column(sql_type = "vector(3)", index, index_method = "hnsw", opclass = "vector_cosine_ops")]
-                embedding: Vector,
-            }
-        "#;
+        let source = &docs_schema(
+            r#"#[column(sql_type = "vector(3)", index, index_method = "hnsw", opclass = "vector_cosine_ops")] embedding: Vector,"#,
+        );
         let schema = parse_schema(source).unwrap();
         let embedding = schema.table("docs").unwrap().column("embedding").unwrap();
         assert!(embedding.index);
@@ -883,58 +891,32 @@ mod tests {
 
     #[test]
     fn unknown_column_attribute_is_rejected() {
-        let source = r#"
-            #[derive(Table)]
-            #[table(name = "docs")]
-            struct Doc {
-                #[column(pk)] id: i64,
-                #[column(index_methd = "hnsw")] body: String,
-            }
-        "#;
+        let source = &docs_schema(r#"#[column(index_methd = "hnsw")] body: String,"#);
         let error = parse_schema(source).unwrap_err();
         assert!(error.contains("unknown"), "got: {error}");
     }
 
     #[test]
     fn opclass_without_index_is_rejected() {
-        let source = r#"
-            #[derive(Table)]
-            #[table(name = "docs")]
-            struct Doc {
-                #[column(pk)] id: i64,
-                #[column(opclass = "vector_cosine_ops")] embedding: Vector,
-            }
-        "#;
+        let source = &docs_schema(r#"#[column(opclass = "vector_cosine_ops")] embedding: Vector,"#);
         let error = parse_schema(source).unwrap_err();
         assert!(error.contains("require #[column(index)]"), "got: {error}");
     }
 
     #[test]
     fn generated_with_default_is_rejected() {
-        let source = r#"
-            #[derive(Table)]
-            #[table(name = "docs")]
-            struct Doc {
-                #[column(pk)] id: i64,
-                #[column(sql_type = "tsvector", generated = "to_tsvector('english', body)", default = "''")]
-                body_tsv: String,
-            }
-        "#;
+        let source = &docs_schema(
+            r#"#[column(sql_type = "tsvector", generated = "to_tsvector('english', body)", default = "''")] body_tsv: String,"#,
+        );
         let error = parse_schema(source).unwrap_err();
         assert!(error.contains("cannot also have a default"), "got: {error}");
     }
 
     #[test]
     fn index_method_with_sql_breakout_is_rejected() {
-        let source = r#"
-            #[derive(Table)]
-            #[table(name = "docs")]
-            struct Doc {
-                #[column(pk)] id: i64,
-                #[column(sql_type = "vector(3)", index, index_method = "gin); drop table users; --")]
-                embedding: Vector,
-            }
-        "#;
+        let source = &docs_schema(
+            r#"#[column(sql_type = "vector(3)", index, index_method = "gin); drop table users; --")] embedding: Vector,"#,
+        );
         let error = parse_schema(source).unwrap_err();
         assert!(error.contains("bare SQL identifier"), "got: {error}");
     }
@@ -1155,18 +1137,9 @@ mod tests {
     // so the CLI is the only gate (and a free string would otherwise reach DDL raw).
     #[test]
     fn on_delete_injection_keyword_is_rejected() {
-        let source = r#"
-            #[derive(Table)]
-            #[table(name = "parent")]
-            struct Parent { #[column(pk)] id: i64 }
-            #[derive(Table)]
-            #[table(name = "child")]
-            struct Child {
-                #[column(pk)] id: i64,
-                #[column(references = Parent::id, on_delete = "cascade); drop table parent; --")]
-                p: i64,
-            }
-        "#;
+        let source = &parent_child_schema(
+            r#"#[column(references = Parent::id, on_delete = "cascade); drop table parent; --")] p: i64,"#,
+        );
         let error = parse_schema(source).unwrap_err();
         assert!(error.contains("on_delete must be one of"), "got: {error}");
     }
@@ -1187,17 +1160,9 @@ mod tests {
 
     #[test]
     fn set_null_on_not_null_column_is_rejected() {
-        let source = r#"
-            #[derive(Table)]
-            #[table(name = "parent")]
-            struct Parent { #[column(pk)] id: i64 }
-            #[derive(Table)]
-            #[table(name = "child")]
-            struct Child {
-                #[column(pk)] id: i64,
-                #[column(references = Parent::id, on_delete = "set null")] p: i64,
-            }
-        "#;
+        let source = &parent_child_schema(
+            r#"#[column(references = Parent::id, on_delete = "set null")] p: i64,"#,
+        );
         let error = parse_schema(source).unwrap_err();
         assert!(error.contains("requires a nullable"), "got: {error}");
     }
