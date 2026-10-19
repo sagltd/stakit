@@ -1,5 +1,7 @@
 //! The [`Action`] trait and its type-erased form.
 
+use std::any::Any;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 
@@ -59,12 +61,73 @@ pub trait Action<G, R>: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send + 'a;
 }
 
+/// The TypeScript-facing signature of an action: its input and output (or
+/// item) type references, the declarations they pull in, and its error codes.
+pub(crate) struct Signature {
+    pub(crate) input: String,
+    pub(crate) output: String,
+    pub(crate) codes: &'static [&'static str],
+    declare: fn(&mut BTreeMap<String, String>),
+}
+
+impl Signature {
+    fn of<I: TSType, O: TSType, E: ErrorCodes>() -> Self {
+        Self {
+            input: I::ts_ref(),
+            output: O::ts_ref(),
+            codes: E::error_codes(),
+            declare: |out| {
+                I::ts_declarations(out);
+                O::ts_declarations(out);
+            },
+        }
+    }
+
+    /// Adds every declaration the input and output types reference to `out`.
+    pub(crate) fn collect_ts(&self, out: &mut BTreeMap<String, String>) {
+        (self.declare)(out);
+    }
+}
+
+/// The error a panicking action, guard or hook is reported as.
+fn panicked(panic: &(dyn Any + Send)) -> Error {
+    Error::internal(format!("action panicked: {}", panic_message(panic)))
+}
+
+/// The unary pipeline shared by [`Action`] and [`BorrowAction`]: guard (before
+/// any deserialize/validate), decode, validate, run, `after`, encode. It all
+/// runs inside `catch_unwind`, so a panicking action (or guard) becomes a `500`
+/// error instead of crashing the app/connection.
+async fn run_unary<I, O, E, Before, Run, After>(
+    before: impl FnOnce() -> Before,
+    decode: impl FnOnce() -> Result<I, serde_json::Error>,
+    run: impl FnOnce(I) -> Run,
+    after: impl FnOnce() -> After,
+) -> Result<Value, Error>
+where
+    I: Validate,
+    O: Serialize,
+    E: Into<Error>,
+    Before: Future<Output = Result<(), Error>>,
+    Run: Future<Output = Result<O, E>>,
+    After: Future<Output = ()>,
+{
+    let work = AssertUnwindSafe(async move {
+        before().await?;
+        let input = decode().map_err(|e| Error::decode(&e))?;
+        input.validate().map_err(Error::validation)?;
+        let result = run(input).await.map_err(Into::into);
+        after().await;
+        serde_json::to_value(result?).map_err(|e| Error::encode(&e))
+    });
+    work.catch_unwind()
+        .await
+        .unwrap_or_else(|panic| Err(panicked(&*panic)))
+}
+
 /// Object-safe erasure so the router can hold heterogeneous actions by name.
 pub(crate) trait ErasedAction<G, R>: Send + Sync {
-    fn input_ref(&self) -> String;
-    fn output_ref(&self) -> String;
-    fn collect_ts(&self, out: &mut std::collections::BTreeMap<String, String>);
-    fn error_codes(&self) -> &'static [&'static str];
+    fn signature(&self) -> Signature;
     fn dispatch<'a>(
         &'a self,
         cx: &'a Cx<G, R>,
@@ -78,21 +141,8 @@ where
     G: Send + Sync + 'static,
     R: Send + Sync + 'static,
 {
-    fn input_ref(&self) -> String {
-        <A::Input as TSType>::ts_ref()
-    }
-
-    fn output_ref(&self) -> String {
-        <A::Output as TSType>::ts_ref()
-    }
-
-    fn collect_ts(&self, out: &mut std::collections::BTreeMap<String, String>) {
-        <A::Input as TSType>::ts_declarations(out);
-        <A::Output as TSType>::ts_declarations(out);
-    }
-
-    fn error_codes(&self) -> &'static [&'static str] {
-        <A::Error as ErrorCodes>::error_codes()
+    fn signature(&self) -> Signature {
+        Signature::of::<A::Input, A::Output, A::Error>()
     }
 
     fn dispatch<'a>(
@@ -100,26 +150,12 @@ where
         cx: &'a Cx<G, R>,
         params: Value,
     ) -> BoxFuture<'a, Result<Value, Error>> {
-        // The whole pipeline runs inside `catch_unwind`: a panicking action (or
-        // guard) becomes a `500` error instead of crashing the app/connection.
-        Box::pin(async move {
-            let work = AssertUnwindSafe(async move {
-                self.before(cx).await?; // guard before deserialize/validate
-                let input: A::Input =
-                    serde_json::from_value(params).map_err(|e| Error::decode(&e))?;
-                input.validate().map_err(Error::validation)?;
-                let result = self.run(cx, input).await.map_err(Into::into);
-                self.after(cx).await;
-                serde_json::to_value(result?).map_err(|e| Error::encode(&e))
-            });
-            match work.catch_unwind().await {
-                Ok(result) => result,
-                Err(panic) => Err(Error::internal(format!(
-                    "action panicked: {}",
-                    panic_message(&*panic)
-                ))),
-            }
-        })
+        Box::pin(run_unary(
+            || self.before(cx),
+            || serde_json::from_value::<A::Input>(params),
+            |input| self.run(cx, input),
+            || self.after(cx),
+        ))
     }
 }
 
@@ -177,10 +213,7 @@ pub trait BorrowAction<G, R>: Send + Sync + 'static {
 /// bytes (a slice of the request buffer) rather than an owned [`Value`], so the
 /// borrowed input can point into them.
 pub(crate) trait ErasedBorrowAction<G, R>: Send + Sync {
-    fn input_ref(&self) -> String;
-    fn output_ref(&self) -> String;
-    fn collect_ts(&self, out: &mut std::collections::BTreeMap<String, String>);
-    fn error_codes(&self) -> &'static [&'static str];
+    fn signature(&self) -> Signature;
     fn dispatch<'a>(
         &'a self,
         cx: &'a Cx<G, R>,
@@ -194,22 +227,9 @@ where
     G: Send + Sync + 'static,
     R: Send + Sync + 'static,
 {
-    fn input_ref(&self) -> String {
+    fn signature(&self) -> Signature {
         // TS export is lifetime-agnostic; any concrete lifetime names the type.
-        <A::Input<'static> as TSType>::ts_ref()
-    }
-
-    fn output_ref(&self) -> String {
-        <A::Output as TSType>::ts_ref()
-    }
-
-    fn collect_ts(&self, out: &mut std::collections::BTreeMap<String, String>) {
-        <A::Input<'static> as TSType>::ts_declarations(out);
-        <A::Output as TSType>::ts_declarations(out);
-    }
-
-    fn error_codes(&self) -> &'static [&'static str] {
-        <A::Error as ErrorCodes>::error_codes()
+        Signature::of::<A::Input<'static>, A::Output, A::Error>()
     }
 
     fn dispatch<'a>(
@@ -217,25 +237,13 @@ where
         cx: &'a Cx<G, R>,
         params: &'a [u8],
     ) -> BoxFuture<'a, Result<Value, Error>> {
-        Box::pin(async move {
-            let work = AssertUnwindSafe(async move {
-                self.before(cx).await?; // guard before deserialize/validate
-                // Zero-copy: `input` borrows out of `params` (the request buffer).
-                let input: A::Input<'a> =
-                    serde_json::from_slice(params).map_err(|e| Error::decode(&e))?;
-                input.validate().map_err(Error::validation)?;
-                let result = self.run(cx, input).await.map_err(Into::into);
-                self.after(cx).await;
-                serde_json::to_value(result?).map_err(|e| Error::encode(&e))
-            });
-            match work.catch_unwind().await {
-                Ok(result) => result,
-                Err(panic) => Err(Error::internal(format!(
-                    "action panicked: {}",
-                    panic_message(&*panic)
-                ))),
-            }
-        })
+        Box::pin(run_unary(
+            || self.before(cx),
+            // Zero-copy: `input` borrows out of `params` (the request buffer).
+            || serde_json::from_slice::<A::Input<'a>>(params),
+            |input| self.run(cx, input),
+            || self.after(cx),
+        ))
     }
 }
 
@@ -281,10 +289,7 @@ pub trait StreamAction<G, R>: Send + Sync + 'static {
 
 /// Object-safe erasure for streaming actions.
 pub(crate) trait ErasedStreamAction<G, R>: Send + Sync {
-    fn input_ref(&self) -> String;
-    fn item_ref(&self) -> String;
-    fn collect_ts(&self, out: &mut std::collections::BTreeMap<String, String>);
-    fn error_codes(&self) -> &'static [&'static str];
+    fn signature(&self) -> Signature;
     fn dispatch<'a>(
         &'a self,
         cx: &'a Cx<G, R>,
@@ -298,21 +303,8 @@ where
     G: Send + Sync + 'static,
     R: Send + Sync + 'static,
 {
-    fn input_ref(&self) -> String {
-        <A::Input as TSType>::ts_ref()
-    }
-
-    fn item_ref(&self) -> String {
-        <A::Item as TSType>::ts_ref()
-    }
-
-    fn collect_ts(&self, out: &mut std::collections::BTreeMap<String, String>) {
-        <A::Input as TSType>::ts_declarations(out);
-        <A::Item as TSType>::ts_declarations(out);
-    }
-
-    fn error_codes(&self) -> &'static [&'static str] {
-        <A::Error as ErrorCodes>::error_codes()
+    fn signature(&self) -> Signature {
+        Signature::of::<A::Input, A::Item, A::Error>()
     }
 
     fn dispatch<'a>(
@@ -330,7 +322,7 @@ where
                     return;
                 }
                 Err(panic) => {
-                    yield Err(Error::internal(format!("action panicked: {}", panic_message(&*panic))));
+                    yield Err(panicked(&*panic));
                     return;
                 }
             }
@@ -357,7 +349,7 @@ where
                     }
                     Ok(None) => break,
                     Err(panic) => {
-                        yield Err(Error::internal(format!("action panicked: {}", panic_message(&*panic))));
+                        yield Err(panicked(&*panic));
                         return;
                     }
                 }
@@ -365,7 +357,7 @@ where
             // `after` is caught too: a panicking teardown hook ends the stream
             // with an error frame instead of escaping the spawned task.
             if let Err(panic) = AssertUnwindSafe(self.after(cx)).catch_unwind().await {
-                yield Err(Error::internal(format!("action panicked: {}", panic_message(&*panic))));
+                yield Err(panicked(&*panic));
             }
         })
     }

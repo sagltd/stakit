@@ -68,6 +68,27 @@ pub trait StreamActionExt<G, R>: StreamAction<G, R> + Sized {
 
 impl<G, R, A: StreamAction<G, R>> StreamActionExt<G, R> for A {}
 
+/// The `name`/`before`/`after` methods both guard wrappers share. The guard
+/// rides the `before`/`after` hooks (which the router runs *before*
+/// deserialize/validate), so a rejected caller never reaches parsing/the body.
+macro_rules! guarded_hooks {
+    () => {
+        fn name(&self) -> &'static str {
+            self.action.name()
+        }
+
+        async fn before<'a>(&'a self, cx: &'a Cx<G, R>) -> Result<(), Error> {
+            self.action.before(cx).await?;
+            self.mw.before(cx).await
+        }
+
+        async fn after<'a>(&'a self, cx: &'a Cx<G, R>) {
+            self.mw.after(cx).await;
+            self.action.after(cx).await;
+        }
+    };
+}
+
 /// A unary action wrapped with a [`Middleware`] guard (see [`ActionExt::middleware`]).
 pub struct Guarded<A, M> {
     action: A,
@@ -85,21 +106,7 @@ where
     type Output = A::Output;
     type Error = A::Error;
 
-    fn name(&self) -> &'static str {
-        self.action.name()
-    }
-
-    // The guard rides the `before`/`after` hooks (which the router runs *before*
-    // deserialize/validate), so a rejected caller never reaches parsing/the body.
-    async fn before<'a>(&'a self, cx: &'a Cx<G, R>) -> Result<(), Error> {
-        self.action.before(cx).await?;
-        self.mw.before(cx).await
-    }
-
-    async fn after<'a>(&'a self, cx: &'a Cx<G, R>) {
-        self.mw.after(cx).await;
-        self.action.after(cx).await;
-    }
+    guarded_hooks!();
 
     fn run<'a>(
         &'a self,
@@ -128,19 +135,7 @@ where
     type Item = A::Item;
     type Error = A::Error;
 
-    fn name(&self) -> &'static str {
-        self.action.name()
-    }
-
-    async fn before<'a>(&'a self, cx: &'a Cx<G, R>) -> Result<(), Error> {
-        self.action.before(cx).await?;
-        self.mw.before(cx).await
-    }
-
-    async fn after<'a>(&'a self, cx: &'a Cx<G, R>) {
-        self.mw.after(cx).await;
-        self.action.after(cx).await;
-    }
+    guarded_hooks!();
 
     fn run<'a>(
         &'a self,

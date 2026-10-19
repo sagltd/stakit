@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use hashbrown::HashMap;
 
-use crate::action::{ErasedAction, ErasedBorrowAction, ErasedStreamAction};
+use crate::action::{ErasedAction, ErasedBorrowAction, ErasedStreamAction, Signature};
 use crate::client::ClientMeta;
 use crate::error::BUILTIN_ERROR_CODES;
 
@@ -22,9 +22,7 @@ type Streams<G, R> = HashMap<&'static str, Arc<dyn ErasedStreamAction<G, R>>>;
 /// zero-copy [`BorrowAction`] alike (both are unary on the wire).
 struct Unary {
     name: &'static str,
-    input: String,
-    output: String,
-    codes: &'static [&'static str],
+    signature: Signature,
 }
 
 pub(crate) fn generate<G, R>(
@@ -38,30 +36,24 @@ pub(crate) fn generate<G, R>(
 
     // Unify owned + borrow actions into one unary list (collecting decls as we go).
     let mut unary: Vec<Unary> = Vec::with_capacity(actions.len() + borrow_actions.len());
-    for (name, action) in actions {
-        action.collect_ts(&mut decls);
-        unary.push(Unary {
-            name,
-            input: action.input_ref(),
-            output: action.output_ref(),
-            codes: action.error_codes(),
-        });
-    }
-    for (name, action) in borrow_actions {
-        action.collect_ts(&mut decls);
-        unary.push(Unary {
-            name,
-            input: action.input_ref(),
-            output: action.output_ref(),
-            codes: action.error_codes(),
-        });
+    let signatures = actions
+        .iter()
+        .map(|(name, action)| (*name, action.signature()))
+        .chain(
+            borrow_actions
+                .iter()
+                .map(|(name, action)| (*name, action.signature())),
+        );
+    for (name, signature) in signatures {
+        signature.collect_ts(&mut decls);
+        unary.push(Unary { name, signature });
     }
     unary.sort_unstable_by_key(|u| u.name);
 
     let mut stream: Vec<&'static str> = streams.keys().copied().collect();
     stream.sort_unstable();
     for name in &stream {
-        streams[*name].collect_ts(&mut decls);
+        streams[*name].signature().collect_ts(&mut decls);
     }
 
     let mut clients: Vec<&ClientMeta> = client_actions.iter().collect();
@@ -93,10 +85,10 @@ fn write_error_envelope<G, R>(
 ) {
     let mut codes: BTreeSet<&'static str> = BUILTIN_ERROR_CODES.iter().copied().collect();
     for u in unary {
-        codes.extend(u.codes);
+        codes.extend(u.signature.codes);
     }
     for name in stream {
-        codes.extend(streams[*name].error_codes());
+        codes.extend(streams[*name].signature().codes);
     }
     let union = codes
         .iter()
@@ -128,17 +120,17 @@ fn write_interfaces<G, R>(
 ) {
     out.push_str("export interface ActionParameters {\n");
     for u in unary {
-        let _ = writeln!(out, "  {}: {};", u.name, u.input);
+        let _ = writeln!(out, "  {}: {};", u.name, u.signature.input);
     }
     for name in stream {
-        let _ = writeln!(out, "  {name}: {};", streams[*name].input_ref());
+        let _ = writeln!(out, "  {name}: {};", streams[*name].signature().input);
     }
     out.push_str("}\n\nexport interface ActionResults {\n");
     for u in unary {
-        let _ = writeln!(out, "  {}: {};", u.name, u.output);
+        let _ = writeln!(out, "  {}: {};", u.name, u.signature.output);
     }
     for name in stream {
-        let _ = writeln!(out, "  {name}: {};", streams[*name].item_ref());
+        let _ = writeln!(out, "  {name}: {};", streams[*name].signature().output);
     }
     out.push_str("}\n\nexport interface ActionKinds {\n");
     for u in unary {
