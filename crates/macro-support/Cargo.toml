@@ -1,0 +1,15 @@
+[package]
+name = "stakit-macro-support"
+description = "Shared `syn` helpers for stakit's proc-macro crates."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+syn.workspace = true
+
+[lints]
+workspace = true

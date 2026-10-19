@@ -8,25 +8,9 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{GenericArgument, Generics, Ident, PathArguments, Type};
+use syn::{Generics, Ident, Type};
 
-use crate::ir::{Body, Field, Ir, Variant};
-
-/// Returns the inner type `T` if `ty` is `Option<T>`.
-fn option_inner(ty: &Type) -> Option<&Type> {
-    let Type::Path(tp) = ty else { return None };
-    let seg = tp.path.segments.last()?;
-    if seg.ident != "Option" {
-        return None;
-    }
-    let PathArguments::AngleBracketed(args) = &seg.arguments else {
-        return None;
-    };
-    args.args.iter().find_map(|a| match a {
-        GenericArgument::Type(t) => Some(t),
-        _ => None,
-    })
-}
+use crate::ir::{Body, Field, Ir, Variant, option_inner};
 
 /// `<Ty as TSType>::ts_ref()` preserves nullable values in every field position.
 /// Named optional properties separately allow omission with `?`.

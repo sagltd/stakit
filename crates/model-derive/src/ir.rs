@@ -397,3 +397,8 @@ fn parse_description(attrs: &[Attribute]) -> syn::Result<Option<String>> {
     let joined = lines.join("\n").trim().to_owned();
     Ok((!joined.is_empty()).then_some(joined))
 }
+
+/// Returns the inner type `T` if `ty` is `Option<T>`.
+pub(crate) fn option_inner(ty: &Type) -> Option<&Type> {
+    stakit_macro_support::type_args(ty, "Option")?.next()
+}

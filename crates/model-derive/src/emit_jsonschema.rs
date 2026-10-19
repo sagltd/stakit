@@ -10,29 +10,13 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{GenericArgument, Ident, PathArguments, Type};
+use syn::Ident;
 
-use crate::ir::{Body, Field, Ir, Rule, Variant};
+use crate::ir::{Body, Field, Ir, Rule, Variant, option_inner};
 
 /// Path to the re-exported `serde_json` in generated code.
 fn sj() -> TokenStream {
     quote!(::stakit_model::__serde_json)
-}
-
-/// Returns the inner type `T` if `ty` is `Option<T>`.
-fn option_inner(ty: &Type) -> Option<&Type> {
-    let Type::Path(tp) = ty else { return None };
-    let seg = tp.path.segments.last()?;
-    if seg.ident != "Option" {
-        return None;
-    }
-    let PathArguments::AngleBracketed(args) = &seg.arguments else {
-        return None;
-    };
-    args.args.iter().find_map(|a| match a {
-        GenericArgument::Type(t) => Some(t),
-        _ => None,
-    })
 }
 
 pub(crate) fn expand(ident: &Ident, ir: &Ir) -> TokenStream {

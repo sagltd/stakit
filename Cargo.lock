@@ -3235,6 +3235,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
+ "stakit-macro-support",
  "syn",
 ]
 
@@ -3261,6 +3262,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "stakit-macro-support"
+version = "0.1.0"
+dependencies = [
+ "syn",
+]
+
+[[package]]
 name = "stakit-model"
 version = "0.1.0"
 dependencies = [
@@ -3279,6 +3287,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
+ "stakit-macro-support",
  "syn",
 ]
 
@@ -3347,6 +3356,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
+ "stakit-macro-support",
  "syn",
 ]
 

@@ -57,6 +57,7 @@ stakit-router-derive = { path = "crates/router-derive", version = "0.1.0" }
 stakit-ai-sdk = { path = "crates/ai-sdk", version = "0.1.0" }
 stakit-ai-sdk-derive = { path = "crates/ai-sdk-derive", version = "0.1.0" }
 stakit-client = { path = "crates/client", version = "0.1.0" }
+stakit-macro-support = { path = "crates/macro-support", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

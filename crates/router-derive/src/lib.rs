@@ -15,9 +15,10 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
+use stakit_macro_support::{split_params, type_args};
 use syn::{
-    AssocType, DeriveInput, FnArg, GenericArgument, ItemFn, PatType, PathArguments, ReturnType,
-    Type, parse_macro_input, spanned::Spanned,
+    AssocType, DeriveInput, GenericArgument, ItemFn, PathArguments, ReturnType, Type,
+    parse_macro_input, spanned::Spanned,
 };
 
 mod response_error;
@@ -99,21 +100,7 @@ fn expand(func: &ItemFn, is_stream: bool) -> syn::Result<proc_macro2::TokenStrea
 
     // Classify args: `&Cx<G, R>` is the context, the other is params. We keep the
     // user's written `Cx<…>` type so their `use Cx` / `use Error` stay "used".
-    let mut cx: Option<(syn::Pat, Type, Type, Type)> = None;
-    let mut params: Option<(syn::Pat, Type)> = None;
-    for arg in &func.sig.inputs {
-        let FnArg::Typed(PatType { pat, ty, .. }) = arg else {
-            return Err(syn::Error::new(
-                arg.span(),
-                "`#[action]` does not take `self`",
-            ));
-        };
-        if let Some((cx_ty, g, r)) = cx_info(ty) {
-            cx = Some(((**pat).clone(), cx_ty, g, r));
-        } else {
-            params = Some(((**pat).clone(), (**ty).clone()));
-        }
-    }
+    let (cx, params) = split_params(func, "`#[action]`", cx_info)?;
 
     let cx_bind = cx
         .as_ref()
@@ -124,7 +111,7 @@ fn expand(func: &ItemFn, is_stream: bool) -> syn::Result<proc_macro2::TokenStrea
     };
 
     let (impl_header, g_ty, r_ty, cx_param_ty) = match &cx {
-        Some((_, cx_ty, g, r)) => (quote!(impl), quote!(#g), quote!(#r), quote!(&'a #cx_ty)),
+        Some((_, (cx_ty, g, r))) => (quote!(impl), quote!(#g), quote!(#r), quote!(&'a #cx_ty)),
         None => (
             quote!(impl<G: ::core::marker::Send + ::core::marker::Sync + 'static, R: ::core::marker::Send + ::core::marker::Sync + 'static>),
             quote!(G),
@@ -211,22 +198,8 @@ fn cx_info(ty: &Type) -> Option<(Type, Type, Type)> {
     let Type::Reference(reference) = ty else {
         return None;
     };
-    let inner = (*reference.elem).clone();
-    let Type::Path(path) = &inner else {
-        return None;
-    };
-    let seg = path.path.segments.last()?;
-    if seg.ident != "Cx" {
-        return None;
-    }
-    let PathArguments::AngleBracketed(args) = &seg.arguments else {
-        return None;
-    };
-    let mut types = args.args.iter().filter_map(|a| match a {
-        GenericArgument::Type(t) => Some(t.clone()),
-        _ => None,
-    });
-    Some((inner.clone(), types.next()?, types.next()?))
+    let mut types = type_args(&reference.elem, "Cx")?.cloned();
+    Some(((*reference.elem).clone(), types.next()?, types.next()?))
 }
 
 fn return_type(output: &ReturnType) -> syn::Result<&Type> {
@@ -241,18 +214,7 @@ fn return_type(output: &ReturnType) -> syn::Result<&Type> {
 
 /// `(O, Some(E))` from `Result<O, E>`, `(O, None)` from `Result<O>`.
 fn result_parts(ty: &Type) -> Option<(Type, Option<Type>)> {
-    let Type::Path(path) = ty else { return None };
-    let seg = path.path.segments.last()?;
-    if seg.ident != "Result" {
-        return None;
-    }
-    let PathArguments::AngleBracketed(args) = &seg.arguments else {
-        return None;
-    };
-    let mut types = args.args.iter().filter_map(|a| match a {
-        GenericArgument::Type(t) => Some(t.clone()),
-        _ => None,
-    });
+    let mut types = type_args(ty, "Result")?.cloned();
     Some((types.next()?, types.next()))
 }
 

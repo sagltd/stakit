@@ -19,9 +19,10 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
+use stakit_macro_support::{split_params, type_args};
 use syn::{
-    Expr, ExprLit, FnArg, GenericArgument, ItemFn, Lit, Meta, PatType, PathArguments, ReturnType,
-    Token, Type, parse_macro_input, punctuated::Punctuated, spanned::Spanned,
+    Expr, ExprLit, ItemFn, Lit, Meta, ReturnType, Token, Type, parse_macro_input,
+    punctuated::Punctuated, spanned::Spanned,
 };
 
 /// See the crate docs.
@@ -94,21 +95,7 @@ fn expand(func: &ItemFn, args: &ToolArgs) -> syn::Result<proc_macro2::TokenStrea
         .unwrap_or_default();
 
     // Classify args: `&ToolCx<Ctx>` is the context; the other is the args type.
-    let mut cx: Option<(syn::Pat, Type)> = None;
-    let mut params: Option<(syn::Pat, Type)> = None;
-    for arg in &func.sig.inputs {
-        let FnArg::Typed(PatType { pat, ty, .. }) = arg else {
-            return Err(syn::Error::new(
-                arg.span(),
-                "`#[tool]` does not take `self`",
-            ));
-        };
-        if let Some(ctx_ty) = cx_ctx_type(ty) {
-            cx = Some(((**pat).clone(), ctx_ty));
-        } else {
-            params = Some(((**pat).clone(), (**ty).clone()));
-        }
-    }
+    let (cx, params) = split_params(func, "`#[tool]`", cx_ctx_type)?;
 
     let cx_bind = cx.as_ref().map_or_else(|| quote!(_cx), |(p, _)| quote!(#p));
     let (args_ty, args_bind) = match &params {
@@ -159,20 +146,7 @@ fn cx_ctx_type(ty: &Type) -> Option<Type> {
     let Type::Reference(reference) = ty else {
         return None;
     };
-    let Type::Path(path) = &*reference.elem else {
-        return None;
-    };
-    let seg = path.path.segments.last()?;
-    if seg.ident != "ToolCx" {
-        return None;
-    }
-    let PathArguments::AngleBracketed(args) = &seg.arguments else {
-        return None;
-    };
-    args.args.iter().find_map(|a| match a {
-        GenericArgument::Type(t) => Some(t.clone()),
-        _ => None,
-    })
+    type_args(&reference.elem, "ToolCx")?.next().cloned()
 }
 
 /// Extracts `Output` from a `Result<Output, _>` return type.
@@ -180,18 +154,7 @@ fn result_output(output: &ReturnType) -> Option<Type> {
     let ReturnType::Type(_, ty) = output else {
         return None;
     };
-    let Type::Path(path) = &**ty else { return None };
-    let seg = path.path.segments.last()?;
-    if seg.ident != "Result" {
-        return None;
-    }
-    let PathArguments::AngleBracketed(generics) = &seg.arguments else {
-        return None;
-    };
-    generics.args.iter().find_map(|a| match a {
-        GenericArgument::Type(t) => Some(t.clone()),
-        _ => None,
-    })
+    type_args(ty, "Result")?.next().cloned()
 }
 
 /// Joins the function's `///` doc-comments into a description.

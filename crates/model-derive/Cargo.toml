@@ -23,6 +23,7 @@ schema = []
 syn.workspace = true
 quote.workspace = true
 proc-macro2.workspace = true
+stakit-macro-support.workspace = true
 
 [lints]
 workspace = true
