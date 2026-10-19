@@ -46,6 +46,7 @@ const MAX_INFLIGHT_TOOLS: usize = crate::provider::MAX_STREAM_OPEN_BLOCKS;
 pub struct ClaudeClient {
     api_key: String,
     base_url: String,
+    endpoint: Option<String>,
     http: Option<reqwest::Client>,
 }
 
@@ -55,6 +56,7 @@ impl std::fmt::Debug for ClaudeClient {
         f.debug_struct("ClaudeClient")
             .field("api_key", &"[redacted]")
             .field("base_url", &self.base_url)
+            .field("endpoint", &self.endpoint)
             .finish_non_exhaustive()
     }
 }
@@ -66,6 +68,7 @@ impl ClaudeClient {
         Self {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_owned(),
+            endpoint: None,
             http: crate::provider::http_client(),
         }
     }
@@ -85,6 +88,21 @@ impl ClaudeClient {
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
+    }
+
+    /// Overrides the full request URL (instead of `{base_url}/v1/messages`), for
+    /// compatible APIs mounted under a different path, e.g. Gemini's
+    /// `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`.
+    #[must_use]
+    pub fn with_endpoint(mut self, url: impl Into<String>) -> Self {
+        self.endpoint = Some(url.into());
+        self
+    }
+
+    fn url(&self) -> String {
+        self.endpoint
+            .clone()
+            .unwrap_or_else(|| format!("{}/v1/messages", self.base_url))
     }
 
     /// Mints a [`ClaudeModel`] for the given model id.
@@ -194,7 +212,7 @@ impl ClaudeModel {
         let http = self.client.http.as_ref().ok_or_else(|| {
             ProviderError::Transport("provider HTTP client initialization failed".into())
         })?;
-        http.post(format!("{}/v1/messages", self.client.base_url))
+        http.post(self.client.url())
             .header("x-api-key", &self.client.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&body)

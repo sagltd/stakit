@@ -325,6 +325,10 @@ mod http_client_test;
 #[cfg(all(test, feature = "claude", feature = "openai"))]
 mod redirect_test;
 
+#[cfg(all(test, feature = "claude", feature = "openai"))]
+#[path = "provider/endpoint_test.rs"]
+mod endpoint_test;
+
 /// Parses the `Retry-After` response header (delta-seconds form) into a
 /// [`Duration`](std::time::Duration). HTTP-date forms and unparseable values
 /// yield `None`. Shared by the built-in providers when building a 429 error.

@@ -41,6 +41,7 @@ const MAX_TOOL_ARGS: usize = crate::provider::MAX_STREAM_BLOCK_BYTES;
 pub struct OpenAiClient {
     api_key: String,
     base_url: String,
+    endpoint: Option<String>,
     http: Option<reqwest::Client>,
 }
 
@@ -50,6 +51,7 @@ impl std::fmt::Debug for OpenAiClient {
         f.debug_struct("OpenAiClient")
             .field("api_key", &"[redacted]")
             .field("base_url", &self.base_url)
+            .field("endpoint", &self.endpoint)
             .finish_non_exhaustive()
     }
 }
@@ -61,6 +63,7 @@ impl OpenAiClient {
         Self {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_owned(),
+            endpoint: None,
             http: crate::provider::http_client(),
         }
     }
@@ -80,6 +83,21 @@ impl OpenAiClient {
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
+    }
+
+    /// Overrides the full request URL (instead of `{base_url}/v1/chat/completions`), for
+    /// compatible APIs mounted under a different path, e.g. Gemini's
+    /// `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`.
+    #[must_use]
+    pub fn with_endpoint(mut self, url: impl Into<String>) -> Self {
+        self.endpoint = Some(url.into());
+        self
+    }
+
+    fn url(&self) -> String {
+        self.endpoint
+            .clone()
+            .unwrap_or_else(|| format!("{}/v1/chat/completions", self.base_url))
     }
 
     /// Mints an [`OpenAiModel`] for the given model id.
@@ -188,7 +206,7 @@ impl OpenAiModel {
         let http = self.client.http.as_ref().ok_or_else(|| {
             ProviderError::Transport("provider HTTP client initialization failed".into())
         })?;
-        http.post(format!("{}/v1/chat/completions", self.client.base_url))
+        http.post(self.client.url())
             .bearer_auth(&self.client.api_key)
             .json(&body)
             .send()
