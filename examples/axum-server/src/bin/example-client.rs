@@ -3,20 +3,14 @@
 //! Start the server first (`cargo run --bin axum-server-example`), then:
 //!   cargo run --bin example-client
 
-use axum_server_example::{
-    Count, Greet, Greeting, SaveImage, count, greet, progress, save_image, version,
-};
+use axum_server_example::demo::{batch_greetings, client, progress_over_ws, upload_image};
+use axum_server_example::{Count, Greet, Greeting, count, greet};
 use futures::StreamExt as _;
-use stakit_client::{CallOpts, Client, ServerFrame};
+use stakit_client::ServerFrame;
 
 #[tokio::main]
 async fn main() {
-    let base = "http://127.0.0.1:3007";
-    let client = Client::builder(format!("{base}/app"))
-        .header("x-admin", "true")
-        .stream_url(format!("{base}/stream"))
-        .ws_url(format!("{base}/ws"))
-        .build();
+    let client = client("http://127.0.0.1:3007");
 
     println!("== HTTP unary: greet ==");
     let r = client
@@ -45,26 +39,7 @@ async fn main() {
     println!("  greet(\"\") -> error {:?}", r.error());
 
     println!("== HTTP: fetch MANY actions in ONE request (typed batch) ==");
-    let results = client
-        .batch()
-        .add(
-            greet,
-            Greet {
-                name: "alice".to_owned(),
-                user_id: Some(1),
-            },
-        )
-        .add(
-            greet,
-            Greet {
-                name: "bob".to_owned(),
-                user_id: None,
-            },
-        )
-        .add(version, ())
-        .send()
-        .await
-        .unwrap();
+    let results = batch_greetings(&client).await.unwrap();
     println!("  {} results in one round-trip:", results.len());
     let g0 = results.get::<Greeting>(0).unwrap();
     let g1 = results.get::<Greeting>(1).unwrap();
@@ -80,16 +55,7 @@ async fn main() {
     println!("  [2] version -> {:?}", ver.data());
 
     println!("== HTTP files: save_image (multipart) ==");
-    let r = client
-        .fetch_with(
-            save_image,
-            SaveImage {
-                file_name: "demo.png".to_owned(),
-            },
-            CallOpts::new().file(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
-        )
-        .await
-        .unwrap();
+    let r = upload_image(&client, "demo.png").await.unwrap();
     println!(
         "  save_image -> {:?}",
         r.data().map(|s| (s.bytes, s.path.as_str()))
@@ -102,24 +68,21 @@ async fn main() {
     }
 
     println!("== WS: progress + server->client client_call(showToast) ==");
-    let mut conn = client.connect(CallOpts::new()).await.unwrap();
-    conn.send(progress, Count { n: 3 }).await.unwrap();
-    loop {
-        match conn.recv().await {
-            Some(Ok(ServerFrame::ClientCall { id, action, data })) => {
-                println!("  server called client action '{action}' with {data}");
-                conn.reply(id, "shown").await.unwrap();
-            }
-            Some(Ok(ServerFrame::Result { result, .. })) => {
-                println!("  progress item -> {result:?}");
-            }
-            Some(Ok(ServerFrame::End { .. })) | None => break,
-            Some(Err(error)) => {
-                println!("  ws error: {error}");
-                break;
+    match progress_over_ws(&client, 3).await {
+        Ok(frames) => {
+            for frame in frames {
+                match frame {
+                    ServerFrame::ClientCall { action, data, .. } => {
+                        println!("  server called client action '{action}' with {data}");
+                    }
+                    ServerFrame::Result { result, .. } => {
+                        println!("  progress item -> {result:?}");
+                    }
+                    ServerFrame::End { .. } => {}
+                }
             }
         }
+        Err(error) => println!("  ws error: {error}"),
     }
-    conn.close().await.unwrap();
     println!("== done ==");
 }

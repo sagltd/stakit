@@ -19,9 +19,9 @@ use axum::Router as AxumRouter;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequest as _, Multipart, Query, Request, State};
-use axum::http::header::CONTENT_TYPE;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, post};
 use futures::{SinkExt as _, StreamExt as _};
@@ -32,6 +32,8 @@ use serde_json::Value;
 // (`stakit-model` is still a Cargo dependency — the macros expand to its paths.)
 use stakit_model::Validate as _;
 use stakit_router::{ClientAction, Cx, Error, Router, action, model};
+
+pub mod demo;
 
 // ---- global context ----
 /// Shared application state.
@@ -155,21 +157,17 @@ pub async fn notify(cx: &Cx<App, Req>, params: Greet) -> Result<Greeting, Error>
     Ok(Greeting { message: ack })
 }
 
-/// Streams `0..n`, asking the client to show a toast before each item.
+/// Streams `0..n`, asking the client to show a toast before each item. A
+/// failed `client_call` ends the stream with that error (`?` in `try_stream!`).
 #[action(stream)]
 pub fn progress(
     cx: &Cx<App, Req>,
     params: Count,
 ) -> impl futures::Stream<Item = Result<u64, Error>> {
-    async_stream::stream! {
+    async_stream::try_stream! {
         for i in 0..params.n {
-            match cx.client_call::<ShowToast>(Toast { text: format!("step {i}") }).await {
-                Ok(_ack) => yield Ok(i),
-                Err(e) => {
-                    yield Err(e);
-                    return;
-                }
-            }
+            cx.client_call::<ShowToast>(Toast { text: format!("step {i}") }).await?;
+            yield i;
         }
     }
 }
@@ -321,7 +319,10 @@ async fn app_post(State(state): State<AppState>, request: Request) -> Response {
         let body = to_bytes(request.into_body(), BODY_LIMIT)
             .await
             .unwrap_or_default();
-        (serde_json::from_slice(&body).unwrap_or(Value::Null), Vec::new())
+        (
+            serde_json::from_slice(&body).unwrap_or(Value::Null),
+            Vec::new(),
+        )
     };
     let response = state
         .router

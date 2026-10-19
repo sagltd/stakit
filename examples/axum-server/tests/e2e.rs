@@ -6,10 +6,9 @@
 use futures::StreamExt as _;
 use tokio::net::TcpListener;
 
-use axum_server_example::{
-    Count, Greet, Greeting, SaveImage, app, count, greet, progress, save_image, version,
-};
-use stakit_client::{CallOpts, Client, ServerFrame};
+use axum_server_example::demo::{batch_greetings, client, progress_over_ws, upload_image};
+use axum_server_example::{Count, Greet, Greeting, app, count, greet};
+use stakit_client::ServerFrame;
 
 /// Spawns the example server on a random port; returns its origin.
 async fn spawn() -> String {
@@ -21,17 +20,9 @@ async fn spawn() -> String {
     format!("http://{addr}")
 }
 
-fn client_for(origin: &str) -> Client {
-    Client::builder(format!("{origin}/app"))
-        .header("x-admin", "true")
-        .stream_url(format!("{origin}/stream"))
-        .ws_url(format!("{origin}/ws"))
-        .build()
-}
-
 #[tokio::test]
 async fn http_unary_ok() {
-    let client = client_for(&spawn().await);
+    let client = client(&spawn().await);
     let res = client
         .fetch(
             greet,
@@ -47,7 +38,7 @@ async fn http_unary_ok() {
 
 #[tokio::test]
 async fn http_unary_validation_error() {
-    let client = client_for(&spawn().await);
+    let client = client(&spawn().await);
     let res = client
         .fetch(
             greet,
@@ -65,27 +56,8 @@ async fn http_unary_validation_error() {
 
 #[tokio::test]
 async fn http_typed_batch_many_actions() {
-    let client = client_for(&spawn().await);
-    let results = client
-        .batch()
-        .add(
-            greet,
-            Greet {
-                name: "alice".to_owned(),
-                user_id: Some(1),
-            },
-        )
-        .add(
-            greet,
-            Greet {
-                name: "bob".to_owned(),
-                user_id: None,
-            },
-        )
-        .add(version, ())
-        .send()
-        .await
-        .unwrap();
+    let client = client(&spawn().await);
+    let results = batch_greetings(&client).await.unwrap();
     assert_eq!(results.len(), 3);
     assert_eq!(
         results.get::<Greeting>(0).unwrap().data().unwrap().message,
@@ -103,23 +75,14 @@ async fn http_typed_batch_many_actions() {
 
 #[tokio::test]
 async fn http_multipart_file_upload() {
-    let client = client_for(&spawn().await);
-    let res = client
-        .fetch_with(
-            save_image,
-            SaveImage {
-                file_name: "e2e.png".to_owned(),
-            },
-            CallOpts::new().file(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
-        )
-        .await
-        .unwrap();
+    let client = client(&spawn().await);
+    let res = upload_image(&client, "e2e.png").await.unwrap();
     assert_eq!(res.data().unwrap().bytes, 10);
 }
 
 #[tokio::test]
 async fn http_stream_count() {
-    let client = client_for(&spawn().await);
+    let client = client(&spawn().await);
     let mut stream = client.stream(count, Count { n: 4 }).await.unwrap();
     let mut items = Vec::new();
     while let Some(item) = stream.next().await {
@@ -132,25 +95,16 @@ async fn http_stream_count() {
 
 #[tokio::test]
 async fn websocket_progress_with_client_call() {
-    let client = client_for(&spawn().await);
-    let mut conn = client.connect(CallOpts::new()).await.unwrap();
-    conn.send(progress, Count { n: 3 }).await.unwrap();
-
-    let mut toasts = 0;
-    let mut results = 0;
-    loop {
-        match conn.recv().await {
-            Some(Ok(ServerFrame::ClientCall { id, action, .. })) => {
-                assert_eq!(action, "showToast");
-                toasts += 1;
-                conn.reply(id, "shown").await.unwrap();
-            }
-            Some(Ok(ServerFrame::Result { .. })) => results += 1,
-            Some(Ok(ServerFrame::End { .. })) | None => break,
-            Some(Err(error)) => panic!("ws error: {error}"),
-        }
-    }
-    conn.close().await.ok();
+    let client = client(&spawn().await);
+    let frames = progress_over_ws(&client, 3).await.unwrap();
+    let toasts = frames
+        .iter()
+        .filter(|frame| matches!(frame, ServerFrame::ClientCall { action, .. } if action == "showToast"))
+        .count();
+    let results = frames
+        .iter()
+        .filter(|frame| matches!(frame, ServerFrame::Result { .. }))
+        .count();
     assert_eq!(toasts, 3);
     assert_eq!(results, 3);
 }
