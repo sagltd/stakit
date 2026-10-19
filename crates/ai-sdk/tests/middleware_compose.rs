@@ -7,17 +7,17 @@
 //! - `on_finish` runs for every middleware whose `on_start` already ran (even on stop/error)
 //! - `on_tool_approve` most-restrictive precedence: Stop > Deny > Allow
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures::StreamExt;
-use futures::future::BoxFuture;
 use stakit_ai_sdk::{
-    Agent, AgentCx, AgentError, AgentEvent, AgentMiddleware, Approval, ChatRequest, ChatResponse,
-    EventStream, Finish, Flow, Message, PendingToolCall, Provider, ProviderError, StopReason,
-    StreamEvent, Tool, ToolCx, ToolError, ToolOutcome, Usage,
+    Agent, AgentCx, AgentError, AgentMiddleware, Approval, Finish, Flow, Message, PendingToolCall,
+    ToolOutcome,
 };
-use stakit_model::{JsonSchema, Model};
+
+#[path = "support/mock.rs"]
+mod mock;
+use mock::{EchoTool, Scripted, last_tool_result};
 
 // ── Shared app context that carries the event log ───────────────────────────
 
@@ -38,113 +38,8 @@ impl LogCtx {
 
 // ── A simple 2-step scripted provider ───────────────────────────────────────
 
-#[derive(Clone)]
-struct TwoStepProvider {
-    calls: Arc<AtomicU32>,
-}
-
-impl TwoStepProvider {
-    fn new() -> Self {
-        Self {
-            calls: Arc::new(AtomicU32::new(0)),
-        }
-    }
-}
-
-impl Provider for TwoStepProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "two-step"
-    }
-
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-
-    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move {
-            let events: Vec<Result<StreamEvent, ProviderError>> = if n == 0 {
-                vec![
-                    Ok(StreamEvent::Start {
-                        usage: Usage::default(),
-                    }),
-                    Ok(StreamEvent::ToolCall {
-                        id: "tc1".into(),
-                        name: "echo".into(),
-                        arguments: r#"{"text":"hello"}"#.into(),
-                    }),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::ToolUse,
-                        usage: Usage::default(),
-                    }),
-                ]
-            } else {
-                vec![
-                    Ok(StreamEvent::TextDelta("finished".into())),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::EndTurn,
-                        usage: Usage::default(),
-                    }),
-                ]
-            };
-            Ok(futures::stream::iter(events).boxed())
-        })
-    }
-}
-
-// ── A simple echo tool ───────────────────────────────────────────────────────
-
-#[derive(serde::Deserialize, Model, JsonSchema)]
-struct EchoArgs {
-    /// Text to echo.
-    text: String,
-}
-
-struct EchoTool;
-
-impl Tool<LogCtx> for EchoTool {
-    type Args = EchoArgs;
-    type Output = String;
-
-    fn name(&self) -> &'static str {
-        "echo"
-    }
-    fn description(&self) -> &'static str {
-        "Echo text back"
-    }
-    fn run<'a>(
-        &'a self,
-        _cx: &'a ToolCx<LogCtx>,
-        args: Self::Args,
-    ) -> BoxFuture<'a, Result<Self::Output, ToolError>> {
-        Box::pin(async move { Ok(args.text) })
-    }
-}
-
-// EchoTool for () context (some tests don't need LogCtx on the tool).
-struct EchoToolUnit;
-
-impl Tool<()> for EchoToolUnit {
-    type Args = EchoArgs;
-    type Output = String;
-
-    fn name(&self) -> &'static str {
-        "echo"
-    }
-    fn description(&self) -> &'static str {
-        "Echo text back"
-    }
-    fn run<'a>(
-        &'a self,
-        _cx: &'a ToolCx<()>,
-        args: Self::Args,
-    ) -> BoxFuture<'a, Result<Self::Output, ToolError>> {
-        Box::pin(async move { Ok(args.text) })
-    }
+fn two_step() -> Scripted {
+    Scripted::tool_then_text("two-step", "echo", r#"{"text":"hello"}"#, "finished")
 }
 
 // ── Test 1: Forward order in on_start / on_step / on_step_done ──────────────
@@ -177,7 +72,7 @@ impl AgentMiddleware<LogCtx> for LogHook {
 async fn hooks_run_in_registration_order() {
     let ctx = LogCtx::default();
     let mut agent = Agent::new(ctx.clone())
-        .provider(TwoStepProvider::new())
+        .provider(two_step())
         .model("two-step")
         .register_tool(EchoTool)
         .register_middleware(LogHook { name: "A" })
@@ -259,9 +154,9 @@ impl AgentMiddleware<()> for StopInStep {
 async fn first_stop_in_on_step_skips_later_middlewares() {
     let b_ran = Arc::new(AtomicBool::new(false));
     let mut agent = Agent::new(())
-        .provider(TwoStepProvider::new())
+        .provider(two_step())
         .model("two-step")
-        .register_tool(EchoToolUnit)
+        .register_tool(EchoTool)
         .register_middleware(StopInStep {
             name: "A",
             b_ran: Arc::clone(&b_ran),
@@ -328,9 +223,9 @@ impl AgentMiddleware<()> for FinishTracker {
 async fn on_finish_runs_for_all_started_middlewares_after_step_stop() {
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut agent = Agent::new(())
-        .provider(TwoStepProvider::new())
+        .provider(two_step())
         .model("two-step")
-        .register_tool(EchoToolUnit)
+        .register_tool(EchoTool)
         .register_middleware(FinishTracker {
             name: "A",
             log: Arc::clone(&log),
@@ -395,9 +290,9 @@ async fn on_finish_only_for_started_middlewares_when_on_start_stops() {
     // Middleware A stops in on_start → B's on_start never runs.
     // Expected: finish:A runs, finish:B does NOT.
     let mut agent = Agent::new(())
-        .provider(TwoStepProvider::new())
+        .provider(two_step())
         .model("two-step")
-        .register_tool(EchoToolUnit)
+        .register_tool(EchoTool)
         .register_middleware(OnStartStopper {
             name: "A",
             log: Arc::clone(&log),
@@ -435,59 +330,8 @@ async fn on_finish_only_for_started_middlewares_when_on_start_stops() {
 // ── Test 4: on_tool_approve — Deny beats Allow, Stop beats Deny ─────────────
 
 // A provider that produces a single tool call then ends.
-#[derive(Clone)]
-struct SingleToolProvider {
-    calls: Arc<AtomicU32>,
-}
-
-impl SingleToolProvider {
-    fn new() -> Self {
-        Self {
-            calls: Arc::new(AtomicU32::new(0)),
-        }
-    }
-}
-
-impl Provider for SingleToolProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "single-tool"
-    }
-
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-
-    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move {
-            let events: Vec<Result<StreamEvent, ProviderError>> = if n == 0 {
-                vec![
-                    Ok(StreamEvent::ToolCall {
-                        id: "t1".into(),
-                        name: "echo".into(),
-                        arguments: r#"{"text":"hi"}"#.into(),
-                    }),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::ToolUse,
-                        usage: Usage::default(),
-                    }),
-                ]
-            } else {
-                vec![
-                    Ok(StreamEvent::TextDelta("done".into())),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::EndTurn,
-                        usage: Usage::default(),
-                    }),
-                ]
-            };
-            Ok(futures::stream::iter(events).boxed())
-        })
-    }
+fn single_tool() -> Scripted {
+    Scripted::tool_then_text("single-tool", "echo", r#"{"text":"hi"}"#, "done")
 }
 
 struct AllowMiddleware;
@@ -539,23 +383,16 @@ impl AgentMiddleware<()> for StopMiddleware {
 async fn deny_beats_allow_in_tool_approve() {
     // A=Allow, B=Deny → effective approval is Deny.
     let mut agent = Agent::new(())
-        .provider(SingleToolProvider::new())
+        .provider(single_tool())
         .model("single-tool")
-        .register_tool(EchoToolUnit)
+        .register_tool(EchoTool)
         .register_middleware(AllowMiddleware)
         .register_middleware(DenyMiddleware {
             deny_message: "not-allowed",
         })
         .with_context(vec![Message::user("go")]);
 
-    let mut run = agent.run();
-    let mut tool_result = None;
-    while let Some(ev) = run.next().await {
-        if let AgentEvent::ToolResult { result, .. } = ev {
-            tool_result = Some(result);
-        }
-    }
-    match tool_result.expect("tool result must be produced") {
+    match last_tool_result(agent.run()).await {
         ToolOutcome::Denied { message } => {
             assert_eq!(
                 message, "not-allowed",
@@ -570,9 +407,9 @@ async fn deny_beats_allow_in_tool_approve() {
 async fn stop_beats_deny_in_tool_approve() {
     // A=Deny, B=Stop → effective approval is Stop (run halts).
     let mut agent = Agent::new(())
-        .provider(SingleToolProvider::new())
+        .provider(single_tool())
         .model("single-tool")
-        .register_tool(EchoToolUnit)
+        .register_tool(EchoTool)
         .register_middleware(DenyMiddleware {
             deny_message: "denied",
         })
@@ -591,9 +428,9 @@ async fn stop_beats_deny_in_tool_approve() {
 async fn stop_beats_allow_in_tool_approve() {
     // A=Allow, B=Stop → run halts.
     let mut agent = Agent::new(())
-        .provider(SingleToolProvider::new())
+        .provider(single_tool())
         .model("single-tool")
-        .register_tool(EchoToolUnit)
+        .register_tool(EchoTool)
         .register_middleware(AllowMiddleware)
         .register_middleware(StopMiddleware)
         .with_context(vec![Message::user("go")]);

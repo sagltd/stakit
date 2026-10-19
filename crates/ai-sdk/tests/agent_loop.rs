@@ -7,139 +7,56 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use stakit_ai_sdk::{
-    Agent, AgentCx, AgentError, AgentEvent, AgentMiddleware, Approval, ChatRequest, ChatResponse,
-    EventStream, Finish, Flow, Message, PendingToolCall, Provider, ProviderError, StopReason,
-    StreamEvent, Tool, ToolCx, ToolError, ToolOutcome, Usage,
+    Agent, AgentCx, AgentError, AgentEvent, AgentMiddleware, Approval, Finish, Flow, Message,
+    PendingToolCall, StopReason, StreamEvent, Tool, ToolCx, ToolError, ToolOutcome, Usage,
 };
 use stakit_model::{JsonSchema, Model};
 
-// ── A hand-written tool (uses `ToolCx`, as tools always do) ─────────────────
-
-#[derive(serde::Deserialize, Model, JsonSchema)]
-struct EchoArgs {
-    /// Text to echo back.
-    text: String,
-}
-
-/// Echoes its `text` argument back.
-struct EchoTool;
-
-impl Tool<()> for EchoTool {
-    type Args = EchoArgs;
-    type Output = String;
-
-    fn name(&self) -> &'static str {
-        "echo"
-    }
-    fn description(&self) -> &'static str {
-        "Echo the text back"
-    }
-    fn run<'a>(
-        &'a self,
-        _cx: &'a ToolCx<()>,
-        args: Self::Args,
-    ) -> BoxFuture<'a, Result<Self::Output, ToolError>> {
-        Box::pin(async move { Ok(args.text) })
-    }
-}
+#[path = "support/mock.rs"]
+mod mock;
+use mock::{EchoTool, Scripted, assert_tool_error, drain, end, text_turn, tool_turn};
 
 // ── A scripted provider: step 1 → tool call, step 2 → text "done" ───────────
 
-#[derive(Clone)]
-struct ScriptedProvider {
-    calls: Arc<AtomicU32>,
-    seen: Arc<std::sync::Mutex<Vec<usize>>>,
-}
-
-impl ScriptedProvider {
-    fn two_step() -> Self {
-        Self {
-            calls: Arc::new(AtomicU32::new(0)),
-            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+fn two_step() -> Scripted {
+    Scripted::turns("scripted", |call| {
+        let usage = |input_tokens, output_tokens| Usage {
+            input_tokens,
+            output_tokens,
+            ..Usage::default()
+        };
+        if call == 0 {
+            vec![
+                StreamEvent::Start {
+                    usage: usage(10, 0),
+                },
+                mock::tool_call("t1", "echo", r#"{ "text": "hi" }"#),
+                StreamEvent::End {
+                    stop: StopReason::ToolUse,
+                    usage: usage(10, 5),
+                },
+            ]
+        } else {
+            vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::End {
+                    stop: StopReason::EndTurn,
+                    usage: usage(20, 3),
+                },
+            ]
         }
-    }
-
-    fn first_seen(&self) -> usize {
-        self.seen.lock().unwrap()[0]
-    }
-}
-
-impl Provider for ScriptedProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "scripted"
-    }
-
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async move { Err(ProviderError::InvalidArgument("unused".into())) })
-    }
-
-    fn stream(&self, r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        Box::pin(async move {
-            self.seen.lock().unwrap().push(r.messages.len());
-            let n = self.calls.fetch_add(1, Ordering::SeqCst);
-            let events: Vec<Result<StreamEvent, ProviderError>> = if n == 0 {
-                vec![
-                    Ok(StreamEvent::Start {
-                        usage: Usage {
-                            input_tokens: 10,
-                            ..Usage::default()
-                        },
-                    }),
-                    Ok(StreamEvent::ToolCall {
-                        id: "t1".into(),
-                        name: "echo".into(),
-                        arguments: r#"{ "text": "hi" }"#.into(),
-                    }),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::ToolUse,
-                        usage: Usage {
-                            input_tokens: 10,
-                            output_tokens: 5,
-                            ..Usage::default()
-                        },
-                    }),
-                ]
-            } else {
-                vec![
-                    Ok(StreamEvent::TextDelta("done".into())),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::EndTurn,
-                        usage: Usage {
-                            input_tokens: 20,
-                            output_tokens: 3,
-                            ..Usage::default()
-                        },
-                    }),
-                ]
-            };
-            Ok(futures::stream::iter(events).boxed())
-        })
-    }
+    })
 }
 
 #[tokio::test]
 async fn run_executes_tool_then_ends_and_streams() {
     let mut agent = Agent::new(())
-        .provider(ScriptedProvider::two_step())
+        .provider(two_step())
         .model("scripted")
         .register_tool(EchoTool)
         .with_context(vec![Message::user("hi")]);
-    let mut run = agent.run();
-    let mut saw_tool = false;
-    let mut outcome = None;
-    while let Some(ev) = run.next().await {
-        match ev {
-            AgentEvent::ToolResult { .. } => saw_tool = true,
-            AgentEvent::Done(o) => outcome = Some(o),
-            _ => {}
-        }
-    }
-    let out = outcome.unwrap();
-    assert!(saw_tool);
+    let (results, out) = drain(agent.run()).await;
+    assert!(!results.is_empty());
     assert_eq!(out.text, "done");
     assert!(matches!(out.finish, Finish::EndTurn));
 }
@@ -147,7 +64,7 @@ async fn run_executes_tool_then_ends_and_streams() {
 #[tokio::test]
 async fn run_accumulates_usage_across_steps() {
     let mut agent = Agent::new(())
-        .provider(ScriptedProvider::two_step())
+        .provider(two_step())
         .model("scripted")
         .register_tool(EchoTool)
         .with_context(vec![Message::user("hi")]);
@@ -172,7 +89,7 @@ async fn run_accumulates_usage_across_steps() {
 #[tokio::test]
 async fn into_future_yields_outcome() {
     let mut agent = Agent::new(())
-        .provider(ScriptedProvider::two_step())
+        .provider(two_step())
         .model("scripted")
         .register_tool(EchoTool)
         .with_context(vec![Message::user("hi")]);
@@ -201,30 +118,18 @@ impl AgentMiddleware<()> for DenyTools {
 #[tokio::test]
 async fn denied_tool_yields_error_result_and_continues() {
     let mut agent = Agent::new(())
-        .provider(ScriptedProvider::two_step())
+        .provider(two_step())
         .model("scripted")
         .register_tool(EchoTool)
         .register_middleware(DenyTools)
         .with_context(vec![Message::user("hi")]);
-    let mut run = agent.run();
-    let mut denied = false;
-    let mut outcome = None;
-    while let Some(ev) = run.next().await {
-        match ev {
-            AgentEvent::ToolResult {
-                result: ToolOutcome::Denied { message },
-                ..
-            } => {
-                assert_eq!(message, "echo not allowed");
-                denied = true;
-            }
-            AgentEvent::Done(o) => outcome = Some(o),
-            _ => {}
-        }
-    }
-    assert!(denied, "expected a denied tool result");
+    let (results, out) = drain(agent.run()).await;
+    assert!(
+        matches!(results.as_slice(), [ToolOutcome::Denied { message }] if message == "echo not allowed"),
+        "expected a denied tool result, got {results:?}"
+    );
     // The loop still proceeds to the model's final turn.
-    assert_eq!(outcome.unwrap().text, "done");
+    assert_eq!(out.text, "done");
 }
 
 // ── Middleware: stop the run from on_step ───────────────────────────────────
@@ -241,7 +146,7 @@ impl AgentMiddleware<()> for StopAtStart {
 #[tokio::test]
 async fn middleware_stop_in_on_start_halts_with_message() {
     let mut agent = Agent::new(())
-        .provider(ScriptedProvider::two_step())
+        .provider(two_step())
         .model("scripted")
         .register_middleware(StopAtStart)
         .with_context(vec![Message::user("hi")]);
@@ -265,7 +170,7 @@ impl AgentMiddleware<()> for SeedConversation {
 
 #[tokio::test]
 async fn middleware_on_start_prepends_conversation() {
-    let provider = ScriptedProvider::two_step();
+    let provider = two_step();
     let mut agent = Agent::new(())
         .provider(provider.clone())
         .model("scripted")
@@ -274,7 +179,7 @@ async fn middleware_on_start_prepends_conversation() {
         .with_context(vec![Message::user("hi")]);
     let _ = agent.run().await.expect("outcome");
     // seeded + hi were both present at the first provider call.
-    assert_eq!(provider.first_seen(), 2);
+    assert_eq!(provider.requests()[0].messages.len(), 2);
 }
 
 // ── on_finish runs for every middleware whose on_start ran ───────────────────
@@ -304,7 +209,7 @@ async fn on_finish_runs_for_started_middleware() {
         finished: Arc::new(AtomicU32::new(0)),
     };
     let mut agent = Agent::new(())
-        .provider(ScriptedProvider::two_step())
+        .provider(two_step())
         .model("scripted")
         .register_tool(EchoTool)
         .register_middleware(m.clone())
@@ -316,56 +221,18 @@ async fn on_finish_runs_for_started_middleware() {
 
 // ── Concurrent tool calls in one turn ───────────────────────────────────────
 
-#[derive(Clone)]
-struct ParallelProvider {
-    calls: Arc<AtomicU32>,
-}
-
-impl Provider for ParallelProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "parallel"
-    }
-
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async move { Err(ProviderError::Cancelled) })
-    }
-
-    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        Box::pin(async move {
-            let n = self.calls.fetch_add(1, Ordering::SeqCst);
-            let events: Vec<Result<StreamEvent, ProviderError>> = if n == 0 {
-                vec![
-                    Ok(StreamEvent::ToolCall {
-                        id: "a".into(),
-                        name: "barrier".into(),
-                        arguments: "{}".into(),
-                    }),
-                    Ok(StreamEvent::ToolCall {
-                        id: "b".into(),
-                        name: "barrier".into(),
-                        arguments: "{}".into(),
-                    }),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::ToolUse,
-                        usage: Usage::default(),
-                    }),
-                ]
-            } else {
-                vec![
-                    Ok(StreamEvent::TextDelta("done".into())),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::EndTurn,
-                        usage: Usage::default(),
-                    }),
-                ]
-            };
-            Ok(futures::stream::iter(events).boxed())
-        })
-    }
+fn parallel() -> Scripted {
+    Scripted::turns("parallel", |call| {
+        if call == 0 {
+            vec![
+                mock::tool_call("a", "barrier", "{}"),
+                mock::tool_call("b", "barrier", "{}"),
+                end(StopReason::ToolUse),
+            ]
+        } else {
+            text_turn("done")
+        }
+    })
 }
 
 #[derive(serde::Deserialize, Model, JsonSchema)]
@@ -408,9 +275,7 @@ async fn tool_calls_in_a_turn_run_concurrently() {
         barrier: Arc::new(tokio::sync::Barrier::new(2)),
     };
     let mut agent = Agent::new(ctx)
-        .provider(ParallelProvider {
-            calls: Arc::new(AtomicU32::new(0)),
-        })
+        .provider(parallel())
         .model("parallel")
         .register_tool(BarrierTool)
         .with_context(vec![Message::user("go")]);
@@ -453,7 +318,7 @@ impl AgentMiddleware<()> for CancelImmediately {
 #[tokio::test]
 async fn cancelled_run_finishes_cancelled() {
     let mut agent = Agent::new(())
-        .provider(ScriptedProvider::two_step())
+        .provider(two_step())
         .model("scripted")
         .register_tool(EchoTool)
         .register_middleware(CancelImmediately)
@@ -485,12 +350,10 @@ async fn no_provider_for_model_stops_with_error() {
 
 #[tokio::test]
 async fn provider_sets_default_model() {
-    let agent = Agent::new(()).provider(ScriptedProvider::two_step());
+    let agent = Agent::new(()).provider(two_step());
     assert_eq!(agent.current_model(), "scripted");
     // A second provider does not steal the default model.
-    let agent = agent.register_provider(ParallelProvider {
-        calls: Arc::new(AtomicU32::new(0)),
-    });
+    let agent = agent.register_provider(parallel());
     assert_eq!(agent.current_model(), "scripted");
 }
 
@@ -501,48 +364,15 @@ async fn provider_sets_default_model() {
 const DEFAULT_MAX_STEPS: u32 = 16;
 
 /// Always emits a tool call (never ends its turn), forcing the step cap to fire.
-#[derive(Clone)]
-struct AlwaysToolProvider {
-    calls: Arc<AtomicU32>,
-}
-
-impl Provider for AlwaysToolProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "always"
-    }
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move {
-            Ok(futures::stream::iter(vec![
-                Ok(StreamEvent::ToolCall {
-                    id: "x".into(),
-                    name: "echo".into(),
-                    arguments: r#"{"text":"x"}"#.into(),
-                }),
-                Ok(StreamEvent::End {
-                    stop: StopReason::ToolUse,
-                    usage: Usage::default(),
-                }),
-            ])
-            .boxed())
-        })
-    }
+fn always_tool() -> Scripted {
+    Scripted::turns("always", |_| tool_turn("x", "echo", r#"{"text":"x"}"#))
 }
 
 #[tokio::test]
 async fn step_cap_runs_exactly_default_max_steps() {
-    let calls = Arc::new(AtomicU32::new(0));
+    let provider = always_tool();
     let mut agent = Agent::new(())
-        .provider(AlwaysToolProvider {
-            calls: Arc::clone(&calls),
-        })
+        .provider(provider.clone())
         .model("always")
         .register_tool(EchoTool)
         .with_context(vec![Message::user("hi")]);
@@ -550,7 +380,7 @@ async fn step_cap_runs_exactly_default_max_steps() {
 
     // Exactly DEFAULT_MAX_STEPS model calls and steps — no off-by-one.
     assert_eq!(
-        calls.load(Ordering::SeqCst),
+        provider.calls(),
         DEFAULT_MAX_STEPS,
         "provider must be called exactly DEFAULT_MAX_STEPS times"
     );
@@ -610,79 +440,21 @@ impl Tool<()> for SpyTool {
     }
 }
 
-/// Emits a tool call whose argument text is invalid JSON on the first step.
-#[derive(Clone)]
-struct MalformedArgsProvider {
-    calls: Arc<AtomicU32>,
-}
-
-impl Provider for MalformedArgsProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "malformed"
-    }
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move {
-            let events = if n == 0 {
-                vec![
-                    // Truncated / invalid JSON — must NOT become `{}` silently.
-                    Ok(StreamEvent::ToolCall {
-                        id: "bad".into(),
-                        name: "spy".into(),
-                        arguments: r#"{"text": "oo"#.into(),
-                    }),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::ToolUse,
-                        usage: Usage::default(),
-                    }),
-                ]
-            } else {
-                vec![
-                    Ok(StreamEvent::TextDelta("done".into())),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::EndTurn,
-                        usage: Usage::default(),
-                    }),
-                ]
-            };
-            Ok(futures::stream::iter(events).boxed())
-        })
-    }
-}
-
 #[tokio::test]
 async fn malformed_tool_args_yield_error_not_empty_call() {
     let spy = ArgSpy::default();
     let mut agent = Agent::new(())
-        .provider(MalformedArgsProvider {
-            calls: Arc::new(AtomicU32::new(0)),
-        })
+        // Truncated / invalid JSON — must NOT become `{}` silently.
+        .provider(Scripted::tool_then_text(
+            "malformed",
+            "spy",
+            r#"{"text": "oo"#,
+            "done",
+        ))
         .model("malformed")
         .register_tool(SpyTool { spy: spy.clone() })
         .with_context(vec![Message::user("hi")]);
-
-    let mut run = agent.run();
-    let mut tool_result = None;
-    while let Some(ev) = run.next().await {
-        if let AgentEvent::ToolResult { result, .. } = ev {
-            tool_result = Some(result);
-        }
-    }
-
-    match tool_result.expect("a tool result was produced") {
-        ToolOutcome::Error(msg) => assert!(
-            msg.contains("malformed tool arguments"),
-            "expected a malformed-args error, got: {msg}"
-        ),
-        other => panic!("expected ToolOutcome::Error, got {other:?}"),
-    }
+    assert_tool_error(agent.run(), "malformed tool arguments").await;
     // The tool body must never have been invoked with coerced `{}` args.
     assert!(
         spy.seen.lock().unwrap().is_empty(),
@@ -696,52 +468,31 @@ async fn malformed_tool_args_yield_error_not_empty_call() {
 /// provider. The consumer compares "how many the provider has produced" against
 /// "how many it has received" at the moment of the first delta — proving the
 /// loop forwards each event live, not buffered until the turn ends.
-#[derive(Clone)]
-struct DrippleProvider {
-    produced: Arc<AtomicU32>,
-}
-
-impl Provider for DrippleProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "ripple"
-    }
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        let produced = Arc::clone(&self.produced);
-        Box::pin(async move {
-            let s = async_stream::stream! {
-                for part in ["a", "b", "c"] {
-                    // Yield so the consumer can run between each emission; a
-                    // buffered loop would still drain all three before the host
-                    // sees the first one.
-                    tokio::task::yield_now().await;
-                    produced.fetch_add(1, Ordering::SeqCst);
-                    yield Ok(StreamEvent::TextDelta(part.into()));
-                }
+fn dripple(produced: &Arc<AtomicU32>) -> Scripted {
+    let produced = Arc::clone(produced);
+    Scripted::new("ripple", move |_| {
+        let produced = Arc::clone(&produced);
+        Ok(async_stream::stream! {
+            for part in ["a", "b", "c"] {
+                // Yield so the consumer can run between each emission; a
+                // buffered loop would still drain all three before the host
+                // sees the first one.
+                tokio::task::yield_now().await;
                 produced.fetch_add(1, Ordering::SeqCst);
-                yield Ok(StreamEvent::End {
-                    stop: StopReason::EndTurn,
-                    usage: Usage::default(),
-                });
-            };
-            Ok(s.boxed())
-        })
-    }
+                yield Ok(StreamEvent::TextDelta(part.into()));
+            }
+            produced.fetch_add(1, Ordering::SeqCst);
+            yield Ok(end(StopReason::EndTurn));
+        }
+        .boxed())
+    })
 }
 
 #[tokio::test]
 async fn streaming_deltas_are_yielded_live_and_in_order() {
     let produced = Arc::new(AtomicU32::new(0));
     let mut agent = Agent::new(())
-        .provider(DrippleProvider {
-            produced: Arc::clone(&produced),
-        })
+        .provider(dripple(&produced))
         .model("ripple")
         .with_context(vec![Message::user("hi")]);
 
@@ -803,74 +554,18 @@ impl stakit_ai_sdk::SkillLoader<()> for EmptyLoader {
     }
 }
 
-/// Calls `load_skill` with no `id` argument on the first step.
-#[derive(Clone)]
-struct LoadSkillNoIdProvider {
-    calls: Arc<AtomicU32>,
-}
-
-impl Provider for LoadSkillNoIdProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "loadskill"
-    }
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move {
-            let events = if n == 0 {
-                vec![
-                    Ok(StreamEvent::ToolCall {
-                        id: "ls".into(),
-                        name: "load_skill".into(),
-                        arguments: "{}".into(),
-                    }),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::ToolUse,
-                        usage: Usage::default(),
-                    }),
-                ]
-            } else {
-                vec![
-                    Ok(StreamEvent::TextDelta("done".into())),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::EndTurn,
-                        usage: Usage::default(),
-                    }),
-                ]
-            };
-            Ok(futures::stream::iter(events).boxed())
-        })
-    }
-}
-
 #[tokio::test]
 async fn load_skill_without_id_errors() {
     let mut agent = Agent::new(())
-        .provider(LoadSkillNoIdProvider {
-            calls: Arc::new(AtomicU32::new(0)),
-        })
+        // Calls `load_skill` with no `id` argument on the first step.
+        .provider(Scripted::tool_then_text(
+            "loadskill",
+            "load_skill",
+            "{}",
+            "done",
+        ))
         .model("loadskill")
         .skills(EmptyLoader)
         .with_context(vec![Message::user("hi")]);
-
-    let mut run = agent.run();
-    let mut tool_result = None;
-    while let Some(ev) = run.next().await {
-        if let AgentEvent::ToolResult { result, .. } = ev {
-            tool_result = Some(result);
-        }
-    }
-    match tool_result.expect("a tool result was produced") {
-        ToolOutcome::Error(msg) => assert!(
-            msg.contains("missing required argument: id"),
-            "expected a missing-id error, got: {msg}"
-        ),
-        other => panic!("expected ToolOutcome::Error, got {other:?}"),
-    }
+    assert_tool_error(agent.run(), "missing required argument: id").await;
 }

@@ -5,167 +5,28 @@
 //!   8. An empty step never persists an empty assistant turn (resume-safety).
 //!   9. A mid-batch `Approval::Stop` leaves no dangling `tool_use` (resume-safety).
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-
-use futures::StreamExt;
-use futures::future::BoxFuture;
 use stakit_ai_sdk::{
-    Agent, AgentCx, AgentError, AgentEvent, AgentMiddleware, Approval, AssistantContent,
-    ChatRequest, ChatResponse, EventStream, Finish, Flow, Message, PendingToolCall, Provider,
-    ProviderError, StopReason, StreamEvent, Tool, ToolCx, ToolError, ToolOutcome, Usage,
-    UserContent,
+    Agent, AgentCx, AgentError, AgentMiddleware, Approval, AssistantContent, Finish, Flow, Message,
+    PendingToolCall, StopReason, ToolOutcome, UserContent,
 };
-use stakit_model::{JsonSchema, Model};
+
+#[path = "support/mock.rs"]
+mod mock;
+use mock::{EchoTool, Scripted, drain, end, tool_call};
 
 // ── Shared scripted/recording infrastructure ─────────────────────────────────
 
-#[derive(Clone)]
-struct TwoStepProvider {
-    calls: Arc<AtomicU32>,
+fn two_step() -> Scripted {
+    Scripted::tool_then_text("two-step", "echo", r#"{"text":"hello"}"#, "final-text")
 }
 
-impl TwoStepProvider {
-    fn new() -> Self {
-        Self {
-            calls: Arc::new(AtomicU32::new(0)),
-        }
-    }
-}
-
-impl Provider for TwoStepProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "two-step"
-    }
-
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-
-    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move {
-            let events: Vec<Result<StreamEvent, ProviderError>> = if n == 0 {
-                vec![
-                    Ok(StreamEvent::ToolCall {
-                        id: "tc1".into(),
-                        name: "echo".into(),
-                        arguments: r#"{"text":"hello"}"#.into(),
-                    }),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::ToolUse,
-                        usage: Usage::default(),
-                    }),
-                ]
-            } else {
-                vec![
-                    Ok(StreamEvent::TextDelta("final-text".into())),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::EndTurn,
-                        usage: Usage::default(),
-                    }),
-                ]
-            };
-            Ok(futures::stream::iter(events).boxed())
-        })
-    }
-}
-
-#[derive(Clone)]
-struct RecordingProvider {
-    calls: Arc<AtomicU32>,
-    system_log: Arc<Mutex<Vec<Option<String>>>>,
-}
-
-impl RecordingProvider {
-    fn new() -> Self {
-        Self {
-            calls: Arc::new(AtomicU32::new(0)),
-            system_log: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    fn systems(&self) -> Vec<Option<String>> {
-        self.system_log.lock().unwrap().clone()
-    }
-}
-
-impl Provider for RecordingProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "recorder"
-    }
-
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-
-    fn stream(&self, r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        self.system_log
-            .lock()
-            .unwrap()
-            .push(r.system.map(|s| s.text.to_string()));
-        let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move {
-            let events: Vec<Result<StreamEvent, ProviderError>> = if n == 0 {
-                // First step: request a tool call so there's a second step.
-                vec![
-                    Ok(StreamEvent::ToolCall {
-                        id: "tc1".into(),
-                        name: "echo".into(),
-                        arguments: r#"{"text":"hi"}"#.into(),
-                    }),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::ToolUse,
-                        usage: Usage::default(),
-                    }),
-                ]
-            } else {
-                vec![
-                    Ok(StreamEvent::TextDelta("ok".into())),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::EndTurn,
-                        usage: Usage::default(),
-                    }),
-                ]
-            };
-            Ok(futures::stream::iter(events).boxed())
-        })
-    }
-}
-
-#[derive(serde::Deserialize, Model, JsonSchema)]
-struct EchoArgs {
-    /// Text to echo.
-    text: String,
-}
-
-struct EchoTool;
-
-impl Tool<()> for EchoTool {
-    type Args = EchoArgs;
-    type Output = String;
-
-    fn name(&self) -> &'static str {
-        "echo"
-    }
-    fn description(&self) -> &'static str {
-        "Echo text"
-    }
-    fn run<'a>(
-        &'a self,
-        _cx: &'a ToolCx<()>,
-        args: Self::Args,
-    ) -> BoxFuture<'a, Result<Self::Output, ToolError>> {
-        Box::pin(async move { Ok(args.text) })
-    }
+/// The system prompt text of every request `provider` received.
+fn systems(provider: &Scripted) -> Vec<Option<String>> {
+    provider
+        .requests()
+        .into_iter()
+        .map(|request| request.system.map(|system| system.text.to_string()))
+        .collect()
 }
 
 // ── Test 5: Flow::Stop from on_step_done halts after results recorded ─────────
@@ -182,28 +43,17 @@ impl AgentMiddleware<()> for StopInDone {
 #[tokio::test]
 async fn flow_stop_from_on_step_done_halts_after_results() {
     let mut agent = Agent::new(())
-        .provider(TwoStepProvider::new())
+        .provider(two_step())
         .model("two-step")
         .register_tool(EchoTool)
         .register_middleware(StopInDone)
         .with_context(vec![Message::user("go")]);
 
-    let mut run = agent.run();
-    let mut saw_tool_result = false;
-    let mut outcome = None;
-    while let Some(ev) = run.next().await {
-        match ev {
-            AgentEvent::ToolResult { .. } => saw_tool_result = true,
-            AgentEvent::Done(o) => outcome = Some(o),
-            _ => {}
-        }
-    }
-
-    let out = outcome.unwrap();
+    let (results, out) = drain(agent.run()).await;
 
     // The run must have recorded the tool result before stopping.
     assert!(
-        saw_tool_result,
+        !results.is_empty(),
         "tool result must be emitted before on_step_done stop"
     );
 
@@ -240,33 +90,15 @@ impl AgentMiddleware<()> for ApproveStop {
 
 #[tokio::test]
 async fn approval_stop_halts_run_not_just_tool() {
-    let calls = Arc::new(AtomicU32::new(0));
-    let two_step = TwoStepProvider {
-        calls: Arc::clone(&calls),
-    };
+    let two_step = two_step();
     let mut agent = Agent::new(())
-        .provider(two_step)
+        .provider(two_step.clone())
         .model("two-step")
         .register_tool(EchoTool)
         .register_middleware(ApproveStop)
         .with_context(vec![Message::user("go")]);
 
-    let mut run = agent.run();
-    let mut saw_deny = false;
-    let mut outcome = None;
-    while let Some(ev) = run.next().await {
-        match ev {
-            // Deny would emit a ToolResult; Stop should not.
-            AgentEvent::ToolResult {
-                result: ToolOutcome::Denied { .. },
-                ..
-            } => saw_deny = true,
-            AgentEvent::Done(o) => outcome = Some(o),
-            _ => {}
-        }
-    }
-
-    let out = outcome.unwrap();
+    let (results, out) = drain(agent.run()).await;
 
     // Stop must have halted the run.
     assert!(
@@ -277,13 +109,15 @@ async fn approval_stop_halts_run_not_just_tool() {
 
     // Approval::Stop must NOT produce a Denied tool-result (only Deny does).
     assert!(
-        !saw_deny,
+        !results
+            .iter()
+            .any(|result| matches!(result, ToolOutcome::Denied { .. })),
         "Approval::Stop must not produce a Denied tool result"
     );
 
     // Provider must only have been called once (the second turn never happened).
     assert_eq!(
-        calls.load(Ordering::SeqCst),
+        two_step.calls(),
         1,
         "provider must be called only once on Stop"
     );
@@ -309,10 +143,10 @@ impl AgentMiddleware<()> for SetSystemInStep {
 
 #[tokio::test]
 async fn set_system_mid_run_affects_next_provider_request() {
-    let provider = RecordingProvider::new();
-    let provider_clone = provider.clone();
+    // First step: request a tool call so there's a second step.
+    let provider = Scripted::tool_then_text("recorder", "echo", r#"{"text":"hi"}"#, "ok");
     let mut agent = Agent::new(())
-        .provider(provider)
+        .provider(provider.clone())
         .model("recorder")
         .system("ORIGINAL")
         .register_tool(EchoTool)
@@ -321,7 +155,7 @@ async fn set_system_mid_run_affects_next_provider_request() {
 
     let _ = agent.run().await.expect("outcome");
 
-    let systems = provider_clone.systems();
+    let systems = systems(&provider);
     // There should be exactly 2 provider calls (tool step + final step).
     assert_eq!(systems.len(), 2, "expected exactly 2 provider calls");
 
@@ -350,36 +184,11 @@ async fn set_system_mid_run_affects_next_provider_request() {
 // `Assistant(vec![])` — an `on_step_done` checkpoint would persist it and some
 // providers 400 on resending an empty assistant turn.
 
-/// Yields a single empty step (just `End`, no content).
-#[derive(Clone)]
-struct EmptyStepProvider;
-
-impl Provider for EmptyStepProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "empty"
-    }
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        Box::pin(async move {
-            Ok(futures::stream::iter(vec![Ok(StreamEvent::End {
-                stop: StopReason::EndTurn,
-                usage: Usage::default(),
-            })])
-            .boxed())
-        })
-    }
-}
-
 #[tokio::test]
 async fn empty_step_does_not_persist_empty_assistant_turn() {
     let mut agent = Agent::new(())
-        .provider(EmptyStepProvider)
+        // Yields a single empty step (just `End`, no content).
+        .provider(Scripted::turns("empty", |_| vec![end(StopReason::EndTurn)]))
         .model("empty")
         .with_context(vec![Message::user("hi")]);
 
@@ -405,47 +214,6 @@ async fn empty_step_does_not_persist_empty_assistant_turn() {
 // matching `tool_result` for EVERY `tool_use` id (Claude rejects a resumed turn
 // with dangling tool_use blocks).
 
-/// Emits two tool calls in one turn on the first step.
-#[derive(Clone)]
-struct TwoToolProvider {
-    calls: Arc<AtomicU32>,
-}
-
-impl Provider for TwoToolProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "two-tool"
-    }
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move {
-            Ok(futures::stream::iter(vec![
-                Ok(StreamEvent::ToolCall {
-                    id: "call_a".into(),
-                    name: "echo".into(),
-                    arguments: r#"{"text":"a"}"#.into(),
-                }),
-                Ok(StreamEvent::ToolCall {
-                    id: "call_b".into(),
-                    name: "echo".into(),
-                    arguments: r#"{"text":"b"}"#.into(),
-                }),
-                Ok(StreamEvent::End {
-                    stop: StopReason::ToolUse,
-                    usage: Usage::default(),
-                }),
-            ])
-            .boxed())
-        })
-    }
-}
-
 /// Stops on the FIRST tool approval (mid-batch — the second call never runs).
 struct StopOnFirstApproval;
 
@@ -465,9 +233,14 @@ impl AgentMiddleware<()> for StopOnFirstApproval {
 #[tokio::test]
 async fn mid_batch_stop_records_tool_result_for_every_tool_use() {
     let mut agent = Agent::new(())
-        .provider(TwoToolProvider {
-            calls: Arc::new(AtomicU32::new(0)),
-        })
+        // Emits two tool calls in one turn on every step.
+        .provider(Scripted::turns("two-tool", |_| {
+            vec![
+                tool_call("call_a", "echo", r#"{"text":"a"}"#),
+                tool_call("call_b", "echo", r#"{"text":"b"}"#),
+                end(StopReason::ToolUse),
+            ]
+        }))
         .model("two-tool")
         .register_tool(EchoTool)
         .register_middleware(StopOnFirstApproval)

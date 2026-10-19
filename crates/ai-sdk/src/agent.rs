@@ -1528,7 +1528,8 @@ async fn acquire_stream(
         let req = request.clone();
         let attempt_fut = async {
             let mut stream = provider.stream(req).await?;
-            let first = stream.next().await;
+            // A failed first event is a failed attempt, classified like an open error.
+            let first = stream.next().await.transpose()?;
             Ok::<_, crate::error::ProviderError>((first, stream))
         };
 
@@ -1559,25 +1560,14 @@ async fn acquire_stream(
                     break;
                 }
             }
-            Ok(Ok((first, stream))) => match first {
-                None => {
-                    // An accepted but empty response is incomplete, never an
-                    // implicit success or an automatically retried safety turn.
-                    return AcquireOutcome::Error(crate::error::ProviderError::Transport(
-                        "provider stream ended before its terminal event".into(),
-                    ));
-                }
-                Some(Ok(ev)) => return AcquireOutcome::Ready { first: ev, stream },
-                Some(Err(e)) => {
-                    let class = crate::retry::classify(&e);
-                    let retryable = retry.is_retryable(&class);
-                    last_err = Some(e);
-                    last_class = class;
-                    if !retryable {
-                        break;
-                    }
-                }
-            },
+            Ok(Ok((None, _))) => {
+                // An accepted but empty response is incomplete, never an
+                // implicit success or an automatically retried safety turn.
+                return AcquireOutcome::Error(crate::error::ProviderError::Transport(
+                    "provider stream ended before its terminal event".into(),
+                ));
+            }
+            Ok(Ok((Some(first), stream))) => return AcquireOutcome::Ready { first, stream },
         }
     }
 
@@ -1668,98 +1658,21 @@ impl<'a> std::future::IntoFuture for AgentRun<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::Ordering;
 
     use futures::future::BoxFuture;
 
     use super::*;
     use crate::provider::{ChatResponse, EventStream};
 
-    /// A provider that fails transiently `fail_times` then streams one text.
-    struct FlakyProvider {
-        attempts: Arc<AtomicU32>,
-        fail_times: u32,
-    }
-
-    impl Provider for FlakyProvider {
-        #[allow(
-            clippy::unnecessary_literal_bound,
-            reason = "trait method must return &str"
-        )]
-        fn model_id(&self) -> &str {
-            "flaky"
-        }
-        fn complete(
-            &self,
-            _r: ChatRequest,
-        ) -> BoxFuture<'_, Result<ChatResponse, crate::error::ProviderError>> {
-            Box::pin(async { Err(crate::error::ProviderError::Cancelled) })
-        }
-        fn stream(
-            &self,
-            _r: ChatRequest,
-        ) -> BoxFuture<'_, Result<EventStream, crate::error::ProviderError>> {
-            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
-            let fail = n < self.fail_times;
-            Box::pin(async move {
-                if fail {
-                    return Err(crate::error::ProviderError::Transport("boom".into()));
-                }
-                Ok(crate::provider::event_stream(vec![
-                    Ok(StreamEvent::TextDelta("ok".into())),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::EndTurn,
-                        usage: Usage::default(),
-                    }),
-                ]))
-            })
-        }
-    }
-
+    // Retry behaviour (transient retries, the retry cap) is covered end to end
+    // by `tests/retry.rs`.
     #[test]
     fn provider_registers_and_sets_default_model() {
-        let agent = Agent::new(()).provider(FlakyProvider {
-            attempts: Arc::new(AtomicU32::new(0)),
-            fail_times: 0,
-        });
-        assert!(agent.has_provider("flaky"));
+        let agent = Agent::new(()).provider(crate::provider::tests::MockProvider);
+        assert!(agent.has_provider("mock"));
         assert!(!agent.has_provider("missing"));
-        assert_eq!(agent.current_model(), "flaky");
-    }
-
-    #[tokio::test]
-    async fn transient_failures_are_retried_before_first_token() {
-        let attempts = Arc::new(AtomicU32::new(0));
-        let mut agent = Agent::new(())
-            .provider(FlakyProvider {
-                attempts: Arc::clone(&attempts),
-                // Fail twice, succeed on the third attempt (within 2 retries).
-                fail_times: 2,
-            })
-            .model("flaky")
-            .with_retries(2)
-            .with_context(vec![Message::user("hi")]);
-        let out = agent.run().await.expect("outcome");
-        assert_eq!(out.text, "ok");
-        assert!(matches!(out.finish, Finish::EndTurn));
-        assert_eq!(attempts.load(Ordering::SeqCst), 3, "two retries + success");
-    }
-
-    #[tokio::test]
-    async fn transient_failures_beyond_cap_stop_with_error() {
-        let attempts = Arc::new(AtomicU32::new(0));
-        let mut agent = Agent::new(())
-            .provider(FlakyProvider {
-                attempts: Arc::clone(&attempts),
-                fail_times: 5,
-            })
-            .model("flaky")
-            .with_retries(1)
-            .with_context(vec![Message::user("hi")]);
-        let out = agent.run().await.expect("outcome");
-        assert!(matches!(out.finish, Finish::Stopped { .. }));
-        // 1 try + 1 retry = 2 attempts, then give up.
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(agent.current_model(), "mock");
     }
 
     /// A provider that streams one delta and then never finishes.

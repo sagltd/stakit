@@ -4,16 +4,17 @@
 //! These tests use a mock `SkillLoader` (no network) and a recording provider
 //! that captures the `ChatRequest.system` text sent to the provider.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 
-use futures::StreamExt;
-use futures::future::BoxFuture;
 use stakit_ai_sdk::{
-    Agent, AgentCx, AgentError, AgentEvent, AgentMiddleware, ChatRequest, ChatResponse,
-    EventStream, Flow, Message, Provider, ProviderError, Skill, SkillContent, SkillLoader,
-    StopReason, StreamEvent, ToolOutcome, Usage,
+    Agent, AgentCx, AgentError, AgentMiddleware, Flow, Message, Skill, SkillContent, SkillLoader,
+    ToolOutcome,
 };
+
+#[path = "support/mock.rs"]
+mod mock;
+use mock::{Scripted, assert_tool_error, last_tool_result, text_turn};
 
 // ── Mock skill loader ────────────────────────────────────────────────────────
 
@@ -60,93 +61,17 @@ impl SkillLoader<()> for MockLoader {
 
 // ── Recording provider ───────────────────────────────────────────────────────
 //
-// Captures the full ChatRequest for each call so tests can assert on
-// `system.text`, tool definitions, etc.
+// `Scripted` captures the full ChatRequest for each call so tests can assert
+// on `system.text`, tool definitions, etc.
 
-#[derive(Clone)]
-struct RecordingProvider {
-    calls: Arc<AtomicU32>,
-    requests: Arc<Mutex<Vec<ChatRequest>>>,
-    /// Script: requests[0] returns this tool call (None → text "done").
-    tool_call_on_first: Option<(&'static str, &'static str)>, // (tool_name, arguments)
+/// Provider that always responds with a single text turn ("done").
+fn text_only() -> Scripted {
+    Scripted::turns("recorder", |_| text_turn("done"))
 }
 
-impl RecordingProvider {
-    /// Provider that always responds with a single text turn ("done").
-    fn text_only() -> Self {
-        Self {
-            calls: Arc::new(AtomicU32::new(0)),
-            requests: Arc::new(Mutex::new(Vec::new())),
-            tool_call_on_first: None,
-        }
-    }
-
-    /// Provider that produces a tool call on step 0, then "done" on step 1.
-    fn with_tool_call(name: &'static str, args: &'static str) -> Self {
-        Self {
-            calls: Arc::new(AtomicU32::new(0)),
-            requests: Arc::new(Mutex::new(Vec::new())),
-            tool_call_on_first: Some((name, args)),
-        }
-    }
-
-    fn captured(&self) -> Vec<ChatRequest> {
-        self.requests.lock().unwrap().clone()
-    }
-}
-
-impl Provider for RecordingProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "recorder"
-    }
-
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-
-    fn stream(&self, r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        self.requests.lock().unwrap().push(r);
-        let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        let tool_call_on_first = self.tool_call_on_first;
-        Box::pin(async move {
-            let events: Vec<Result<StreamEvent, ProviderError>> = if n == 0 {
-                if let Some((name, args)) = tool_call_on_first {
-                    vec![
-                        Ok(StreamEvent::ToolCall {
-                            id: "tc1".into(),
-                            name: name.into(),
-                            arguments: args.into(),
-                        }),
-                        Ok(StreamEvent::End {
-                            stop: StopReason::ToolUse,
-                            usage: Usage::default(),
-                        }),
-                    ]
-                } else {
-                    vec![
-                        Ok(StreamEvent::TextDelta("done".into())),
-                        Ok(StreamEvent::End {
-                            stop: StopReason::EndTurn,
-                            usage: Usage::default(),
-                        }),
-                    ]
-                }
-            } else {
-                vec![
-                    Ok(StreamEvent::TextDelta("done".into())),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::EndTurn,
-                        usage: Usage::default(),
-                    }),
-                ]
-            };
-            Ok(futures::stream::iter(events).boxed())
-        })
-    }
+/// Provider that produces a tool call on step 0, then "done" on step 1.
+fn with_tool_call(name: &'static str, args: &'static str) -> Scripted {
+    Scripted::tool_then_text("recorder", name, args, "done")
 }
 
 // ── Test 1: list() is called at run start and injected into system prompt ────
@@ -165,7 +90,7 @@ async fn list_is_called_at_start_and_injected_into_system_prompt() {
             description: "second skill".into(),
         },
     ];
-    let provider = RecordingProvider::text_only();
+    let provider = text_only();
     let mut agent = Agent::new(())
         .provider(provider.clone())
         .model("recorder")
@@ -174,7 +99,7 @@ async fn list_is_called_at_start_and_injected_into_system_prompt() {
 
     let _ = agent.run().await.expect("outcome");
 
-    let captured = provider.captured();
+    let captured = provider.requests();
     assert!(!captured.is_empty(), "provider must have been called");
     let system = captured[0]
         .system
@@ -211,65 +136,6 @@ async fn list_is_called_at_start_and_injected_into_system_prompt() {
 
 // ── Test 2: search_skills built-in returns full-text matches ─────────────────
 
-// A provider that calls `search_skills` on the first turn.
-#[derive(Clone)]
-struct SearchProvider {
-    calls: Arc<AtomicU32>,
-    query: &'static str,
-}
-
-impl SearchProvider {
-    fn new(query: &'static str) -> Self {
-        Self {
-            calls: Arc::new(AtomicU32::new(0)),
-            query,
-        }
-    }
-}
-
-impl Provider for SearchProvider {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "trait method must return &str"
-    )]
-    fn model_id(&self) -> &str {
-        "searcher"
-    }
-
-    fn complete(&self, _r: ChatRequest) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-
-    fn stream(&self, _r: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        let query = self.query;
-        Box::pin(async move {
-            let events: Vec<Result<StreamEvent, ProviderError>> = if n == 0 {
-                vec![
-                    Ok(StreamEvent::ToolCall {
-                        id: "tc1".into(),
-                        name: "search_skills".into(),
-                        arguments: format!(r#"{{"query":"{query}"}}"#),
-                    }),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::ToolUse,
-                        usage: Usage::default(),
-                    }),
-                ]
-            } else {
-                vec![
-                    Ok(StreamEvent::TextDelta("done".into())),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::EndTurn,
-                        usage: Usage::default(),
-                    }),
-                ]
-            };
-            Ok(futures::stream::iter(events).boxed())
-        })
-    }
-}
-
 #[tokio::test]
 async fn search_skills_returns_matches_for_query() {
     let skills = vec![
@@ -284,24 +150,16 @@ async fn search_skills_returns_matches_for_query() {
             description: "write Python".into(),
         },
     ];
-    let provider = SearchProvider::new("rust");
-    let provider_clone = provider.clone();
+    // A provider that calls `search_skills` on the first turn.
+    let provider =
+        Scripted::tool_then_text("searcher", "search_skills", r#"{"query":"rust"}"#, "done");
     let mut agent = Agent::new(())
         .provider(provider)
         .model("searcher")
         .skills(MockLoader::new(skills))
         .with_context(vec![Message::user("search")]);
 
-    let mut run = agent.run();
-    let mut tool_result = None;
-    while let Some(ev) = run.next().await {
-        if let AgentEvent::ToolResult { result, .. } = ev {
-            tool_result = Some(result);
-        }
-    }
-    let _ = provider_clone; // keep alive
-
-    let result = match tool_result.expect("search_skills must produce a result") {
+    let result = match last_tool_result(agent.run()).await {
         ToolOutcome::Ok(v) => v,
         other => panic!("expected Ok, got {other:?}"),
     };
@@ -324,22 +182,14 @@ async fn load_skill_returns_body_on_known_id() {
         name: "Rust guide".into(),
         description: "guides for Rust".into(),
     }];
-    let provider = RecordingProvider::with_tool_call("load_skill", r#"{"id":"rust"}"#);
+    let provider = with_tool_call("load_skill", r#"{"id":"rust"}"#);
     let mut agent = Agent::new(())
         .provider(provider.clone())
         .model("recorder")
         .skills(MockLoader::new(skills))
         .with_context(vec![Message::user("load it")]);
 
-    let mut run = agent.run();
-    let mut tool_result = None;
-    while let Some(ev) = run.next().await {
-        if let AgentEvent::ToolResult { result, .. } = ev {
-            tool_result = Some(result);
-        }
-    }
-
-    let result = match tool_result.expect("load_skill must produce a result") {
+    let result = match last_tool_result(agent.run()).await {
         ToolOutcome::Ok(v) => v,
         other => panic!("expected Ok, got {other:?}"),
     };
@@ -359,27 +209,14 @@ async fn load_skill_with_unknown_id_yields_error_not_panic() {
         name: "Known Skill".into(),
         description: "a skill".into(),
     }];
-    let provider = RecordingProvider::with_tool_call("load_skill", r#"{"id":"unknown-id"}"#);
+    let provider = with_tool_call("load_skill", r#"{"id":"unknown-id"}"#);
     let mut agent = Agent::new(())
         .provider(provider.clone())
         .model("recorder")
         .skills(MockLoader::new(skills))
         .with_context(vec![Message::user("load unknown")]);
 
-    let mut run = agent.run();
-    let mut tool_result = None;
-    while let Some(ev) = run.next().await {
-        if let AgentEvent::ToolResult { result, .. } = ev {
-            tool_result = Some(result);
-        }
-    }
-
-    match tool_result.expect("load_skill must produce a result") {
-        ToolOutcome::Error(msg) => {
-            assert!(!msg.is_empty(), "error message must not be empty");
-        }
-        other => panic!("expected ToolOutcome::Error for unknown id, got {other:?}"),
-    }
+    assert_tool_error(agent.run(), "unknown skill id: unknown-id").await;
 }
 
 // ── Test 3c: load_skill with missing/empty id → ToolOutcome::Error ───────────
@@ -391,30 +228,14 @@ async fn load_skill_with_empty_id_yields_error() {
         name: "S1".into(),
         description: "a skill".into(),
     }];
-    let provider = RecordingProvider::with_tool_call("load_skill", r"{}");
+    let provider = with_tool_call("load_skill", r"{}");
     let mut agent = Agent::new(())
         .provider(provider.clone())
         .model("recorder")
         .skills(MockLoader::new(skills))
         .with_context(vec![Message::user("load empty")]);
 
-    let mut run = agent.run();
-    let mut tool_result = None;
-    while let Some(ev) = run.next().await {
-        if let AgentEvent::ToolResult { result, .. } = ev {
-            tool_result = Some(result);
-        }
-    }
-
-    match tool_result.expect("load_skill must produce a result") {
-        ToolOutcome::Error(msg) => {
-            assert!(
-                msg.contains("missing required argument: id"),
-                "expected missing-id error, got: {msg}"
-            );
-        }
-        other => panic!("expected ToolOutcome::Error for empty id, got {other:?}"),
-    }
+    assert_tool_error(agent.run(), "missing required argument: id").await;
 }
 
 // ── Test 4: loader.load is NOT called before a load_skill tool call ──────────
@@ -428,7 +249,7 @@ async fn loader_load_not_called_eagerly() {
         description: "a skill".into(),
     }];
     // Provider that just emits text — no load_skill tool call.
-    let provider = RecordingProvider::text_only();
+    let provider = text_only();
     let mut agent = Agent::new(())
         .provider(provider.clone())
         .model("recorder")
@@ -468,7 +289,7 @@ async fn skill_manifest_is_injected_each_step_and_set_system_still_applies() {
     }];
     // Step 0 calls a built-in skill tool so the loop runs a second step; the
     // middleware then swaps the base system prompt before step 1.
-    let provider = RecordingProvider::with_tool_call("search_skills", r#"{"query":"x"}"#);
+    let provider = with_tool_call("search_skills", r#"{"query":"x"}"#);
     let mut agent = Agent::new(())
         .provider(provider.clone())
         .model("recorder")
@@ -478,7 +299,7 @@ async fn skill_manifest_is_injected_each_step_and_set_system_still_applies() {
 
     let _ = agent.run().await.expect("outcome");
 
-    let captured = provider.captured();
+    let captured = provider.requests();
     assert!(captured.len() >= 2, "expected at least two provider calls");
 
     // The manifest (cached once) must be injected on BOTH steps.
