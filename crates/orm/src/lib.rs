@@ -80,7 +80,7 @@ pub use projection::{
 pub use query::Select;
 pub use raw::Raw;
 pub use schema::{Col, Column, Expr, ForeignKey, OnDelete, Rel, Table};
-pub use sql::SqlWriter;
+pub use sql::{BindBuffer, SqlWriter};
 pub use value::{FromValue, ToValue, Value, ValueKind};
 pub use vector::{Distance, Vector};
 

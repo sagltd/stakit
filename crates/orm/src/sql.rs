@@ -6,10 +6,11 @@
 use crate::ident::{self, IdentError};
 use crate::value::Value;
 
-/// Inline-capacity bind buffer: most statements bind few values, so the common
-/// case stays on the stack (no heap allocation for the buffer itself). Values are
-/// backend-neutral [`Value`]s; each driver converts them to native parameters.
-pub(crate) type BindBuffer = smallvec::SmallVec<[Value; 4]>;
+/// Inline-capacity buffer of backend-neutral statement parameters.
+///
+/// Common small statements keep the buffer on the stack. Each driver converts
+/// the backend-neutral [`Value`]s to native parameters.
+pub type BindBuffer = smallvec::SmallVec<[Value; 4]>;
 
 /// Typical assembled statement length; pre-sizing avoids `String` reallocs in
 /// the build hot path.
