@@ -9,6 +9,10 @@ use serde_json::{Value, json};
 use stakit_model::Model;
 use stakit_router::{BorrowAction, Cx, Error, Frame, Router, action};
 
+#[path = "../tests/support/fixtures.rs"]
+mod fixtures;
+use fixtures::count;
+
 fn main() {
     divan::main();
 }
@@ -33,20 +37,6 @@ async fn greet(_cx: &Cx<App, Req>, params: Greet) -> Result<Greeting, Error> {
     Ok(Greeting {
         message: params.name,
     })
-}
-
-#[derive(Model, Serialize, Deserialize)]
-struct Count {
-    n: u64,
-}
-
-#[action(stream)]
-fn count(params: Count) -> impl futures::Stream<Item = Result<u64, Error>> {
-    async_stream::stream! {
-        for i in 0..params.n {
-            yield Ok(i);
-        }
-    }
 }
 
 // Minimal action: `()` params + `()` output, so its benchmark isolates the

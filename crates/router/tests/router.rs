@@ -14,9 +14,13 @@ use serde_json::{Value, json};
 use std::sync::OnceLock;
 
 use stakit_model::Model;
+
+#[path = "support/fixtures.rs"]
+mod fixtures;
+use fixtures::{Admin, Count, RequireAdmin, count, open_session, payload};
 use stakit_router::{
     Action, ActionExt as _, ClientAction, Cx, Endpoint, Error, Frame, Middleware, ResponseError,
-    Router, StreamActionExt as _, action, err,
+    Router, StreamActionExt, action, err,
 };
 
 // --- contexts ---
@@ -26,6 +30,11 @@ struct App {
 #[derive(Clone)]
 struct Req {
     admin: bool,
+}
+impl Admin for Req {
+    fn is_admin(&self) -> bool {
+        self.admin
+    }
 }
 
 // --- models ---
@@ -92,21 +101,6 @@ async fn find(params: Greet) -> Result<Greeting, Error> {
     Ok(Greeting {
         message: params.name,
     })
-}
-
-// --- streaming action (no ctx needed) ---
-#[derive(Model, Serialize, Deserialize)]
-struct Count {
-    n: u64,
-}
-
-#[action(stream)]
-fn count(params: Count) -> impl futures::Stream<Item = Result<u64, Error>> {
-    async_stream::stream! {
-        for i in 0..params.n {
-            yield Ok(i);
-        }
-    }
 }
 
 // A streaming action that calls a *client* action on every iteration — proves
@@ -183,13 +177,6 @@ fn router() -> Router<App, Req> {
         .register_stream(progress)
         .client_action::<ShowToast>()
         .build()
-}
-
-/// Builds a single-call object payload `{ action: params }`.
-fn payload(action: &str, params: Value) -> Value {
-    let mut map = serde_json::Map::new();
-    map.insert(action.to_owned(), params);
-    Value::Object(map)
 }
 
 /// Calls one action and returns its envelope (`{status, data | error}`).
@@ -418,10 +405,7 @@ fn thiserror_app_error_works_out_of_the_box() {
 
 #[tokio::test]
 async fn duplex_client_call_roundtrip() {
-    let router = Arc::new(router());
-    let mut session = router.session(Req { admin: true });
-    let mut outgoing = session.outgoing();
-    let session = Arc::new(session);
+    let (session, mut outgoing) = open_session(&Arc::new(router()), Req { admin: true });
 
     // Client invokes the server action `notify_user` (camelCase under `camel` feature).
     session.handle(
@@ -448,10 +432,7 @@ async fn duplex_client_call_roundtrip() {
 
 #[tokio::test]
 async fn duplex_streams_over_websocket() {
-    let router = Arc::new(router());
-    let mut session = router.session(Req { admin: true });
-    let mut outgoing = session.outgoing();
-    let session = Arc::new(session);
+    let (session, mut outgoing) = open_session(&Arc::new(router()), Req { admin: true });
 
     session.handle(&json!({ "kind": "call", "id": 7, "action": <count as Endpoint>::ACTION, "params": { "n": 2 } }));
 
@@ -466,10 +447,7 @@ async fn duplex_streams_over_websocket() {
 
 #[tokio::test]
 async fn duplex_stream_action_can_call_client_actions() {
-    let router = Arc::new(router());
-    let mut session = router.session(Req { admin: true });
-    let mut outgoing = session.outgoing();
-    let session = Arc::new(session);
+    let (session, mut outgoing) = open_session(&Arc::new(router()), Req { admin: true });
 
     // A streaming action `progress` that calls back to the client each iteration.
     session.handle(&json!({ "kind": "call", "id": 1, "action": <progress as Endpoint>::ACTION, "params": { "n": 2 } }));
@@ -524,9 +502,7 @@ async fn client_call_times_out_when_unanswered() {
             .client_call_timeout(Duration::from_millis(50))
             .build(),
     );
-    let mut session = router.session(Req { admin: true });
-    let mut outgoing = session.outgoing();
-    let session = Arc::new(session);
+    let (session, mut outgoing) = open_session(&router, Req { admin: true });
 
     session.handle(
         &json!({ "kind": "call", "id": 1, "action": <notify_user as Endpoint>::ACTION, "params": { "name": "x" } }),
@@ -729,25 +705,14 @@ fn middleware_after_runs_once_the_action_completes() {
     assert_eq!(AFTER_RAN.load(Ordering::SeqCst), 1); // ...then `after`
 }
 
-// guard on a *streaming* action (exercises `StreamGuarded`).
-struct RequireAdmin;
-impl Middleware<App, Req> for RequireAdmin {
-    async fn before(&self, cx: &Cx<App, Req>) -> Result<(), Error> {
-        if cx.req.admin {
-            Ok(())
-        } else {
-            Err(err!(403, "admin only"))
-        }
-    }
-}
-
+// guard on a *streaming* action (exercises `StreamGuarded`): `RequireAdmin`.
 #[test]
 fn stream_middleware_guards_the_stream() {
     let router = Router::builder()
         .ctx(App {
             greeting: "Hi".to_owned(),
         })
-        .register_stream(count.middleware(RequireAdmin))
+        .register_stream(StreamActionExt::<App, Req>::middleware(count, RequireAdmin))
         .build();
 
     let count_name = <count as Endpoint>::ACTION;

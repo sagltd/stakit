@@ -13,6 +13,10 @@ use serde_json::{Value, json};
 
 use stakit_router::{Cx, Error, Router, action, model};
 
+#[path = "support/fixtures.rs"]
+mod fixtures;
+use fixtures::payload;
+
 // --- contexts ---
 struct App;
 #[derive(Clone)]
@@ -102,13 +106,6 @@ fn router() -> Router<App, Req> {
         .register(announce)
         .register(checkout)
         .build()
-}
-
-/// One-call object payload `{ action: params }`.
-fn payload(action: &str, params: Value) -> Value {
-    let mut map = serde_json::Map::new();
-    map.insert(action.to_owned(), params);
-    Value::Object(map)
 }
 
 /// Dispatches one action and returns its envelope.

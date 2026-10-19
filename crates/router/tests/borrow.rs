@@ -72,20 +72,28 @@ async fn ping() -> Result<String, Error> {
     Ok("pong".to_owned())
 }
 
-fn router(seen: Arc<AtomicUsize>) -> Router<(), ()> {
-    Router::<(), ()>::builder()
+/// The router under test, plus the cell its `login` action records the
+/// address of its borrowed `email` in.
+fn router() -> (Router<(), ()>, Arc<AtomicUsize>) {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let router = Router::<(), ()>::builder()
         .ctx(())
-        .register_borrow(Login { seen_ptr: seen })
+        .register_borrow(Login {
+            seen_ptr: Arc::clone(&seen),
+        })
         .register(ping)
-        .build()
+        .build();
+    (router, seen)
 }
+
+/// A valid `login` call body.
+const LOGIN_BODY: &[u8] = br#"{"login":{"email":"a@b.com"}}"#;
 
 #[test]
 fn router_dispatches_borrowed_action_and_returns_data() {
-    let seen = Arc::new(AtomicUsize::new(0));
-    let router = router(Arc::clone(&seen));
+    let (router, _) = router();
 
-    let body = br#"{"login":{"email":"a@b.com"}}"#.to_vec();
+    let body = LOGIN_BODY.to_vec();
     let response = block_on(router.on_request_borrowed((), &body));
 
     let data = &response["login"]["data"];
@@ -95,10 +103,9 @@ fn router_dispatches_borrowed_action_and_returns_data() {
 
 #[test]
 fn borrowed_input_points_into_the_request_buffer() {
-    let seen = Arc::new(AtomicUsize::new(0));
-    let router = router(Arc::clone(&seen));
+    let (router, seen) = router();
 
-    let body = br#"{"login":{"email":"a@b.com"}}"#.to_vec();
+    let body = LOGIN_BODY.to_vec();
     let _ = block_on(router.on_request_borrowed((), &body));
 
     // Zero-copy proof: the action saw an `email` pointer inside `body` — if the
@@ -114,8 +121,7 @@ fn borrowed_input_points_into_the_request_buffer() {
 
 #[test]
 fn borrowed_action_runs_derived_validation() {
-    let seen = Arc::new(AtomicUsize::new(0));
-    let router = router(Arc::clone(&seen));
+    let (router, _) = router();
 
     let body = br#"{"login":{"email":"not-an-email"}}"#.to_vec();
     let response = block_on(router.on_request_borrowed((), &body));
@@ -126,8 +132,7 @@ fn borrowed_action_runs_derived_validation() {
 
 #[test]
 fn owned_action_falls_back_through_borrowed_entrypoint() {
-    let seen = Arc::new(AtomicUsize::new(0));
-    let router = router(Arc::clone(&seen));
+    let (router, _) = router();
 
     // One payload, two calls: a borrow action and an owned action.
     let body = br#"{"login":{"email":"a@b.com"},"ping":null}"#.to_vec();
@@ -139,8 +144,7 @@ fn owned_action_falls_back_through_borrowed_entrypoint() {
 
 #[test]
 fn array_payload_dispatches_borrowed_calls_in_order() {
-    let seen = Arc::new(AtomicUsize::new(0));
-    let router = router(Arc::clone(&seen));
+    let (router, _) = router();
 
     let body = br#"[["login",{"email":"a@b.com"}],["login",{"email":"c@d.com"}]]"#.to_vec();
     let response = block_on(router.on_request_borrowed((), &body));
@@ -153,8 +157,7 @@ fn array_payload_dispatches_borrowed_calls_in_order() {
 
 #[test]
 fn unknown_borrowed_action_is_not_found() {
-    let seen = Arc::new(AtomicUsize::new(0));
-    let router = router(Arc::clone(&seen));
+    let (router, _) = router();
 
     let body = br#"{"nope":{"x":1}}"#.to_vec();
     let response = block_on(router.on_request_borrowed((), &body));
@@ -165,8 +168,7 @@ fn unknown_borrowed_action_is_not_found() {
 
 #[test]
 fn borrow_action_appears_in_generated_typescript() {
-    let seen = Arc::new(AtomicUsize::new(0));
-    let ts = router(seen).generate_ts();
+    let ts = router().0.generate_ts();
 
     assert!(ts.contains("export interface LoginParams {"), "{ts}");
     assert!(ts.contains("login: LoginParams;"), "{ts}");

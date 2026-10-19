@@ -5,10 +5,14 @@
 use futures::StreamExt as _;
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use stakit_model::Model;
 use stakit_router::{Cx, Endpoint, Error, Frame, Middleware, Router, StreamActionExt as _, action};
+
+#[path = "support/fixtures.rs"]
+mod fixtures;
+use fixtures::payload;
 
 #[derive(Model, Serialize, Deserialize)]
 struct In {
@@ -76,12 +80,6 @@ fn router() -> Router<(), ()> {
         .register_stream(boom_first)
         .register_stream(good.middleware(PanicAfter))
         .build()
-}
-
-fn payload(action: &str, params: Value) -> Value {
-    let mut map = serde_json::Map::new();
-    map.insert(action.to_owned(), params);
-    Value::Object(map)
 }
 
 #[test]

@@ -5,15 +5,18 @@
 //! and websocket `call` results.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use stakit_model::Model;
 use stakit_router::{Endpoint, Error, Frame, ResponseError, Router, action};
+
+#[path = "support/fixtures.rs"]
+mod fixtures;
+use fixtures::{next_frame, open_session, payload};
 
 #[derive(Model, Serialize, Deserialize)]
 struct In {
@@ -38,12 +41,6 @@ fn explode_stream(_params: In) -> impl futures::Stream<Item = Result<u32, Error>
         yield Ok(0u32);
         yield Err(Error::new(500, "boom"));
     }
-}
-
-fn payload(action: &str, params: Value) -> Value {
-    let mut map = serde_json::Map::new();
-    map.insert(action.to_owned(), params);
-    Value::Object(map)
 }
 
 // --- default: identity (no hook) ---
@@ -149,17 +146,12 @@ async fn hook_fires_on_session_path() {
             .register(explode)
             .build(),
     );
-    let mut session = router.session(());
-    let mut outgoing = session.outgoing();
-    let session = Arc::new(session);
+    let (session, mut outgoing) = open_session(&router, ());
 
     // Use the action's stable name (camelCase under the `camel` feature).
     let action_name = <explode as Endpoint>::ACTION;
     session.handle(&json!({ "kind": "call", "id": 1, "action": action_name, "params": null }));
-    let result = tokio::time::timeout(Duration::from_secs(2), outgoing.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let result = next_frame(&mut outgoing).await;
     assert_eq!(result["status"], "error");
     assert_eq!(result["error"]["code"], 500);
     assert_eq!(result["error"]["message"], "ws redacted");

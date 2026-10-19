@@ -27,12 +27,15 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use stakit_model::Model;
+
+#[path = "support/fixtures.rs"]
+mod fixtures;
+use fixtures::{Admin, Count, RequireAdmin, count, next_frame, open_session, payload};
 use stakit_router::{
-    ActionExt as _, Cx, Endpoint, Error, Frame, Middleware, ResponseError, Router,
-    StreamActionExt as _, action, err,
+    ActionExt as _, Cx, Endpoint, Error, Frame, ResponseError, Router, StreamActionExt, action,
 };
 
 // ── contexts ─────────────────────────────────────────────────────────────────
@@ -44,17 +47,18 @@ struct Req {
     admin: bool,
 }
 
+impl Admin for Req {
+    fn is_admin(&self) -> bool {
+        self.admin
+    }
+}
+
 // ── models ───────────────────────────────────────────────────────────────────
 
 #[derive(Model, Serialize, Deserialize)]
 struct Secret {
     #[validate(min_len = 8, max_len = 64)]
     api_key: String,
-}
-
-#[derive(Model, Serialize, Deserialize)]
-struct Count {
-    n: u64,
 }
 
 // ── actions ──────────────────────────────────────────────────────────────────
@@ -70,38 +74,12 @@ async fn admin_only(_cx: &Cx<App, Req>, _params: Secret) -> Result<String, Error
     Ok("top secret".to_owned())
 }
 
-#[action(stream)]
-fn count(params: Count) -> impl futures::Stream<Item = Result<u64, Error>> {
-    async_stream::stream! {
-        for i in 0..params.n {
-            yield Ok(i);
-        }
-    }
-}
-
-struct RequireAdmin;
-impl Middleware<App, Req> for RequireAdmin {
-    async fn before(&self, cx: &Cx<App, Req>) -> Result<(), Error> {
-        if cx.req.admin {
-            Ok(())
-        } else {
-            Err(err!(403, "admin only"))
-        }
-    }
-}
-
 fn guarded_router() -> Router<App, Req> {
     Router::builder()
         .ctx(App)
         .register(admin_only.middleware(RequireAdmin))
-        .register_stream(count.middleware(RequireAdmin))
+        .register_stream(StreamActionExt::<App, Req>::middleware(count, RequireAdmin))
         .build()
-}
-
-fn payload(action: &str, params: Value) -> Value {
-    let mut map = serde_json::Map::new();
-    map.insert(action.to_owned(), params);
-    Value::Object(map)
 }
 
 // ── FIXED (was MED): the guard now runs BEFORE deserialize/validate ──────────
@@ -277,9 +255,7 @@ fn ws_router() -> Arc<Router<App, Req>> {
 #[tokio::test]
 async fn session_ignores_hostile_frames_without_panicking() {
     let router = ws_router();
-    let mut session = router.session(Req { admin: true });
-    let _outgoing = session.outgoing();
-    let session = Arc::new(session);
+    let (session, _outgoing) = open_session(&router, Req { admin: true });
 
     // None of these well-poisoned frames may panic the session.
     let hostile = [
@@ -307,9 +283,7 @@ async fn session_ignores_hostile_frames_without_panicking() {
     }
 
     // The session is still alive and routes a legitimate call afterwards.
-    let mut session2 = router.session(Req { admin: true });
-    let mut out2 = session2.outgoing();
-    let session2 = Arc::new(session2);
+    let (session2, mut out2) = open_session(&router, Req { admin: true });
     session2.handle(&json!({
         "kind": "call", "id": 1, "action": <greet as Endpoint>::ACTION, "params": { "name": "ok" }
     }));
@@ -325,15 +299,10 @@ async fn session_ignores_hostile_frames_without_panicking() {
 #[tokio::test]
 async fn session_unknown_action_is_404_not_panic() {
     let router = ws_router();
-    let mut session = router.session(Req { admin: true });
-    let mut outgoing = session.outgoing();
-    let session = Arc::new(session);
+    let (session, mut outgoing) = open_session(&router, Req { admin: true });
 
     session.handle(&json!({ "kind": "call", "id": 1, "action": "does_not_exist", "params": null }));
-    let result = tokio::time::timeout(Duration::from_secs(2), outgoing.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let result = next_frame(&mut outgoing).await;
     assert_eq!(result["status"], "error");
     assert_eq!(result["error"]["code"], 404);
 }
@@ -343,17 +312,12 @@ async fn session_validation_runs_on_the_duplex_path_too() {
     // Validation is not just an HTTP-path guard: invalid input over a websocket
     // session is rejected with 422 before the action body runs.
     let router = ws_router();
-    let mut session = router.session(Req { admin: true });
-    let mut outgoing = session.outgoing();
-    let session = Arc::new(session);
+    let (session, mut outgoing) = open_session(&router, Req { admin: true });
 
     session.handle(&json!({
         "kind": "call", "id": 1, "action": <greet as Endpoint>::ACTION, "params": { "name": "" }
     }));
-    let result = tokio::time::timeout(Duration::from_secs(2), outgoing.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let result = next_frame(&mut outgoing).await;
     assert_eq!(result["status"], "error");
     assert_eq!(result["error"]["code"], 422);
 }
