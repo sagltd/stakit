@@ -112,3 +112,32 @@ async fn guarded_increment_only_applies_while_there_is_room() {
     assert_eq!(reserve(1).await.expect("full"), 0);
     assert_eq!(balance(&db).await, 100);
 }
+
+#[tokio::test]
+async fn bigint_sum_decodes_as_i64_and_groups_by_an_expression() {
+    let (_pg, db) = setup().await;
+    db.raw("insert into counters values ('b', 9000000000, 1), ('c', 5, 2)")
+        .exec()
+        .await
+        .expect("seed");
+    let total: Option<i64> = db
+        .select(sum(Counter::balance))
+        .from::<Counter>()
+        .one()
+        .await
+        .expect("sum")
+        .expect("row");
+    assert_eq!(total, Some(9_000_000_015));
+    let mut buckets: Vec<(i64, Option<i64>)> = db
+        .select((
+            sql_expr::<i64>("(\"counters\".\"cap\" % 2)"),
+            sum(Counter::balance),
+        ))
+        .from::<Counter>()
+        .group_by_sql("(\"counters\".\"cap\" % 2)")
+        .all()
+        .await
+        .expect("grouped");
+    buckets.sort_unstable();
+    assert_eq!(buckets, [(0, Some(15)), (1, Some(9_000_000_000))]);
+}

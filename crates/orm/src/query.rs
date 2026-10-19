@@ -34,6 +34,12 @@ struct NearestGeo {
     geom: Value,
 }
 
+/// One `GROUP BY` term: a qualified column or a raw SQL expression.
+enum GroupTerm {
+    Column(&'static str, &'static str),
+    Sql(&'static str),
+}
+
 /// A `SELECT` query under construction.
 pub struct Select<P> {
     projection: P,
@@ -41,7 +47,7 @@ pub struct Select<P> {
     from_table: &'static str,
     joins: Vec<Join>,
     filter: Option<Predicate>,
-    group: SmallVec<[(&'static str, &'static str); 4]>,
+    group: SmallVec<[GroupTerm; 4]>,
     having: Option<Predicate>,
     order: SmallVec<[Order; 4]>,
     nearest: Option<NearestOrder>,
@@ -122,7 +128,17 @@ impl<P: Projection> Select<P> {
     /// Add a `GROUP BY` column.
     #[must_use]
     pub fn group_by<T, Ty>(mut self, column: crate::schema::Col<T, Ty>) -> Self {
-        self.group.push((column.table, column.name));
+        self.group
+            .push(GroupTerm::Column(column.table, column.name));
+        self
+    }
+
+    /// Add a raw SQL `GROUP BY` expression, written verbatim (a `&'static str`,
+    /// like [`sql_expr`](crate::sql_expr)) — pair it with the same fragment in
+    /// the projection, e.g. bucketing timestamps by day.
+    #[must_use]
+    pub fn group_by_sql(mut self, fragment: &'static str) -> Self {
+        self.group.push(GroupTerm::Sql(fragment));
         self
     }
 
@@ -257,9 +273,12 @@ impl<P: Projection> Select<P> {
             writer.push(" where ");
             filter.write(&mut writer)?;
         }
-        for (index, (table, column)) in group.iter().enumerate() {
+        for (index, term) in group.iter().enumerate() {
             writer.push(if index == 0 { " group by " } else { ", " });
-            writer.push_qualified(table, column)?;
+            match term {
+                GroupTerm::Column(table, column) => writer.push_qualified(table, column)?,
+                GroupTerm::Sql(fragment) => writer.push(fragment),
+            }
         }
         if let Some(having) = having {
             writer.push(" having ");

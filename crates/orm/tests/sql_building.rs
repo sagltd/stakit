@@ -249,6 +249,24 @@ fn group_by_with_aggregate() {
 }
 
 #[test]
+fn group_by_sql_expression_with_aggregate() {
+    use stakit_orm::{count_col, sql_expr};
+    let sql = Select::new((
+        sql_expr::<i64>("lower(\"users\".\"name\")"),
+        count_col(User::id),
+    ))
+    .from::<User>()
+    .group_by_sql("lower(\"users\".\"name\")")
+    .group_by(User::id)
+    .to_sql()
+    .unwrap();
+    assert_eq!(
+        sql,
+        r#"select lower("users"."name"), count("users"."id") from "users" group by lower("users"."name"), "users"."id""#
+    );
+}
+
+#[test]
 fn group_by_having_aggregate() {
     use stakit_orm::count_col;
     use stakit_orm::expr::raw_pred;

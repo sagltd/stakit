@@ -11,7 +11,7 @@ use crate::driver::Row;
 use crate::error::Result;
 use crate::schema::{Col, Table};
 use crate::sql::SqlWriter;
-use crate::value::FromValue;
+use crate::value::{FromValue, ValueKind};
 use core::marker::PhantomData;
 
 use crate::driver::decode_cell as decode_at;
@@ -87,6 +87,9 @@ pub struct Agg<Out> {
     func: &'static str,
     table: &'static str,
     name: &'static str,
+    /// Cast the result to `Out`'s SQL type (on cast-capable dialects): Postgres
+    /// widens `sum(bigint)` to `numeric`, which no integer type decodes.
+    is_widened: bool,
     marker: PhantomData<fn() -> Out>,
 }
 
@@ -96,8 +99,27 @@ impl<Out> Agg<Out> {
             func,
             table,
             name,
+            is_widened: false,
             marker: PhantomData,
         }
+    }
+
+    const fn widened(func: &'static str, table: &'static str, name: &'static str) -> Self {
+        let mut agg = Self::new(func, table, name);
+        agg.is_widened = true;
+        agg
+    }
+}
+
+/// The SQL type a widened numeric aggregate is cast back to, per output kind.
+const fn numeric_cast(kind: ValueKind) -> Option<&'static str> {
+    match kind {
+        ValueKind::I16 => Some("smallint"),
+        ValueKind::I32 => Some("integer"),
+        ValueKind::I64 => Some("bigint"),
+        ValueKind::F32 => Some("real"),
+        ValueKind::F64 => Some("double precision"),
+        _ => None,
     }
 }
 
@@ -114,6 +136,12 @@ where
         out.push("(");
         out.push_qualified(self.table, self.name)?;
         out.push(")");
+        if self.is_widened && out.supports_cast() {
+            if let Some(cast) = numeric_cast(Out::KIND) {
+                out.push("::");
+                out.push(cast);
+            }
+        }
         Ok(())
     }
     fn decode(&self, row: &dyn Row, start: usize) -> Result<Out> {
@@ -139,19 +167,24 @@ pub const fn count_col<T, Ty>(column: Col<T, Ty>) -> Agg<i64> {
     Agg::new("count", column.table, column.name)
 }
 
-/// `sum(column)`. Postgres widens the result (e.g. `sum(int)` → `bigint`), so the
-/// decoded type `Out` is caller-chosen (usually inferred from the result binding)
-/// and nullable over empty input.
+/// `sum(column)`, nullable over empty input.
+///
+/// Postgres widens the result (`sum(int)` → `bigint`, `sum(bigint)` →
+/// `numeric`), so on cast-capable dialects the result is cast back to the
+/// numeric type of `Out` (e.g. `sum(..)::bigint` for `Option<i64>`; an
+/// out-of-range sum is a database error, never a wrap). `Out` is caller-chosen
+/// (usually inferred from the result binding).
 #[must_use]
 pub const fn sum<Out, T, Ty>(column: Col<T, Ty>) -> Agg<Out> {
-    Agg::new("sum", column.table, column.name)
+    Agg::widened("sum", column.table, column.name)
 }
 
-/// `avg(column)`. The decoded type `Out` is caller-chosen (Postgres returns
-/// `numeric`/`double precision`); nullable over empty input.
+/// `avg(column)`. Postgres returns `numeric`/`double precision`; like [`sum`]
+/// the result is cast to the numeric type of `Out` on cast-capable dialects.
+/// Nullable over empty input.
 #[must_use]
 pub const fn avg<Out, T, Ty>(column: Col<T, Ty>) -> Agg<Out> {
-    Agg::new("avg", column.table, column.name)
+    Agg::widened("avg", column.table, column.name)
 }
 
 /// A raw SQL expression projection (the `sql!` capability) decoding to `Out`.
