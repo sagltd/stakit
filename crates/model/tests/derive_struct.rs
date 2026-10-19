@@ -21,7 +21,7 @@ fn ts_interface_renders_each_field() {
     assert!(ts.contains("name: string;"), "{ts}");
     assert!(ts.contains("email: string;"), "{ts}");
     assert!(ts.contains("age: number;"), "{ts}");
-    assert!(ts.contains("bio?: string;"), "{ts}");
+    assert!(ts.contains("bio?: string | null;"), "{ts}");
 }
 
 #[test]

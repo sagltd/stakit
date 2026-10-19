@@ -51,11 +51,11 @@ where
     }
 }
 
-// --- option -> `T | undefined` ---
+// --- option -> `T | null` (serde JSON representation) ---
 
 impl<T: TSType> TSType for Option<T> {
     fn ts_ref() -> String {
-        format!("{} | undefined", T::ts_ref())
+        format!("{} | null", T::ts_ref())
     }
     fn ts_declarations(out: &mut Decls) {
         T::ts_declarations(out);

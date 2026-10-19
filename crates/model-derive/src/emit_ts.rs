@@ -28,11 +28,10 @@ fn option_inner(ty: &Type) -> Option<&Type> {
     })
 }
 
-/// `<Ty as TSType>::ts_ref()` for the type that should appear in output — the
-/// inner type for `Option<T>`, else the field type itself.
+/// `<Ty as TSType>::ts_ref()` preserves nullable values in every field position.
+/// Named optional properties separately allow omission with `?`.
 fn field_ref_expr(ty: &Type) -> TokenStream {
-    let render = option_inner(ty).unwrap_or(ty);
-    quote!(<#render as ::stakit_model::TSType>::ts_ref())
+    quote!(<#ty as ::stakit_model::TSType>::ts_ref())
 }
 
 /// All field types in declaration order (for the declarations recursion).

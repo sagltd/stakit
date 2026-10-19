@@ -35,13 +35,13 @@ fn vec_is_array_of_inner() {
 }
 
 #[test]
-fn option_is_union_with_undefined() {
-    assert_eq!(Option::<String>::to_ts(), "string | undefined");
+fn option_is_union_with_null() {
+    assert_eq!(Option::<String>::to_ts(), "string | null");
 }
 
 #[test]
 fn nested_generics_compose() {
-    assert_eq!(Vec::<Option<i32>>::to_ts(), "Array<number | undefined>");
+    assert_eq!(Vec::<Option<i32>>::to_ts(), "Array<number | null>");
 }
 
 #[test]

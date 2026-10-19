@@ -34,7 +34,7 @@ pub trait TSType {
 ```
 Single method. Contract:
 - **Scalars / collections** return an *inline* TS type: `i32 → "number"`,
-  `String → "string"`, `Vec<T> → "Array<{T}>"`, `Option<T> → "{T} | undefined"`,
+  `String → "string"`, `Vec<T> → "Array<{T}>"`, `Option<T> → "{T} | null"`,
   `HashMap<K,V>` / `IndexMap<K,V>` → `"Record<{K}, {V}>"`.
 - **`#[derive(Model)]` struct** returns a full `export interface Name { … }`.
 - **`#[derive(Model)]` enum** returns a TS union (see below).
@@ -126,7 +126,11 @@ tests/                         # e2e derive tests
 2. **`impl TSType`**:
    - **struct** → `export interface Name {\n  field: Ty;\n  opt?: Ty;\n}`.
      Each field type rendered via `<FieldTy as TSType>::to_ts()`; `Option<T>`
-     fields render as optional (`field?: T`).
+     fields render as optional and nullable (`field?: T | null`). Named fields may be
+     omitted when decoding, and serde normally serializes `None` as JSON `null`.
+     `#[serde(skip_serializing_if = "Option::is_none")]` omits absent values on
+     output; the shared type still accepts `null` on input. Tuple positions and
+     collection values retain `T | null` because JSON has no `undefined` value.
    - **enum, all unit variants** → `export type Name = "A" | "B" | "C";`.
    - **enum with data variants** → union mixing literals + inline objects, e.g.
      `enum UserType { Normal, Help { aha: String } }` →
