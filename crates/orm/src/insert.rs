@@ -45,6 +45,9 @@ enum UpdateMode {
     /// `col = coalesce(excluded.col, <table>.col)` — take the incoming value, but
     /// keep the stored one when the incoming value is `NULL`.
     CoalesceExisting,
+    /// `col = <table>.col + excluded.col` — add the incoming value to the stored
+    /// one (an upserted counter).
+    AddExcluded,
 }
 
 /// One column's update rule in a `DO UPDATE` / `ON DUPLICATE KEY UPDATE` clause.
@@ -441,6 +444,17 @@ impl<N: Insertable> Upsert<N> {
         self
     }
 
+    /// On conflict, set `column = <table>.column + excluded.column`: **add** the
+    /// incoming value to the stored one. With a multi-row insert this upserts a
+    /// batch of counters in one statement (a new key starts at the inserted value).
+    pub fn set_add<T, Ty>(mut self, column: crate::schema::Col<T, Ty>) -> Self {
+        self.updates.push(ColumnUpdate {
+            column: column.name,
+            mode: UpdateMode::AddExcluded,
+        });
+        self
+    }
+
     /// `ON CONFLICT (<key>) DO NOTHING` — leave the existing row untouched. Discards
     /// any `set`/`set_coalesce` columns chosen so far.
     pub fn do_nothing(mut self) -> Insert<N> {
@@ -514,6 +528,55 @@ impl<N: Insertable> Upsert<N> {
     }
 }
 
+/// One `col = …` of a conflict update. `MySQL` names the incoming value
+/// `values(col)` and the stored one bare `col`; the others `excluded.col` and
+/// `<table>.col`.
+fn write_update(
+    writer: &mut SqlWriter,
+    update: ColumnUpdate,
+    table: &str,
+    mysql: bool,
+) -> Result<()> {
+    let column = update.column;
+    let incoming = |writer: &mut SqlWriter| -> Result<()> {
+        if mysql {
+            writer.push("values(");
+            writer.push_ident(column)?;
+            writer.push(")");
+        } else {
+            writer.push("excluded.");
+            writer.push_ident(column)?;
+        }
+        Ok(())
+    };
+    let stored = |writer: &mut SqlWriter| -> Result<()> {
+        if mysql {
+            writer.push_ident(column)?;
+        } else {
+            writer.push_qualified(table, column)?;
+        }
+        Ok(())
+    };
+    writer.push_ident(column)?;
+    writer.push(" = ");
+    match update.mode {
+        UpdateMode::Excluded => incoming(writer)?,
+        UpdateMode::CoalesceExisting => {
+            writer.push("coalesce(");
+            incoming(writer)?;
+            writer.push(", ");
+            stored(writer)?;
+            writer.push(")");
+        }
+        UpdateMode::AddExcluded => {
+            stored(writer)?;
+            writer.push(" + ");
+            incoming(writer)?;
+        }
+    }
+    Ok(())
+}
+
 fn write_conflict(
     writer: &mut SqlWriter,
     conflict: &Conflict,
@@ -570,22 +633,7 @@ fn write_conflict(
             if index > 0 {
                 writer.push(", ");
             }
-            writer.push_ident(update.column)?;
-            writer.push(" = ");
-            match update.mode {
-                UpdateMode::Excluded => {
-                    writer.push("values(");
-                    writer.push_ident(update.column)?;
-                    writer.push(")");
-                }
-                UpdateMode::CoalesceExisting => {
-                    writer.push("coalesce(values(");
-                    writer.push_ident(update.column)?;
-                    writer.push("), ");
-                    writer.push_ident(update.column)?;
-                    writer.push(")");
-                }
-            }
+            write_update(writer, *update, table, true)?;
         }
         return Ok(());
     }
@@ -609,21 +657,7 @@ fn write_conflict(
         if index > 0 {
             writer.push(", ");
         }
-        writer.push_ident(update.column)?;
-        writer.push(" = ");
-        match update.mode {
-            UpdateMode::Excluded => {
-                writer.push("excluded.");
-                writer.push_ident(update.column)?;
-            }
-            UpdateMode::CoalesceExisting => {
-                writer.push("coalesce(excluded.");
-                writer.push_ident(update.column)?;
-                writer.push(", ");
-                writer.push_qualified(table, update.column)?;
-                writer.push(")");
-            }
-        }
+        write_update(writer, *update, table, false)?;
     }
     Ok(())
 }
@@ -760,6 +794,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pg_set_add_increments_the_stored_value() {
+        let conflict = Conflict {
+            targets: target(&["id"]),
+            action: do_update(&[("balance", UpdateMode::AddExcluded)]),
+        };
+        let sql = render(&PostgresDialect, &conflict, &["id", "balance"]);
+        assert_eq!(
+            sql,
+            r#" on conflict ("id") do update set "balance" = "devices"."balance" + excluded."balance""#
+        );
+    }
+
     // ---- MySQL ON DUPLICATE KEY UPDATE ----
 
     #[test]
@@ -779,6 +826,19 @@ mod tests {
         assert_eq!(
             sql,
             " on duplicate key update `platform` = values(`platform`), `location` = coalesce(values(`location`), `location`)"
+        );
+    }
+
+    #[test]
+    fn mysql_set_add_increments_with_values() {
+        let conflict = Conflict {
+            targets: target(&["id"]),
+            action: do_update(&[("balance", UpdateMode::AddExcluded)]),
+        };
+        let sql = render(&MySqlDialect, &conflict, &["id", "balance"]);
+        assert_eq!(
+            sql,
+            " on duplicate key update `balance` = `balance` + values(`balance`)"
         );
     }
 

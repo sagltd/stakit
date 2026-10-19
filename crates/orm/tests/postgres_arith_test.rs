@@ -141,3 +141,39 @@ async fn bigint_sum_decodes_as_i64_and_groups_by_an_expression() {
     buckets.sort_unstable();
     assert_eq!(buckets, [(0, Some(15)), (1, Some(9_000_000_000))]);
 }
+
+#[tokio::test]
+async fn upsert_set_add_inserts_new_rows_and_increments_existing_ones_in_one_statement() {
+    let (_postgres, db) = setup().await;
+    let inserted = db
+        .insert_many(vec![
+            CounterNew {
+                id: "a".to_owned(),
+                balance: 5,
+                cap: 0,
+            },
+            CounterNew {
+                id: "b".to_owned(),
+                balance: 7,
+                cap: 50,
+            },
+        ])
+        .on_conflict(Counter::id)
+        .set_add(Counter::balance)
+        .exec()
+        .await
+        .expect("upsert");
+    assert_eq!(inserted, 2);
+    assert_eq!(balance(&db).await, 15, "existing row incremented, cap kept");
+    let fresh = db
+        .get::<Counter>("b".to_owned())
+        .one()
+        .await
+        .expect("query")
+        .expect("row");
+    assert_eq!(
+        (fresh.balance, fresh.cap),
+        (7, 50),
+        "new row inserted as is"
+    );
+}

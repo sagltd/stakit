@@ -329,6 +329,8 @@ db.insert(DeviceNew { user_id, device_id, platform, location: None })
   value, **but keep the stored one when the incoming value is `NULL`**. Ideal for
   best-effort fields (an async-resolved geolocation, a late-arriving attribute) that a
   later write with no value must not erase.
+- `.set_add(col)` → `col = <table>.col + excluded.col` — add the incoming value to the
+  stored one; with `insert_many` it upserts a batch of counters in one statement.
 - `.do_update_all()` — overwrite every non-key column (no need to list them).
 - `.do_update_all_except(Device::created_at)` — overwrite all but the given column(s).
 - `.do_nothing()` — keep the existing row.
