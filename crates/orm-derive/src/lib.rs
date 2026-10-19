@@ -5,12 +5,13 @@
 //! whole-row projection, a sqlx `FromRow` impl, and compile-time foreign-key
 //! type checks.
 
-mod types;
-
 use proc_macro::TokenStream;
 use quote::quote;
+use stakit_orm_schema_support::{
+    is_relation, is_sql_identifier, parse_grant_entry, parse_policy_entry, parse_table_attrs,
+    split_table_column, sql_type, unwrap_generic,
+};
 use syn::{Data, DeriveInput, Fields, Ident, LitInt, LitStr, Path, Type, parse_macro_input};
-use types::{is_relation, sql_type, unwrap_generic};
 
 /// Derive [`Table`](stakit_orm::Table) for a struct.
 ///
@@ -286,21 +287,33 @@ fn to_snake_case(name: &str) -> String {
     out
 }
 
-#[allow(clippy::too_many_lines)]
-fn expand_type(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+/// The named fields of a struct being derived; `derive` names the macro in the
+/// error, `detail` is appended to the named-fields error.
+fn named_fields<'a>(
+    input: &'a DeriveInput,
+    derive: &str,
+    detail: &str,
+) -> syn::Result<&'a syn::FieldsNamed> {
     let name = &input.ident;
     let Data::Struct(data) = &input.data else {
         return Err(syn::Error::new_spanned(
             name,
-            "Type can only derive for structs",
+            format!("{derive} can only derive for structs"),
         ));
     };
     let Fields::Named(fields) = &data.fields else {
         return Err(syn::Error::new_spanned(
             name,
-            "Type requires named fields (a Postgres composite type)",
+            format!("{derive} requires named fields{detail}"),
         ));
     };
+    Ok(fields)
+}
+
+#[allow(clippy::too_many_lines)]
+fn expand_type(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let name = &input.ident;
+    let fields = named_fields(input, "Type", " (a Postgres composite type)")?;
     if fields.named.is_empty() {
         return Err(syn::Error::new_spanned(
             name,
@@ -454,15 +467,7 @@ fn expand_type(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
 fn expand_row(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let name = &input.ident;
-    let Data::Struct(data) = &input.data else {
-        return Err(syn::Error::new_spanned(
-            name,
-            "Row can only derive for structs",
-        ));
-    };
-    let Fields::Named(fields) = &data.fields else {
-        return Err(syn::Error::new_spanned(name, "Row requires named fields"));
-    };
+    let fields = named_fields(input, "Row", "")?;
 
     let mut idents = Vec::new();
     let mut exprs = Vec::new();
@@ -573,15 +578,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let table_name = table_attrs(input)?;
     validate_ident(&table_name, name)?;
 
-    let Data::Struct(data) = &input.data else {
-        return Err(syn::Error::new_spanned(
-            name,
-            "Table can only derive for structs",
-        ));
-    };
-    let Fields::Named(fields) = &data.fields else {
-        return Err(syn::Error::new_spanned(name, "Table requires named fields"));
-    };
+    let fields = named_fields(input, "Table", "")?;
 
     let mut columns = Vec::new();
     let mut relations = Vec::new();
@@ -772,9 +769,6 @@ fn emit_insertable(name: &Ident, table: &str, columns: &[ColumnModel]) -> proc_m
 /// don't trip clippy's `duplicated_attributes` across separate attributes. RLS config is
 /// validated here and consumed by the migration CLI; it emits no runtime code.
 fn table_attrs(input: &DeriveInput) -> syn::Result<String> {
-    let mut name = None;
-    let mut rls = false;
-    let mut force_rls = false;
     let mut has_policy = false;
     // Column field names, for the compile-time index-column guard (relation markers
     // are not columns, so they're excluded — matching the CLI parser).
@@ -783,39 +777,28 @@ fn table_attrs(input: &DeriveInput) -> syn::Result<String> {
             Fields::Named(named) => named
                 .named
                 .iter()
-                .filter(|field| unwrap_generic(&field.ty, "Rel").is_none())
+                .filter(|field| !is_relation(&field.ty))
                 .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
                 .collect(),
             _ => std::collections::HashSet::new(),
         },
         _ => std::collections::HashSet::new(),
     };
-    for attr in &input.attrs {
-        if !attr.path().is_ident("table") {
-            continue;
+    let head = parse_table_attrs(&input.attrs, |meta| {
+        if meta.path.is_ident("grant") {
+            meta.parse_nested_meta(|entry| validate_grant_entry(&entry))
+        } else if meta.path.is_ident("policy") {
+            has_policy = true;
+            meta.parse_nested_meta(|entry| validate_policy_entry(&entry))
+        } else if meta.path.is_ident("index") || meta.path.is_ident("unique_index") {
+            validate_index_entry(meta, &field_names)
+        } else {
+            // Reject typos rather than silently disabling RLS (a `rsl` typo would
+            // otherwise leave the table unprotected).
+            Err(meta.error("unknown #[table(...)] attribute"))
         }
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("name") {
-                name = Some(meta.value()?.parse::<LitStr>()?.value());
-            } else if meta.path.is_ident("rls") {
-                rls = true;
-            } else if meta.path.is_ident("force_rls") {
-                force_rls = true;
-            } else if meta.path.is_ident("grant") {
-                meta.parse_nested_meta(|entry| validate_grant_entry(&entry))?;
-            } else if meta.path.is_ident("policy") {
-                has_policy = true;
-                meta.parse_nested_meta(|entry| validate_policy_entry(&entry))?;
-            } else if meta.path.is_ident("index") || meta.path.is_ident("unique_index") {
-                validate_index_entry(&meta, &field_names)?;
-            } else {
-                // Reject typos rather than silently disabling RLS (a `rsl` typo would
-                // otherwise leave the table unprotected).
-                return Err(meta.error("unknown #[table(...)] attribute"));
-            }
-            Ok(())
-        })?;
-    }
+    })?;
+    let (name, rls, force_rls) = (head.name, head.rls, head.force_rls);
     let name =
         name.ok_or_else(|| syn::Error::new_spanned(input, "missing #[table(name = \"...\")]"))?;
     if force_rls && !rls {
@@ -1048,21 +1031,6 @@ fn validate_column(model: &ColumnModel, ident: &Ident) -> syn::Result<()> {
     Ok(())
 }
 
-/// Whether `value` is a SQL identifier: a non-empty run of ASCII letters, digits, and
-/// underscores starting with a letter or underscore. When `allow_qualified`, a single
-/// `schema.name` qualification is accepted (each part validated the same way).
-fn is_sql_identifier(value: &str, allow_qualified: bool) -> bool {
-    let parts: Vec<&str> = value.split('.').collect();
-    if parts.len() > 1 && !allow_qualified {
-        return false;
-    }
-    parts.iter().all(|part| {
-        let mut chars = part.chars();
-        matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
-}
-
 /// The reason `name` is unsafe as a Postgres identifier, or `None` if it is fine.
 /// Identifiers are quoted on emit, so only empties, NUL bytes, and over-NAMEDATALEN
 /// lengths are rejected.
@@ -1122,182 +1090,25 @@ fn expand_role(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     })
 }
 
-/// A policy's `FOR <command>` (local to the derive; the derive emits no code for it,
-/// so it does not reuse the CLI's model enum).
-#[derive(Clone, Copy)]
-enum PolicyCmd {
-    All,
-    Select,
-    Insert,
-    Update,
-    Delete,
-}
-
-impl PolicyCmd {
-    const fn keyword(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Select => "select",
-            Self::Insert => "insert",
-            Self::Update => "update",
-            Self::Delete => "delete",
-        }
-    }
-}
-
 /// Validate one `policy(<name>(<command>, to = "...", using = "...", check = "..."))`
 /// entry. The policy name is the entry's head identifier (so two policies are distinct
 /// nested lists — clippy's `duplicated_attributes` never sees a repeated `to = "role"`).
 /// Consumed by the migration CLI; emits no code.
 fn validate_policy_entry(entry: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<()> {
-    let name = entry.path.require_ident()?.to_string();
-    if let Some(message) = ident_error(&name) {
-        return Err(entry.error(message));
-    }
-    let mut command = None;
-    let mut roles = Vec::new();
-    let mut to_present = false;
-    let mut using = None;
-    let mut check = None;
-    entry.parse_nested_meta(|inner| {
-        if inner.path.is_ident("to") {
-            to_present = true;
-            roles = split_roles(&inner.value()?.parse::<LitStr>()?.value());
-        } else if inner.path.is_ident("using") {
-            using = Some(inner.value()?.parse::<LitStr>()?.value());
-        } else if inner.path.is_ident("check") {
-            check = Some(inner.value()?.parse::<LitStr>()?.value());
-        } else if let Some(parsed) = policy_command_flag(&inner.path) {
-            if command.is_some() {
-                return Err(inner
-                    .error("policy has more than one command (all/select/insert/update/delete)"));
-            }
-            command = Some(parsed);
-        } else {
-            return Err(inner
-                .error("unknown policy entry attribute (expected a command, to, using, check)"));
-        }
-        Ok(())
-    })?;
-
-    // `to = ""` would silently broaden the policy to PUBLIC — reject it. PUBLIC is
-    // reachable only by omitting `to` entirely.
-    if to_present && roles.is_empty() {
-        return Err(entry.error(format!(
-            "policy `{name}`: `to` was specified but lists no roles (omit `to` for PUBLIC)"
-        )));
-    }
-    for role in &roles {
-        if let Some(message) = ident_error(role) {
+    let policy = parse_policy_entry(entry)?;
+    for name in std::iter::once(&policy.name).chain(&policy.roles) {
+        if let Some(message) = ident_error(name) {
             return Err(entry.error(message));
         }
     }
-    let command = command.unwrap_or(PolicyCmd::All);
-    validate_policy_clauses(entry, &name, command, using.as_deref(), check.as_deref())
+    Ok(())
 }
 
 /// Validate one `grant(<role>(<privilege>...))` entry. The role is the entry's head
 /// identifier, so two grants are distinct nested lists (lint-safe, like policies).
 fn validate_grant_entry(entry: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<()> {
-    let role = entry.path.require_ident()?.to_string();
-    if let Some(message) = ident_error(&role) {
-        return Err(entry.error(message));
-    }
-    let mut privilege_count = 0usize;
-    entry.parse_nested_meta(|inner| {
-        if is_grant_privilege_flag(&inner.path) {
-            privilege_count += 1;
-            Ok(())
-        } else {
-            Err(inner.error("expected a privilege (select/insert/update/delete/all)"))
-        }
-    })?;
-    if privilege_count == 0 {
-        return Err(entry
-            .error("grant role needs at least one privilege (select/insert/update/delete/all)"));
-    }
-    Ok(())
-}
-
-/// Mirror Postgres's command/clause rules (matches the CLI's `validate_policy_clauses`).
-fn validate_policy_clauses(
-    meta: &syn::meta::ParseNestedMeta<'_>,
-    name: &str,
-    command: PolicyCmd,
-    using: Option<&str>,
-    check: Option<&str>,
-) -> syn::Result<()> {
-    let keyword = command.keyword();
-    match command {
-        PolicyCmd::Select | PolicyCmd::Delete => {
-            if check.is_some() {
-                return Err(meta.error(format!(
-                    "policy `{name}`: a {keyword} policy cannot have check = \"...\""
-                )));
-            }
-            if using.is_none() {
-                return Err(meta.error(format!(
-                    "policy `{name}`: a {keyword} policy needs using = \"...\""
-                )));
-            }
-        }
-        PolicyCmd::Insert => {
-            if using.is_some() {
-                return Err(meta.error(format!(
-                    "policy `{name}`: an insert policy cannot have using = \"...\""
-                )));
-            }
-            if check.is_none() {
-                return Err(meta.error(format!(
-                    "policy `{name}`: an insert policy needs check = \"...\""
-                )));
-            }
-        }
-        PolicyCmd::All | PolicyCmd::Update => {
-            if using.is_none() && check.is_none() {
-                return Err(meta.error(format!(
-                    "policy `{name}`: a {keyword} policy needs at least one of using/check"
-                )));
-            }
-        }
-    }
-    if using == Some("") || check == Some("") {
-        return Err(meta.error(format!(
-            "policy `{name}`: using/check expression must not be empty"
-        )));
-    }
-    Ok(())
-}
-
-fn policy_command_flag(path: &Path) -> Option<PolicyCmd> {
-    if path.is_ident("all") {
-        Some(PolicyCmd::All)
-    } else if path.is_ident("select") {
-        Some(PolicyCmd::Select)
-    } else if path.is_ident("insert") {
-        Some(PolicyCmd::Insert)
-    } else if path.is_ident("update") {
-        Some(PolicyCmd::Update)
-    } else if path.is_ident("delete") {
-        Some(PolicyCmd::Delete)
-    } else {
-        None
-    }
-}
-
-fn is_grant_privilege_flag(path: &Path) -> bool {
-    ["all", "select", "insert", "update", "delete"]
-        .iter()
-        .any(|keyword| path.is_ident(keyword))
-}
-
-/// Split a comma-separated `to = "a, b"` into trimmed, non-empty role names.
-fn split_roles(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|role| !role.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+    let grant = parse_grant_entry(entry)?;
+    ident_error(&grant.role).map_or(Ok(()), |message| Err(entry.error(message)))
 }
 
 fn parse_references(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<FkRef> {
@@ -1324,20 +1135,6 @@ fn parse_references(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<FkRef>
         root.segments.push_value(pair.into_value());
     }
     Ok(FkRef::Typed(root, column))
-}
-
-/// Split a `"table.column"` foreign-key reference into its two identifiers; rejects
-/// anything that isn't exactly one table and one column (no extra dots).
-fn split_table_column(reference: &str) -> Result<(String, String), &'static str> {
-    let mut parts = reference.splitn(2, '.');
-    let table = parts.next().unwrap_or("").trim().to_owned();
-    let column = parts.next().map(|part| part.trim().to_owned());
-    match column {
-        Some(column) if !table.is_empty() && !column.is_empty() && !column.contains('.') => {
-            Ok((table, column))
-        }
-        _ => Err("references string must be \"table.column\""),
-    }
 }
 
 fn on_delete_tokens(value: Option<&str>) -> proc_macro2::TokenStream {

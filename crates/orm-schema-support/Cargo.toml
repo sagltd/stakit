@@ -1,0 +1,20 @@
+[package]
+name = "stakit-orm-schema-support"
+description = "Schema-attribute parsing shared by stakit-orm-derive (compile-time validation) and stakit-orm-cli (migration generation)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[features]
+# Serialize the policy/grant enums (the CLI stores them in schema snapshots).
+serde = ["dep:serde"]
+
+[dependencies]
+syn.workspace = true
+serde = { workspace = true, optional = true }
+
+[lints]
+workspace = true

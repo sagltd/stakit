@@ -59,63 +59,7 @@ impl Column {
     }
 }
 
-/// A table privilege grantable to a role (`GRANT <privilege> ON …`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum Privilege {
-    /// `ALL PRIVILEGES`.
-    All,
-    /// `SELECT`.
-    Select,
-    /// `INSERT`.
-    Insert,
-    /// `UPDATE`.
-    Update,
-    /// `DELETE`.
-    Delete,
-}
-
-impl Privilege {
-    /// The SQL keyword(s) for this privilege (`All` renders `all privileges`).
-    #[must_use]
-    pub const fn as_sql(self) -> &'static str {
-        match self {
-            Self::All => "all privileges",
-            Self::Select => "select",
-            Self::Insert => "insert",
-            Self::Update => "update",
-            Self::Delete => "delete",
-        }
-    }
-}
-
-/// The command a row-level-security policy applies to (`CREATE POLICY … FOR <command>`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PolicyCommand {
-    /// `FOR ALL` (every command).
-    All,
-    /// `FOR SELECT`.
-    Select,
-    /// `FOR INSERT`.
-    Insert,
-    /// `FOR UPDATE`.
-    Update,
-    /// `FOR DELETE`.
-    Delete,
-}
-
-impl PolicyCommand {
-    /// The SQL keyword for this command.
-    #[must_use]
-    pub const fn as_sql(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Select => "select",
-            Self::Insert => "insert",
-            Self::Update => "update",
-            Self::Delete => "delete",
-        }
-    }
-}
+pub use stakit_orm_schema_support::{PolicyCommand, Privilege};
 
 /// A row-level-security policy on a table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

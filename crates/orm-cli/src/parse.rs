@@ -6,14 +6,14 @@
 //! and recurses inline `mod name { ... }` blocks, so a schema split across many files
 //! (e.g. `schema.rs` with `mod user_schema;` in `schema/user_schema.rs`) is fully read.
 
-use crate::model::{
-    Column, ForeignKey, Grant, Index, Policy, PolicyCommand, Privilege, Role, Schema, Table,
+use crate::model::{Column, ForeignKey, Grant, Index, Policy, Role, Schema, Table};
+use stakit_orm_schema_support::{
+    check_policy_clauses, is_relation, is_sql_identifier, parse_table_attrs, split_table_column,
+    sql_type, unwrap_generic,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use syn::{
-    Attribute, Data, DeriveInput, Fields, GenericArgument, Item, ItemMod, PathArguments, Type,
-};
+use syn::{Attribute, Data, DeriveInput, Fields, Item, ItemMod};
 
 /// Parse all tables reachable from the entry schema file, following `mod`
 /// declarations across files and inline modules.
@@ -232,48 +232,34 @@ struct TableMeta {
 /// avoid clippy's cross-attribute `duplicated_attributes`. Unknown keys are rejected so
 /// a typo fails loudly rather than silently disabling RLS.
 fn table_meta(input: &DeriveInput) -> Result<TableMeta, String> {
-    let mut name = None;
-    let mut rls = false;
-    let mut force_rls = false;
     let mut policies = Vec::new();
     let mut grants: Vec<Grant> = Vec::new();
     let mut indexes: Vec<Index> = Vec::new();
-    for attr in &input.attrs {
-        if !attr.path().is_ident("table") {
-            continue;
-        }
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("name") {
-                name = Some(meta.value()?.parse::<syn::LitStr>()?.value());
-            } else if meta.path.is_ident("rls") {
-                rls = true;
-            } else if meta.path.is_ident("force_rls") {
-                force_rls = true;
-            } else if meta.path.is_ident("grant") {
-                meta.parse_nested_meta(|entry| {
-                    let grant =
-                        parse_grant_entry(&entry).map_err(|message| entry.error(message))?;
-                    merge_grants(&mut grants, vec![grant]);
-                    Ok(())
-                })?;
-            } else if meta.path.is_ident("policy") {
-                meta.parse_nested_meta(|entry| {
-                    let policy =
-                        parse_policy_entry(&entry).map_err(|message| entry.error(message))?;
-                    policies.push(policy);
-                    Ok(())
-                })?;
-            } else if meta.path.is_ident("index") {
-                indexes.push(parse_index_entry(&meta, false).map_err(|m| meta.error(m))?);
-            } else if meta.path.is_ident("unique_index") {
-                indexes.push(parse_index_entry(&meta, true).map_err(|m| meta.error(m))?);
-            } else {
-                return Err(meta.error("unknown #[table(...)] attribute"));
-            }
+    let head = parse_table_attrs(&input.attrs, |meta| {
+        if meta.path.is_ident("grant") {
+            meta.parse_nested_meta(|entry| {
+                let grant = parse_grant_entry(&entry).map_err(|message| entry.error(message))?;
+                merge_grants(&mut grants, vec![grant]);
+                Ok(())
+            })
+        } else if meta.path.is_ident("policy") {
+            meta.parse_nested_meta(|entry| {
+                let policy = parse_policy_entry(&entry).map_err(|message| entry.error(message))?;
+                policies.push(policy);
+                Ok(())
+            })
+        } else if meta.path.is_ident("index") {
+            indexes.push(parse_index_entry(meta, false).map_err(|m| meta.error(m))?);
             Ok(())
-        })
-        .map_err(|error| error.to_string())?;
-    }
+        } else if meta.path.is_ident("unique_index") {
+            indexes.push(parse_index_entry(meta, true).map_err(|m| meta.error(m))?);
+            Ok(())
+        } else {
+            Err(meta.error("unknown #[table(...)] attribute"))
+        }
+    })
+    .map_err(|error| error.to_string())?;
+    let (name, rls, force_rls) = (head.name, head.rls, head.force_rls);
     let name = name.ok_or_else(|| format!("{}: missing #[table(name = \"...\")]", input.ident))?;
     validate_identifier(&name)?;
     if force_rls && !rls {
@@ -389,7 +375,7 @@ fn parse_table(
     };
     let mut columns = Vec::new();
     for field in &fields.named {
-        if unwrap_generic(&field.ty, "Rel").is_some() {
+        if is_relation(&field.ty) {
             continue; // relation marker, not a column
         }
         columns.push(parse_column(field, table_of_ident)?);
@@ -478,186 +464,31 @@ fn parse_role(input: &DeriveInput) -> Result<Role, String> {
 /// entry. The policy name is the entry's head identifier, so two policies are distinct
 /// nested lists (clippy's `duplicated_attributes` never sees a repeated `to = "role"`).
 fn parse_policy_entry(entry: &syn::meta::ParseNestedMeta<'_>) -> Result<Policy, String> {
-    let name = entry
-        .path
-        .require_ident()
-        .map_err(|error| error.to_string())?
-        .to_string();
-    validate_identifier(&name)?;
-    let mut command = None;
-    let mut roles = Vec::new();
-    let mut to_present = false;
-    let mut using = None;
-    let mut check = None;
-    entry
-        .parse_nested_meta(|inner| {
-            if inner.path.is_ident("to") {
-                to_present = true;
-                roles = split_roles(&inner.value()?.parse::<syn::LitStr>()?.value());
-            } else if inner.path.is_ident("using") {
-                using = Some(inner.value()?.parse::<syn::LitStr>()?.value());
-            } else if inner.path.is_ident("check") {
-                check = Some(inner.value()?.parse::<syn::LitStr>()?.value());
-            } else if let Some(parsed) = policy_command(&inner.path) {
-                if command.is_some() {
-                    return Err(inner.error(
-                        "policy has more than one command (all/select/insert/update/delete)",
-                    ));
-                }
-                command = Some(parsed);
-            } else {
-                return Err(inner.error(
-                    "unknown policy entry attribute (expected a command, to, using, check)",
-                ));
-            }
-            Ok(())
-        })
-        .map_err(|error| error.to_string())?;
-
-    // `to = ""` (or all-empty) would silently broaden the policy to PUBLIC — reject it.
-    // PUBLIC is reachable only by omitting `to` entirely.
-    if to_present && roles.is_empty() {
-        return Err(format!(
-            "policy `{name}`: `to` was specified but lists no roles (omit `to` for PUBLIC)"
-        ));
-    }
-    for role in &roles {
+    let policy =
+        stakit_orm_schema_support::parse_policy_entry(entry).map_err(|error| error.to_string())?;
+    validate_identifier(&policy.name)?;
+    for role in &policy.roles {
         validate_identifier(role)?;
     }
-    let command = command.unwrap_or(PolicyCommand::All);
-    validate_policy_clauses(&name, command, using.as_deref(), check.as_deref())?;
     Ok(Policy {
-        name,
-        command,
-        roles,
-        using,
-        check,
+        name: policy.name,
+        command: policy.command,
+        roles: policy.roles,
+        using: policy.using,
+        check: policy.check,
     })
 }
 
 /// Parse one `grant(<role>(<privilege>...))` entry. The role is the entry's head
 /// identifier (lint-safe, like policies), with the privileges as bare flags.
 fn parse_grant_entry(entry: &syn::meta::ParseNestedMeta<'_>) -> Result<Grant, String> {
-    let role = entry
-        .path
-        .require_ident()
-        .map_err(|error| error.to_string())?
-        .to_string();
-    validate_identifier(&role)?;
-    let mut privileges: Vec<Privilege> = Vec::new();
-    entry
-        .parse_nested_meta(|inner| {
-            let Some(privilege) = grant_privilege(&inner.path) else {
-                return Err(inner.error("expected a privilege (select/insert/update/delete/all)"));
-            };
-            if !privileges.contains(&privilege) {
-                privileges.push(privilege);
-            }
-            Ok(())
-        })
-        .map_err(|error| error.to_string())?;
-
-    if privileges.is_empty() {
-        return Err(format!(
-            "grant role `{role}` needs at least one privilege (select/insert/update/delete/all)"
-        ));
-    }
-    Ok(Grant { role, privileges })
-}
-
-/// Map a bare attribute flag to a policy command, if it is one.
-fn policy_command(path: &syn::Path) -> Option<PolicyCommand> {
-    if path.is_ident("all") {
-        Some(PolicyCommand::All)
-    } else if path.is_ident("select") {
-        Some(PolicyCommand::Select)
-    } else if path.is_ident("insert") {
-        Some(PolicyCommand::Insert)
-    } else if path.is_ident("update") {
-        Some(PolicyCommand::Update)
-    } else if path.is_ident("delete") {
-        Some(PolicyCommand::Delete)
-    } else {
-        None
-    }
-}
-
-/// Map a bare attribute flag to a grant privilege, if it is one.
-fn grant_privilege(path: &syn::Path) -> Option<Privilege> {
-    if path.is_ident("all") {
-        Some(Privilege::All)
-    } else if path.is_ident("select") {
-        Some(Privilege::Select)
-    } else if path.is_ident("insert") {
-        Some(Privilege::Insert)
-    } else if path.is_ident("update") {
-        Some(Privilege::Update)
-    } else if path.is_ident("delete") {
-        Some(Privilege::Delete)
-    } else {
-        None
-    }
-}
-
-/// Split a comma-separated `to = "a, b"` into trimmed, non-empty role names.
-fn split_roles(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|role| !role.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-/// Enforce the command/clause rules a policy must satisfy (mirrors Postgres):
-/// SELECT/DELETE take `using` only, INSERT takes `check` only, ALL/UPDATE take at
-/// least one. `using`/`check` are verbatim trusted SQL, so only emptiness is checked.
-fn validate_policy_clauses(
-    name: &str,
-    command: PolicyCommand,
-    using: Option<&str>,
-    check: Option<&str>,
-) -> Result<(), String> {
-    let keyword = command.as_sql();
-    match command {
-        PolicyCommand::Select | PolicyCommand::Delete => {
-            // Report the forbidden clause before the missing one (the likelier mistake).
-            if check.is_some() {
-                return Err(format!(
-                    "policy `{name}`: a {keyword} policy cannot have check = \"...\" (no WITH CHECK on {keyword})"
-                ));
-            }
-            if using.is_none() {
-                return Err(format!(
-                    "policy `{name}`: a {keyword} policy needs using = \"...\""
-                ));
-            }
-        }
-        PolicyCommand::Insert => {
-            if using.is_some() {
-                return Err(format!(
-                    "policy `{name}`: an insert policy cannot have using = \"...\" (INSERT only checks new rows)"
-                ));
-            }
-            if check.is_none() {
-                return Err(format!(
-                    "policy `{name}`: an insert policy needs check = \"...\""
-                ));
-            }
-        }
-        PolicyCommand::All | PolicyCommand::Update => {
-            if using.is_none() && check.is_none() {
-                return Err(format!(
-                    "policy `{name}`: a {keyword} policy needs at least one of using = \"...\" / check = \"...\""
-                ));
-            }
-        }
-    }
-    if using == Some("") || check == Some("") {
-        return Err(format!(
-            "policy `{name}`: using/check expression must not be empty"
-        ));
-    }
-    Ok(())
+    let grant =
+        stakit_orm_schema_support::parse_grant_entry(entry).map_err(|error| error.to_string())?;
+    validate_identifier(&grant.role)?;
+    Ok(Grant {
+        role: grant.role,
+        privileges: grant.privileges,
+    })
 }
 
 /// Re-validate an entire [`Schema`]'s identifiers and policy invariants.
@@ -710,7 +541,7 @@ pub fn validate_schema(schema: &Schema) -> Result<(), String> {
             for role in &policy.roles {
                 validate_identifier(role)?;
             }
-            validate_policy_clauses(
+            check_policy_clauses(
                 &policy.name,
                 policy.command,
                 policy.using.as_deref(),
@@ -887,7 +718,7 @@ fn parse_column(
     let base = unwrap_generic(&field.ty, "Option").unwrap_or(&field.ty);
     let sql_type = match explicit_type {
         Some(explicit) => explicit,
-        None => sql_type(base).ok_or_else(|| {
+        None => sql_type(base).map(ToOwned::to_owned).ok_or_else(|| {
             format!("{name}: unknown SQL type; add #[column(sql_type = \"...\")]")
         })?,
     };
@@ -935,85 +766,6 @@ fn parse_reference(
         column,
         on_delete: "no action".to_owned(),
     })
-}
-
-/// Split a `"table.column"` foreign-key reference into its two identifiers.
-/// Rejects anything that isn't exactly one `table` and one `column` (no extra dots).
-fn split_table_column(reference: &str) -> Result<(String, String), &'static str> {
-    let mut parts = reference.splitn(2, '.');
-    let table = parts.next().unwrap_or("").trim().to_owned();
-    let column = parts.next().map(|part| part.trim().to_owned());
-    match column {
-        Some(column) if !table.is_empty() && !column.is_empty() && !column.contains('.') => {
-            Ok((table, column))
-        }
-        _ => Err("references string must be \"table.column\""),
-    }
-}
-
-/// Whether `value` is a SQL identifier: a non-empty run of ASCII letters, digits, and
-/// underscores starting with a letter or underscore. When `allow_qualified`, a single
-/// `schema.name` qualification is accepted (each part validated the same way).
-fn is_sql_identifier(value: &str, allow_qualified: bool) -> bool {
-    let parts: Vec<&str> = value.split('.').collect();
-    if parts.len() > 1 && !allow_qualified {
-        return false;
-    }
-    parts.iter().all(|part| {
-        let mut chars = part.chars();
-        matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
-}
-
-fn unwrap_generic<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type> {
-    let Type::Path(type_path) = ty else {
-        return None;
-    };
-    let segment = type_path.path.segments.last()?;
-    if segment.ident != wrapper {
-        return None;
-    }
-    let PathArguments::AngleBracketed(args) = &segment.arguments else {
-        return None;
-    };
-    args.args.iter().find_map(|arg| match arg {
-        GenericArgument::Type(inner) => Some(inner),
-        _ => None,
-    })
-}
-
-fn last_ident(ty: &Type) -> Option<String> {
-    let Type::Path(type_path) = ty else {
-        return None;
-    };
-    Some(type_path.path.segments.last()?.ident.to_string())
-}
-
-fn sql_type(ty: &Type) -> Option<String> {
-    if let Some(inner) = unwrap_generic(ty, "Vec") {
-        if last_ident(inner).as_deref() == Some("u8") {
-            return Some("bytea".to_owned());
-        }
-        return None;
-    }
-    let mapped = match last_ident(ty)?.as_str() {
-        "i16" => "smallint",
-        "i32" => "int",
-        "i64" => "bigint",
-        "f32" => "real",
-        "f64" => "double precision",
-        "bool" => "boolean",
-        "String" | "str" => "text",
-        "Uuid" => "uuid",
-        "DateTime" => "timestamptz",
-        "NaiveDateTime" => "timestamp",
-        "NaiveDate" => "date",
-        "NaiveTime" => "time",
-        "Value" => "jsonb",
-        _ => return None,
-    };
-    Some(mapped.to_owned())
 }
 
 #[cfg(test)]
