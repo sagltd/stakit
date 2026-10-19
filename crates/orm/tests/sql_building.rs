@@ -336,6 +336,20 @@ struct Profile {
 }
 
 #[test]
+fn update_set_null_binds_a_placeholder() {
+    use stakit_orm::Update;
+    let sql = Update::<Profile>::new()
+        .set_null(Profile::bio)
+        .filter(eq(Profile::id, uid()))
+        .to_sql()
+        .unwrap();
+    assert_eq!(
+        sql,
+        r#"update "profiles" set "bio" = $1 where "profiles"."id" = $2"#
+    );
+}
+
+#[test]
 fn ne_renders_not_equal() {
     let sql = Select::new(User::all())
         .from::<User>()

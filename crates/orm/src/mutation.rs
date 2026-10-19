@@ -46,6 +46,18 @@ impl<T: Table> Update<T> {
         self
     }
 
+    /// Set a nullable `column = NULL` (typed, so the bind keeps the column's kind).
+    #[must_use]
+    pub fn set_null<Ty>(mut self, column: Col<T, Option<Ty>>) -> Self
+    where
+        Ty: crate::value::ToValue + crate::value::FromValue,
+    {
+        use crate::value::ToValue as _;
+        self.sets
+            .push((column.name, Operand::Value(None::<Ty>.to_value())));
+        self
+    }
+
     /// Add a `WHERE` predicate. Repeated calls **AND** together, so
     /// `.filter(a).filter(b)` means `a AND b` — chaining never silently drops an
     /// earlier predicate (use [`or`](crate::or) explicitly for disjunction).
