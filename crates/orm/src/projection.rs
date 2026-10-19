@@ -34,6 +34,25 @@ pub trait Projection {
     fn decode(&self, row: &dyn Row, start: usize) -> Result<Self::Output>;
 }
 
+/// Implement [`Projection`] for a single-column leaf: its inherent `write`
+/// renders the select-list fragment and the cell decodes as `$out`.
+macro_rules! single_column_projection {
+    (impl $(<$generic:ident: $bound:path>)? for $ty:ty => $out:ty) => {
+        impl$(<$generic: $bound>)? Projection for $ty {
+            type Output = $out;
+            fn arity(&self) -> usize {
+                1
+            }
+            fn write_columns(&self, out: &mut SqlWriter) -> Result<()> {
+                self.write(out)
+            }
+            fn decode(&self, row: &dyn Row, start: usize) -> Result<$out> {
+                decode_at(row, start)
+            }
+        }
+    };
+}
+
 impl<T, Ty> Projection for Col<T, Ty>
 where
     Ty: FromValue,
@@ -123,15 +142,9 @@ const fn numeric_cast(kind: ValueKind) -> Option<&'static str> {
     }
 }
 
-impl<Out> Projection for Agg<Out>
-where
-    Out: FromValue,
-{
-    type Output = Out;
-    fn arity(&self) -> usize {
-        1
-    }
-    fn write_columns(&self, out: &mut SqlWriter) -> Result<()> {
+impl<Out: FromValue> Agg<Out> {
+    /// Render `func(col)`, cast back to `Out`'s numeric type when widened.
+    fn write(&self, out: &mut SqlWriter) -> Result<()> {
         out.push(self.func);
         out.push("(");
         out.push_qualified(self.table, self.name)?;
@@ -144,10 +157,9 @@ where
         }
         Ok(())
     }
-    fn decode(&self, row: &dyn Row, start: usize) -> Result<Out> {
-        decode_at(row, start)
-    }
 }
+
+single_column_projection!(impl<Out: FromValue> for Agg<Out> => Out);
 
 /// `min(column)` — `NULL` (`None`) over zero rows, so the output is `Option<Ty>`.
 #[must_use]
@@ -206,22 +218,16 @@ pub const fn sql_expr<Out>(fragment: &'static str) -> SqlExpr<Out> {
     }
 }
 
-impl<Out> Projection for SqlExpr<Out>
-where
-    Out: FromValue,
-{
-    type Output = Out;
-    fn arity(&self) -> usize {
-        1
-    }
-    fn write_columns(&self, out: &mut SqlWriter) -> Result<()> {
+impl<Out> SqlExpr<Out> {
+    /// Write the fragment verbatim (fallible only to match the other leaves).
+    #[allow(clippy::unnecessary_wraps)]
+    fn write(&self, out: &mut SqlWriter) -> Result<()> {
         out.push(self.fragment);
         Ok(())
     }
-    fn decode(&self, row: &dyn Row, start: usize) -> Result<Out> {
-        decode_at(row, start)
-    }
 }
+
+single_column_projection!(impl<Out: FromValue> for SqlExpr<Out> => Out);
 
 /// A Postgres `ts_rank(...)` full-text relevance score, decoded as `f32`.
 ///
@@ -294,18 +300,7 @@ impl TsRank {
     }
 }
 
-impl Projection for TsRank {
-    type Output = f32;
-    fn arity(&self) -> usize {
-        1
-    }
-    fn write_columns(&self, out: &mut SqlWriter) -> Result<()> {
-        self.write(out)
-    }
-    fn decode(&self, row: &dyn Row, start: usize) -> Result<f32> {
-        decode_at(row, start)
-    }
-}
+single_column_projection!(impl for TsRank => f32);
 
 /// Marker: a non-nullable whole-row projection.
 pub struct NotNull;
@@ -373,35 +368,40 @@ fn outer_join_absent<T: Table>(row: &dyn Row, start: usize) -> Result<bool> {
     Ok(true)
 }
 
-impl<T: Table> Projection for All<T, NotNull> {
-    type Output = T;
-    fn arity(&self) -> usize {
-        T::COLUMNS.len()
-    }
-    fn write_columns(&self, out: &mut SqlWriter) -> Result<()> {
-        write_all_columns::<T>(out)
-    }
-    fn decode(&self, row: &dyn Row, start: usize) -> Result<T> {
-        // Positional decode so this works at any offset inside a join tuple.
-        T::from_row_at(row, start)
-    }
+/// Positional whole-row decode, so this works at any offset inside a join tuple.
+fn decode_row<T: Table>(row: &dyn Row, start: usize) -> Result<T> {
+    T::from_row_at(row, start)
 }
 
-impl<T: Table> Projection for All<T, Nullable> {
-    type Output = Option<T>;
-    fn arity(&self) -> usize {
-        T::COLUMNS.len()
+/// The nullable side of an outer join: `None` when no row matched.
+fn decode_outer_row<T: Table>(row: &dyn Row, start: usize) -> Result<Option<T>> {
+    if outer_join_absent::<T>(row, start)? {
+        return Ok(None);
     }
-    fn write_columns(&self, out: &mut SqlWriter) -> Result<()> {
-        write_all_columns::<T>(out)
-    }
-    fn decode(&self, row: &dyn Row, start: usize) -> Result<Option<T>> {
-        if outer_join_absent::<T>(row, start)? {
-            return Ok(None);
-        }
-        Ok(Some(T::from_row_at(row, start)?))
-    }
+    Ok(Some(T::from_row_at(row, start)?))
 }
+
+/// Implement [`Projection`] for `All<T, $nullness>`: every column of `T`,
+/// decoded by `$decode`.
+macro_rules! all_projection {
+    ($nullness:ty => $out:ty, $decode:path) => {
+        impl<T: Table> Projection for All<T, $nullness> {
+            type Output = $out;
+            fn arity(&self) -> usize {
+                T::COLUMNS.len()
+            }
+            fn write_columns(&self, out: &mut SqlWriter) -> Result<()> {
+                write_all_columns::<T>(out)
+            }
+            fn decode(&self, row: &dyn Row, start: usize) -> Result<$out> {
+                $decode(row, start)
+            }
+        }
+    };
+}
+
+all_projection!(NotNull => T, decode_row::<T>);
+all_projection!(Nullable => Option<T>, decode_outer_row::<T>);
 
 /// Implement `Projection` for a tuple of projections, decoding each at its
 /// positional offset (so whole-row `All<T>` members work alongside leaf columns).

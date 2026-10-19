@@ -2,13 +2,14 @@
 //! transaction handle, and `Value` → `PgArguments` binding.
 
 use super::sqlx_backend::{
-    add_null_scalar, add_scalar, geo_from_text, into_decode, read_scalar, sqlx_driver, text_cell,
-    vector_from_text,
+    AddResult, add_null_scalar, add_scalar, geo_from_text, into_decode, read_scalar, sqlx_driver,
+    text_cell, vector_from_text,
 };
 use crate::dialect::PostgresDialect;
 use crate::error::{Error, Result};
 use crate::value::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc, Uuid, Value, ValueKind};
 use sqlx::Row as _;
+use sqlx::error::BoxDynError;
 use sqlx::postgres::{PgArguments, PgRow};
 use sqlx::{Arguments, PgPool, Postgres};
 
@@ -36,32 +37,30 @@ sqlx_driver! {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn bind_scalar(args: &mut PgArguments, value: Value) -> Result<()> {
-    let result = match value {
+fn bind_scalar(args: &mut PgArguments, value: Value) -> AddResult {
+    match value {
         // Bound as the text literal `[..]`; the SQL writer adds the `::vector` cast.
         Value::Vector(x) => args.add(crate::vector::to_literal(&x)),
         // Bound as bare WKT text; the SQL writer adds the `::geometry` cast (and
         // wraps it in `ST_SetSRID(.., srid)` when a SRID is attached).
         Value::Geo { wkt, .. } => args.add(wkt),
-        Value::Array(kind, values) => return bind_array(args, kind, values),
+        Value::Array(kind, values) => bind_array(args, kind, values),
         scalar => add_scalar!(args, scalar),
-    };
-    result.map_err(Error::Encode)
+    }
 }
 
-fn bind_null(args: &mut PgArguments, kind: ValueKind) -> Result<()> {
-    let result = match kind {
+fn bind_null(args: &mut PgArguments, kind: ValueKind) -> AddResult {
+    match kind {
         // Vector and geometry bind as text literals, so their nulls are text nulls too.
         ValueKind::Vector | ValueKind::Geo => args.add(None::<String>),
-        ValueKind::Array(elem) => return bind_null_array(args, *elem),
+        ValueKind::Array(elem) => bind_null_array(args, *elem),
         scalar => add_null_scalar!(args, scalar),
-    };
-    result.map_err(Error::Encode)
+    }
 }
 
 /// Bind a typed `NULL` array for a nullable native-array column.
-fn bind_null_array(args: &mut PgArguments, elem: ValueKind) -> Result<()> {
-    let result = match elem {
+fn bind_null_array(args: &mut PgArguments, elem: ValueKind) -> AddResult {
+    match elem {
         ValueKind::I16 => args.add(None::<Vec<i16>>),
         ValueKind::I32 => args.add(None::<Vec<i32>>),
         ValueKind::I64 => args.add(None::<Vec<i64>>),
@@ -75,8 +74,7 @@ fn bind_null_array(args: &mut PgArguments, elem: ValueKind) -> Result<()> {
         ValueKind::NaiveTime => args.add(None::<Vec<NaiveTime>>),
         ValueKind::Bytes => args.add(None::<Vec<Vec<u8>>>),
         _ => args.add(None::<Vec<String>>),
-    };
-    result.map_err(Error::Encode)
+    }
 }
 
 /// Read a native Postgres array column (`int[]`, `text[]`, …) into a
@@ -117,7 +115,7 @@ fn read_pg_array(row: &PgRow, index: usize, kind: ValueKind) -> Result<Value> {
 
 /// Collect homogeneous scalar `values` of `kind` into a typed `Vec` and bind it
 /// as a Postgres array (the `= ANY($1)` parameter).
-fn bind_array(args: &mut PgArguments, kind: ValueKind, values: Vec<Value>) -> Result<()> {
+fn bind_array(args: &mut PgArguments, kind: ValueKind, values: Vec<Value>) -> AddResult {
     macro_rules! collect_add {
         ($variant:ident) => {{
             // Error on any element whose variant disagrees with `kind` rather than
@@ -127,19 +125,17 @@ fn bind_array(args: &mut PgArguments, kind: ValueKind, values: Vec<Value>) -> Re
                 .into_iter()
                 .map(|value| match value {
                     Value::$variant(inner) => Ok(inner),
-                    other => Err(Error::Encode(
-                        format!(
-                            "heterogeneous array bind: expected {} element, got {other:?}",
-                            stringify!($variant)
-                        )
-                        .into(),
-                    )),
+                    other => Err(format!(
+                        "heterogeneous array bind: expected {} element, got {other:?}",
+                        stringify!($variant)
+                    )
+                    .into()),
                 })
-                .collect::<Result<_>>()?;
+                .collect::<core::result::Result<_, BoxDynError>>()?;
             args.add(typed)
         }};
     }
-    let result = match kind {
+    match kind {
         ValueKind::I16 => collect_add!(I16),
         ValueKind::I32 => collect_add!(I32),
         ValueKind::I64 => collect_add!(I64),
@@ -153,22 +149,11 @@ fn bind_array(args: &mut PgArguments, kind: ValueKind, values: Vec<Value>) -> Re
         ValueKind::NaiveDateTime => collect_add!(NaiveDateTime),
         ValueKind::Date => collect_add!(Date),
         ValueKind::NaiveTime => collect_add!(NaiveTime),
-        ValueKind::Json => {
-            return Err(Error::Encode("json array binds are not supported".into()));
-        }
-        ValueKind::Vector => {
-            return Err(Error::Encode("vector array binds are not supported".into()));
-        }
-        ValueKind::Geo => {
-            return Err(Error::Encode(
-                "geometry array binds are not supported".into(),
-            ));
-        }
+        ValueKind::Json => Err("json array binds are not supported".into()),
+        ValueKind::Vector => Err("vector array binds are not supported".into()),
+        ValueKind::Geo => Err("geometry array binds are not supported".into()),
         ValueKind::Array(_) => {
-            return Err(Error::Encode(
-                "nested arrays are not supported (use Json<Vec<Vec<_>>>)".into(),
-            ));
+            Err("nested arrays are not supported (use Json<Vec<Vec<_>>>)".into())
         }
-    };
-    result.map_err(Error::Encode)
+    }
 }

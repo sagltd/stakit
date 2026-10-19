@@ -7,11 +7,11 @@
 //! array bind path is never hit for `SQLite`).
 
 use super::sqlx_backend::{
-    add_null_scalar, add_scalar, array_from_json_text, geo_from_text, into_decode, read_scalar,
-    sqlx_driver, text_cell, vector_from_text,
+    AddResult, add_null_scalar, add_scalar, array_from_json_text, geo_from_text, into_decode,
+    read_scalar, sqlx_driver, text_cell, vector_from_text,
 };
 use crate::dialect::SqliteDialect;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::value::{Value, ValueKind};
 use sqlx::sqlite::{SqliteArguments, SqlitePool, SqliteRow};
 use sqlx::{Arguments, Row as _, Sqlite};
@@ -46,8 +46,8 @@ sqlx_driver! {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn bind_scalar(args: &mut SqliteArguments, value: Value) -> Result<()> {
-    let result = match value {
+fn bind_scalar(args: &mut SqliteArguments, value: Value) -> AddResult {
+    match value {
         Value::F32(x) => args.add(f64::from(x)),
         Value::Vector(x) => args.add(crate::vector::to_literal(&x)),
         // No `PostGIS` on SQLite; bind the WKT as plain text.
@@ -56,17 +56,15 @@ fn bind_scalar(args: &mut SqliteArguments, value: Value) -> Result<()> {
         // (`any_of` list membership never lands here; it expands to `IN (?, …)`.)
         Value::Array(_, items) => args.add(crate::value::array_to_json_text(&items)),
         scalar => add_scalar!(args, scalar),
-    };
-    result.map_err(Error::Encode)
+    }
 }
 
-fn bind_null(args: &mut SqliteArguments, kind: ValueKind) -> Result<()> {
-    let result = match kind {
+fn bind_null(args: &mut SqliteArguments, kind: ValueKind) -> AddResult {
+    match kind {
         ValueKind::F32 => args.add(None::<f64>),
         // Vector/geometry bind as text literals, and arrays store as JSON text — so
         // their nulls are text nulls too.
         ValueKind::Vector | ValueKind::Geo | ValueKind::Array(_) => args.add(None::<String>),
         scalar => add_null_scalar!(args, scalar),
-    };
-    result.map_err(Error::Encode)
+    }
 }

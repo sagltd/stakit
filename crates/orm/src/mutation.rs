@@ -7,6 +7,29 @@ use crate::schema::{Col, Table};
 use crate::sql::BindBuffer;
 use crate::sql::SqlWriter;
 
+/// The `to_sql` / `exec` terminals shared by [`Update`] and [`Delete`]; `$errors`
+/// extends the `to_sql` error docs.
+macro_rules! terminals {
+    ($errors:literal) => {
+        /// Render the SQL (for inspection / unit tests).
+        ///
+        /// # Errors
+        #[doc = concat!("Returns an error if an identifier is invalid", $errors, ".")]
+        pub fn to_sql(self) -> Result<String> {
+            Ok(self.into_sql()?.0)
+        }
+
+        /// Execute and return the number of rows affected.
+        ///
+        /// # Errors
+        /// Returns an error if the statement fails.
+        pub async fn exec(self) -> Result<u64> {
+            let exec = self.exec.clone();
+            execute(exec, self.into_sql()).await
+        }
+    };
+}
+
 /// An `UPDATE` statement under construction.
 pub struct Update<T> {
     exec: Option<Exec>,
@@ -97,23 +120,7 @@ impl<T: Table> Update<T> {
         crate::render::finish(writer)
     }
 
-    /// Render the SQL (for inspection / unit tests).
-    ///
-    /// # Errors
-    /// Returns an error if an identifier is invalid or no `set` was given.
-    pub fn to_sql(self) -> Result<String> {
-        Ok(self.into_sql()?.0)
-    }
-
-    /// Execute and return the number of rows affected.
-    ///
-    /// # Errors
-    /// Returns an error if the statement fails.
-    pub async fn exec(self) -> Result<u64> {
-        let exec = self.exec.clone().ok_or(Error::NotFound)?;
-        let (sql, arguments) = self.into_sql()?;
-        exec.execute(sql, arguments).await
-    }
+    terminals!(" or no `set` was given");
 }
 
 impl<T: Table> Default for Update<T> {
@@ -175,27 +182,19 @@ impl<T: Table> Delete<T> {
         crate::render::finish(writer)
     }
 
-    /// Render the SQL (for inspection / unit tests).
-    ///
-    /// # Errors
-    /// Returns an error if an identifier is invalid.
-    pub fn to_sql(self) -> Result<String> {
-        Ok(self.into_sql()?.0)
-    }
-
-    /// Execute and return the number of rows affected.
-    ///
-    /// # Errors
-    /// Returns an error if the statement fails.
-    pub async fn exec(self) -> Result<u64> {
-        let exec = self.exec.clone().ok_or(Error::NotFound)?;
-        let (sql, arguments) = self.into_sql()?;
-        exec.execute(sql, arguments).await
-    }
+    terminals!("");
 }
 
 impl<T: Table> Default for Delete<T> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Run a rendered `UPDATE`/`DELETE` on `exec` (an unbound builder is
+/// [`Error::NotFound`]), returning the affected-row count.
+async fn execute(exec: Option<Exec>, rendered: Result<(String, BindBuffer)>) -> Result<u64> {
+    let exec = exec.ok_or(Error::NotFound)?;
+    let (sql, arguments) = rendered?;
+    exec.execute(sql, arguments).await
 }

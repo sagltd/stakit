@@ -293,17 +293,7 @@ impl<N: Insertable, P: Projection> InsertReturning<N, P> {
         if self.insert.rows.is_empty() {
             return Ok(Vec::new());
         }
-        self.insert.ensure_returning_supported()?;
-        let projection_columns = projection_writer(&self.projection);
-        let (exec, writer) = self.insert.build(Some(&projection_columns))?;
-        let (sql, arguments) = crate::render::finish(writer)?;
-        let mut out = Vec::new();
-        exec.for_each_row(sql, arguments, |row| {
-            out.push(self.projection.decode(row, 0)?);
-            Ok(())
-        })
-        .await?;
-        Ok(out)
+        self.returned_rows(usize::MAX).await
     }
 
     /// Execute and decode a single returned row (a plain single-row insert always
@@ -319,19 +309,32 @@ impl<N: Insertable, P: Projection> InsertReturning<N, P> {
         if self.insert.rows.is_empty() {
             return Err(Error::NotFound);
         }
+        self.returned_rows(1)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(Error::NotFound)
+    }
+
+    /// Run the `INSERT … RETURNING`, decoding at most `limit` returned rows.
+    async fn returned_rows(self, limit: usize) -> Result<Vec<P::Output>>
+    where
+        P: Sync,
+        P::Output: Send,
+    {
         self.insert.ensure_returning_supported()?;
         let projection_columns = projection_writer(&self.projection);
         let (exec, writer) = self.insert.build(Some(&projection_columns))?;
         let (sql, arguments) = crate::render::finish(writer)?;
-        let mut out = None;
+        let mut out = Vec::new();
         exec.for_each_row(sql, arguments, |row| {
-            if out.is_none() {
-                out = Some(self.projection.decode(row, 0)?);
+            if out.len() < limit {
+                out.push(self.projection.decode(row, 0)?);
             }
             Ok(())
         })
         .await?;
-        out.ok_or(Error::NotFound)
+        Ok(out)
     }
 }
 

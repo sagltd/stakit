@@ -6,7 +6,8 @@
 //! (list membership is expanded to `IN (?, …)` by the dialect).
 
 use super::sqlx_backend::{
-    add_null_scalar, add_scalar, array_from_json_text, read_scalar, sqlx_driver, text_cell,
+    AddResult, add_null_scalar, add_scalar, array_from_json_text, read_scalar, sqlx_driver,
+    text_cell,
 };
 use crate::dialect::MySqlDialect;
 use crate::error::{Error, Result};
@@ -37,28 +38,22 @@ sqlx_driver! {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn bind_scalar(args: &mut MySqlArguments, value: Value) -> Result<()> {
-    let result = match value {
-        Value::Vector(..) => {
-            return Err(Error::Encode("MySQL has no vector type".into()));
-        }
-        Value::Geo { .. } => {
-            return Err(Error::Encode("PostGIS geometry is Postgres-only".into()));
-        }
+fn bind_scalar(args: &mut MySqlArguments, value: Value) -> AddResult {
+    match value {
+        Value::Vector(..) => Err("MySQL has no vector type".into()),
+        Value::Geo { .. } => Err("PostGIS geometry is Postgres-only".into()),
         // A `Vec<T>` column has no native MySQL array type — store it as JSON text.
         Value::Array(_, items) => args.add(crate::value::array_to_json_text(&items)),
         scalar => add_scalar!(args, scalar),
-    };
-    result.map_err(Error::Encode)
+    }
 }
 
-fn bind_null(args: &mut MySqlArguments, kind: ValueKind) -> Result<()> {
-    let result = match kind {
+fn bind_null(args: &mut MySqlArguments, kind: ValueKind) -> AddResult {
+    match kind {
         // Arrays (stored as JSON text) bind a text null.
         ValueKind::Array(_) => args.add(None::<String>),
-        ValueKind::Vector => return Err(Error::Encode("MySQL has no vector type".into())),
-        ValueKind::Geo => return Err(Error::Encode("PostGIS geometry is Postgres-only".into())),
+        ValueKind::Vector => Err("MySQL has no vector type".into()),
+        ValueKind::Geo => Err("PostGIS geometry is Postgres-only".into()),
         scalar => add_null_scalar!(args, scalar),
-    };
-    result.map_err(Error::Encode)
+    }
 }

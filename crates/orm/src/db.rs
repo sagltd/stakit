@@ -87,6 +87,70 @@ pub struct Migration<'a> {
     pub statements: &'a [&'a str],
 }
 
+/// The query-builder entry points shared by [`Db`] (bound to the pool) and [`Tx`]
+/// (bound to the transaction's connection). `$on` names the executor in the docs;
+/// the implementing type provides `fn exec(&self) -> Exec`.
+macro_rules! query_builders {
+    ($on:literal) => {
+        #[doc = concat!("Start a `SELECT` for `projection`, bound to ", $on, ".")]
+        pub fn select<P: Projection>(&self, projection: P) -> Select<P> {
+            Select::with_exec(projection, self.exec())
+        }
+
+        /// Start a whole-row `SELECT * FROM T` (Drizzle-style `find`): the output type
+        /// is inferred as `T`, so no `T::all()` / `.from::<T>()` boilerplate and no
+        /// `let rows: Vec<T>` annotation. Chain `.filter()`/`.order_by()`/`.limit()`
+        /// then a terminal (`.all()` → `Vec<T>`, `.one()` → `Option<T>`).
+        #[must_use]
+        pub fn find<T: Table>(&self) -> Select<crate::projection::All<T>> {
+            self.select(crate::projection::All::<T>::new()).from::<T>()
+        }
+
+        /// Fetch by primary key: `SELECT * FROM T WHERE <pk> = $1`, output inferred as
+        /// `T`. Finish with `.one()` → `Option<T>`. Tables without a primary key match
+        /// nothing (the filter renders as always-false). A composite-key table's `Pk` is a
+        /// tuple, which has no `ToValue`, so this is a compile error there — query those
+        /// with `find().filter(..)`.
+        #[must_use]
+        pub fn get<T: Table>(&self, pk: T::Pk) -> Select<crate::projection::All<T>>
+        where
+            T::Pk: crate::value::ToValue,
+        {
+            self.find::<T>().filter(pk_filter::<T>(pk))
+        }
+
+        #[doc = concat!("Insert a single row on ", $on, ".")]
+        pub fn insert<N: Insertable>(&self, row: N) -> Insert<N> {
+            Insert::with_exec(self.exec(), vec![row])
+        }
+
+        #[doc = concat!("Insert many rows in one statement on ", $on, ".")]
+        pub fn insert_many<N: Insertable>(&self, rows: Vec<N>) -> Insert<N> {
+            Insert::with_exec(self.exec(), rows)
+        }
+
+        #[doc = concat!("Start an `UPDATE` for table `T`, bound to ", $on, ".")]
+        #[must_use]
+        pub fn update<T: Table>(&self) -> Update<T> {
+            Update::with_exec(self.exec())
+        }
+
+        #[doc = concat!("Start a `DELETE` for table `T`, bound to ", $on, ".")]
+        #[must_use]
+        pub fn delete<T: Table>(&self) -> Delete<T> {
+            Delete::with_exec(self.exec())
+        }
+
+        #[doc = concat!(
+                    "Start a raw SQL query on ", $on, " (the explicit, unaudited escape hatch)."
+                )]
+        #[must_use]
+        pub fn raw(&self, sql: impl Into<String>) -> Raw {
+            Raw::new(self.exec(), sql)
+        }
+    };
+}
+
 /// A database handle. Cheap to clone (the driver is reference-counted) and `Send`
 /// + `Sync`; share it across tasks.
 #[derive(Clone)]
@@ -229,6 +293,8 @@ impl Db {
         Exec::Pool(Arc::clone(&self.driver))
     }
 
+    query_builders!("this pool");
+
     /// Apply pending [`Migration`]s in order, on **any** backend (Postgres, `SQLite`,
     /// `MySQL`, Turso) — migrations work out-of-box because they run through the
     /// [`Driver`], not a backend-specific migrator.
@@ -289,33 +355,6 @@ impl Db {
             count += 1;
         }
         Ok(count)
-    }
-
-    /// Start a `SELECT` for `projection`, bound to this pool.
-    pub fn select<P: Projection>(&self, projection: P) -> Select<P> {
-        Select::with_exec(projection, self.exec())
-    }
-
-    /// Start a whole-row `SELECT * FROM T` (Drizzle-style `find`): the output type
-    /// is inferred as `T`, so no `T::all()` / `.from::<T>()` boilerplate and no
-    /// `let rows: Vec<T>` annotation. Chain `.filter()`/`.order_by()`/`.limit()`
-    /// then a terminal (`.all()` → `Vec<T>`, `.one()` → `Option<T>`).
-    #[must_use]
-    pub fn find<T: Table>(&self) -> Select<crate::projection::All<T>> {
-        self.select(crate::projection::All::<T>::new()).from::<T>()
-    }
-
-    /// Fetch by primary key: `SELECT * FROM T WHERE <pk> = $1`, output inferred as
-    /// `T`. Finish with `.one()` → `Option<T>`. Tables without a primary key match
-    /// nothing (the filter renders as always-false). A composite-key table's `Pk` is a
-    /// tuple, which has no `ToValue`, so this is a compile error there — query those
-    /// with `find().filter(..)`.
-    #[must_use]
-    pub fn get<T: Table>(&self, pk: T::Pk) -> Select<crate::projection::All<T>>
-    where
-        T::Pk: crate::value::ToValue,
-    {
-        self.find::<T>().filter(pk_filter::<T>(pk))
     }
 
     /// Load a **has-many** relation for a set of parents in **one** batched query
@@ -405,34 +444,6 @@ impl Db {
             .collect())
     }
 
-    /// Insert a single row.
-    pub fn insert<N: Insertable>(&self, row: N) -> Insert<N> {
-        Insert::with_exec(self.exec(), vec![row])
-    }
-
-    /// Insert many rows in one statement.
-    pub fn insert_many<N: Insertable>(&self, rows: Vec<N>) -> Insert<N> {
-        Insert::with_exec(self.exec(), rows)
-    }
-
-    /// Start an `UPDATE` for table `T`, bound to this pool.
-    #[must_use]
-    pub fn update<T: Table>(&self) -> Update<T> {
-        Update::with_exec(self.exec())
-    }
-
-    /// Start a `DELETE` for table `T`, bound to this pool.
-    #[must_use]
-    pub fn delete<T: Table>(&self) -> Delete<T> {
-        Delete::with_exec(self.exec())
-    }
-
-    /// Start a raw SQL query (the explicit, unaudited escape hatch).
-    #[must_use]
-    pub fn raw(&self, sql: impl Into<String>) -> Raw {
-        Raw::new(self.exec(), sql)
-    }
-
     /// Run `work` inside a transaction. On `Ok` the transaction commits; on `Err`
     /// (or a returned error) it rolls back.
     ///
@@ -483,53 +494,11 @@ pub struct Tx {
 }
 
 impl Tx {
-    /// Start a `SELECT` on this transaction.
-    pub fn select<P: Projection>(&self, projection: P) -> Select<P> {
-        Select::with_exec(projection, self.exec.clone())
+    fn exec(&self) -> Exec {
+        self.exec.clone()
     }
 
-    /// Start a whole-row `SELECT * FROM T` on this transaction (see [`Db::find`]).
-    #[must_use]
-    pub fn find<T: Table>(&self) -> Select<crate::projection::All<T>> {
-        self.select(crate::projection::All::<T>::new()).from::<T>()
-    }
-
-    /// Fetch by primary key on this transaction (see [`Db::get`]).
-    #[must_use]
-    pub fn get<T: Table>(&self, pk: T::Pk) -> Select<crate::projection::All<T>>
-    where
-        T::Pk: crate::value::ToValue,
-    {
-        self.find::<T>().filter(pk_filter::<T>(pk))
-    }
-
-    /// Insert a single row on this transaction.
-    pub fn insert<N: Insertable>(&self, row: N) -> Insert<N> {
-        Insert::with_exec(self.exec.clone(), vec![row])
-    }
-
-    /// Insert many rows on this transaction.
-    pub fn insert_many<N: Insertable>(&self, rows: Vec<N>) -> Insert<N> {
-        Insert::with_exec(self.exec.clone(), rows)
-    }
-
-    /// Start an `UPDATE` on this transaction.
-    #[must_use]
-    pub fn update<T: Table>(&self) -> Update<T> {
-        Update::with_exec(self.exec.clone())
-    }
-
-    /// Start a `DELETE` on this transaction.
-    #[must_use]
-    pub fn delete<T: Table>(&self) -> Delete<T> {
-        Delete::with_exec(self.exec.clone())
-    }
-
-    /// Start a raw SQL query on this transaction.
-    #[must_use]
-    pub fn raw(&self, sql: impl Into<String>) -> Raw {
-        Raw::new(self.exec.clone(), sql)
-    }
+    query_builders!("this transaction");
 
     /// Set a Postgres run-time parameter for this transaction — typically the
     /// row-level-security context a policy reads via `current_setting('…')`.

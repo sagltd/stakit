@@ -140,57 +140,57 @@ pub struct Dms {
     pub hemisphere: char,
 }
 
-impl Geometry {
-    /// Wrap raw (E)WKT with no SRID prefix.
-    #[must_use]
-    pub fn new(wkt: impl Into<String>) -> Self {
-        Self {
-            wkt: wkt.into(),
-            srid: None,
-        }
-    }
+/// The shared surface of the raw-(E)WKT wrappers [`Geometry`] and [`Geography`]:
+/// constructors, [`to_ewkt`](Geometry::to_ewkt), and the `Value` round-trip.
+macro_rules! ewkt_wrapper {
+    ($ty:ident) => {
+        impl $ty {
+            /// Wrap raw (E)WKT with no SRID prefix.
+            #[must_use]
+            pub fn new(wkt: impl Into<String>) -> Self {
+                Self {
+                    wkt: wkt.into(),
+                    srid: None,
+                }
+            }
 
-    /// Wrap raw WKT and emit an `SRID=<srid>;` prefix.
-    #[must_use]
-    pub fn with_srid(wkt: impl Into<String>, srid: i32) -> Self {
-        Self {
-            wkt: wkt.into(),
-            srid: Some(srid),
-        }
-    }
+            /// Wrap raw WKT and emit an `SRID=<srid>;` prefix.
+            #[must_use]
+            pub fn with_srid(wkt: impl Into<String>, srid: i32) -> Self {
+                Self {
+                    wkt: wkt.into(),
+                    srid: Some(srid),
+                }
+            }
 
-    /// The (E)WKT literal this binds as (`SRID=N;<wkt>` when a SRID is set).
-    #[must_use]
-    pub fn to_ewkt(&self) -> String {
-        with_srid_prefix(&self.wkt, self.srid)
-    }
+            /// The (E)WKT literal this binds as (`SRID=N;<wkt>` when a SRID is set).
+            #[must_use]
+            pub fn to_ewkt(&self) -> String {
+                with_srid_prefix(&self.wkt, self.srid)
+            }
+        }
+
+        impl ToValue for $ty {
+            fn to_value(self) -> Value {
+                Value::Geo {
+                    wkt: self.wkt,
+                    srid: self.srid,
+                }
+            }
+        }
+
+        impl FromValue for $ty {
+            const KIND: ValueKind = ValueKind::Geo;
+            fn from_value(value: Value) -> Result<Self> {
+                let (wkt, srid) = geo_parts(value)?;
+                Ok(Self { wkt, srid })
+            }
+        }
+    };
 }
 
-impl Geography {
-    /// Wrap raw (E)WKT with no SRID prefix.
-    #[must_use]
-    pub fn new(wkt: impl Into<String>) -> Self {
-        Self {
-            wkt: wkt.into(),
-            srid: None,
-        }
-    }
-
-    /// Wrap raw WKT and emit an `SRID=<srid>;` prefix.
-    #[must_use]
-    pub fn with_srid(wkt: impl Into<String>, srid: i32) -> Self {
-        Self {
-            wkt: wkt.into(),
-            srid: Some(srid),
-        }
-    }
-
-    /// The (E)WKT literal this binds as (`SRID=N;<wkt>` when a SRID is set).
-    #[must_use]
-    pub fn to_ewkt(&self) -> String {
-        with_srid_prefix(&self.wkt, self.srid)
-    }
-}
+ewkt_wrapper!(Geometry);
+ewkt_wrapper!(Geography);
 
 impl GeoPoint {
     /// A point from **(latitude, longitude)** — the human / GPS order you read off
@@ -565,24 +565,6 @@ fn parse_point(text: &str) -> Result<(f64, f64, Option<i32>)> {
     Ok((lng, lat, srid))
 }
 
-impl ToValue for Geometry {
-    fn to_value(self) -> Value {
-        Value::Geo {
-            wkt: self.wkt,
-            srid: self.srid,
-        }
-    }
-}
-
-impl ToValue for Geography {
-    fn to_value(self) -> Value {
-        Value::Geo {
-            wkt: self.wkt,
-            srid: self.srid,
-        }
-    }
-}
-
 impl ToValue for GeoPoint {
     fn to_value(self) -> Value {
         Value::Geo {
@@ -590,22 +572,6 @@ impl ToValue for GeoPoint {
             wkt: self.wkt(),
             srid: self.srid,
         }
-    }
-}
-
-impl FromValue for Geometry {
-    const KIND: ValueKind = ValueKind::Geo;
-    fn from_value(value: Value) -> Result<Self> {
-        let (wkt, srid) = geo_parts(value)?;
-        Ok(Self { wkt, srid })
-    }
-}
-
-impl FromValue for Geography {
-    const KIND: ValueKind = ValueKind::Geo;
-    fn from_value(value: Value) -> Result<Self> {
-        let (wkt, srid) = geo_parts(value)?;
-        Ok(Self { wkt, srid })
     }
 }
 

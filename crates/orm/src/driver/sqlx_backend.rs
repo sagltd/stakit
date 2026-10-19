@@ -10,6 +10,11 @@
 use crate::error::{Error, Result};
 use crate::value::{Value, ValueKind};
 
+/// The result of an sqlx `Arguments::add`, before it is wrapped as
+/// [`Error::Encode`]. Backend `bind_scalar`/`bind_null` return this so the
+/// wrapping happens once, in the generated `bind_value`.
+pub(super) type AddResult = core::result::Result<(), sqlx::error::BoxDynError>;
+
 /// Wrap an sqlx decode error as [`Error::Decode`].
 pub(super) fn into_decode(error: sqlx::Error) -> Error {
     Error::Decode(Box::new(error))
@@ -362,12 +367,14 @@ macro_rules! sqlx_driver {
             value: $crate::value::Value,
         ) -> $crate::error::Result<()> {
             match value {
-                $crate::value::Value::Null(kind) => bind_null(args, kind),
+                $crate::value::Value::Null(kind) => {
+                    bind_null(args, kind).map_err($crate::error::Error::Encode)
+                }
                 // The SQL writer unwraps `Cast` (or rejects it on backends without
                 // `::` casts) before queueing the bind, so this is only a defensive
                 // fallback — encode the inner payload.
                 $crate::value::Value::Cast { inner, .. } => bind_value(args, *inner),
-                other => bind_scalar(args, other),
+                other => bind_scalar(args, other).map_err($crate::error::Error::Encode),
             }
         }
     };

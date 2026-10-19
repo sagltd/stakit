@@ -9,7 +9,7 @@ use crate::expr::{Order, Predicate};
 use crate::projection::Projection;
 use crate::schema::Table;
 use crate::sql::{BindBuffer, SqlWriter};
-use crate::value::Value;
+use crate::value::{FromValue, Value};
 use crate::vector::{Distance, DistanceSql};
 use smallvec::SmallVec;
 
@@ -417,7 +417,28 @@ impl<P: Projection> Select<P> {
     ///
     /// # Errors
     /// Returns an error if the query fails.
-    pub async fn count(mut self) -> Result<i64> {
+    pub async fn count(self) -> Result<i64> {
+        self.wrapped_scalar("select count(*) from (", ") as __count", 0)
+            .await
+    }
+
+    /// Whether any row matches (`select exists(<this query>)`). `LIMIT`/`OFFSET`/
+    /// `ORDER BY` are dropped (irrelevant to existence).
+    ///
+    /// # Errors
+    /// Returns an error if the query fails.
+    pub async fn exists(self) -> Result<bool> {
+        self.wrapped_scalar("select exists(", ")", false).await
+    }
+
+    /// Run `<prefix><this query><suffix>` with paging/ordering dropped, decoding
+    /// the single scalar it returns (`empty` if no row comes back).
+    async fn wrapped_scalar<V: FromValue + Send>(
+        mut self,
+        prefix: &str,
+        suffix: &str,
+        empty: V,
+    ) -> Result<V> {
         self.limit = None;
         self.offset = None;
         self.order.clear();
@@ -427,38 +448,11 @@ impl<P: Projection> Select<P> {
         let exec = self.take_exec()?;
         let (_projection, inner, arguments) = self.into_sql()?;
         // Pre-size + push instead of `format!` to avoid a second full-length copy.
-        let mut sql = String::with_capacity(inner.len() + 32);
-        sql.push_str("select count(*) from (");
+        let mut sql = String::with_capacity(prefix.len() + inner.len() + suffix.len());
+        sql.push_str(prefix);
         sql.push_str(&inner);
-        sql.push_str(") as __count");
-        let mut value = 0_i64;
-        exec.for_each_row(sql, arguments, |row| {
-            value = crate::driver::decode_cell(row, 0)?;
-            Ok(())
-        })
-        .await?;
-        Ok(value)
-    }
-
-    /// Whether any row matches (`select exists(<this query>)`). `LIMIT`/`OFFSET`/
-    /// `ORDER BY` are dropped (irrelevant to existence).
-    ///
-    /// # Errors
-    /// Returns an error if the query fails.
-    pub async fn exists(mut self) -> Result<bool> {
-        self.limit = None;
-        self.offset = None;
-        self.order.clear();
-        self.nearest = None;
-        self.nearest_geo = None;
-        self.rank_order = None;
-        let exec = self.take_exec()?;
-        let (_projection, inner, arguments) = self.into_sql()?;
-        let mut sql = String::with_capacity(inner.len() + 16);
-        sql.push_str("select exists(");
-        sql.push_str(&inner);
-        sql.push(')');
-        let mut value = false;
+        sql.push_str(suffix);
+        let mut value = empty;
         exec.for_each_row(sql, arguments, |row| {
             value = crate::driver::decode_cell(row, 0)?;
             Ok(())

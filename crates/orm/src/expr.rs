@@ -364,6 +364,26 @@ impl Predicate {
     }
 }
 
+/// Render the Postgres document side of a full-text search: `to_tsvector('<cfg>',
+/// "t"."col")`, or — when `stored` — the already-stored `tsvector` column itself.
+fn write_tsvector(
+    writer: &mut SqlWriter,
+    table: &'static str,
+    name: &'static str,
+    config: &'static str,
+    stored: bool,
+) -> Result<(), IdentError> {
+    if stored {
+        return writer.push_qualified(table, name);
+    }
+    writer.push("to_tsvector('");
+    writer.push(config);
+    writer.push("', ");
+    writer.push_qualified(table, name)?;
+    writer.push(")");
+    Ok(())
+}
+
 /// Render a full-text match per dialect: FTS5 `col MATCH ?`, or Postgres
 /// `to_tsvector('<cfg>', col) @@ plainto_tsquery('<cfg>', $1)` — or, when `stored`,
 /// `col @@ plainto_tsquery('<cfg>', $1)` against an already-stored `tsvector` column
@@ -389,15 +409,7 @@ fn write_match(
         }
         crate::dialect::FullText::TsQuery(default_config) => {
             let config = config.unwrap_or(default_config);
-            if !stored {
-                writer.push("to_tsvector('");
-                writer.push(config);
-                writer.push("', ");
-            }
-            writer.push_qualified(table, name)?;
-            if !stored {
-                writer.push(")");
-            }
+            write_tsvector(writer, table, name, config, stored)?;
             writer.push(" @@ plainto_tsquery('");
             writer.push(config);
             writer.push("', ");
@@ -435,15 +447,7 @@ pub(crate) fn write_ts_rank(
     };
     let config = config.unwrap_or(default_config);
     writer.push("ts_rank(");
-    if !stored {
-        writer.push("to_tsvector('");
-        writer.push(config);
-        writer.push("', ");
-    }
-    writer.push_qualified(table, name)?;
-    if !stored {
-        writer.push(")");
-    }
+    write_tsvector(writer, table, name, config, stored)?;
     writer.push(", plainto_tsquery('");
     writer.push(config);
     writer.push("', ");
@@ -672,19 +676,29 @@ pub fn not(inner: Predicate) -> Predicate {
     Predicate::Not(Box::new(inner))
 }
 
+/// Build a [`Predicate::Match`] — the shared body of the `matches*` constructors.
+fn full_text<T, Ty>(
+    column: Col<T, Ty>,
+    query: impl Into<String>,
+    config: Option<&'static str>,
+    stored: bool,
+) -> Predicate {
+    Predicate::Match {
+        table: column.table,
+        name: column.name,
+        query: query.into(),
+        config,
+        stored,
+    }
+}
+
 /// Full-text search on `column` for `query`.
 ///
 /// FTS5 `MATCH` on `SQLite`/Turso (the table must be an `fts5` virtual table), or
 /// `to_tsvector @@ plainto_tsquery` on Postgres. Combine with `.order_by`/`.limit`.
 #[must_use]
-pub fn matches<T, Ty>(column: crate::schema::Col<T, Ty>, query: impl Into<String>) -> Predicate {
-    Predicate::Match {
-        table: column.table,
-        name: column.name,
-        query: query.into(),
-        config: None,
-        stored: false,
-    }
+pub fn matches<T, Ty>(column: Col<T, Ty>, query: impl Into<String>) -> Predicate {
+    full_text(column, query, None, false)
 }
 
 /// Full-text search on `column` with an explicit Postgres text-search `config`
@@ -696,17 +710,11 @@ pub fn matches<T, Ty>(column: crate::schema::Col<T, Ty>, query: impl Into<String
 /// `&'static str` (never user input) and is never parameter-bound.
 #[must_use]
 pub fn matches_in<T, Ty>(
-    column: crate::schema::Col<T, Ty>,
+    column: Col<T, Ty>,
     query: impl Into<String>,
     config: &'static str,
 ) -> Predicate {
-    Predicate::Match {
-        table: column.table,
-        name: column.name,
-        query: query.into(),
-        config: Some(config),
-        stored: false,
-    }
+    full_text(column, query, Some(config), false)
 }
 
 /// Full-text search against an **already-stored** `tsvector` column.
@@ -717,17 +725,8 @@ pub fn matches_in<T, Ty>(
 /// index is usable. On `SQLite`/Turso it falls back to FTS5 `MATCH` (there is no stored
 /// `tsvector` form). The query text is always a bound parameter.
 #[must_use]
-pub fn matches_tsv<T, Ty>(
-    column: crate::schema::Col<T, Ty>,
-    query: impl Into<String>,
-) -> Predicate {
-    Predicate::Match {
-        table: column.table,
-        name: column.name,
-        query: query.into(),
-        config: None,
-        stored: true,
-    }
+pub fn matches_tsv<T, Ty>(column: Col<T, Ty>, query: impl Into<String>) -> Predicate {
+    full_text(column, query, None, true)
 }
 
 /// [`matches_tsv`] with an explicit Postgres text-search `config` (e.g. `"english"`).
@@ -738,17 +737,11 @@ pub fn matches_tsv<T, Ty>(
 /// (never user input) and is never parameter-bound.
 #[must_use]
 pub fn matches_tsv_in<T, Ty>(
-    column: crate::schema::Col<T, Ty>,
+    column: Col<T, Ty>,
     query: impl Into<String>,
     config: &'static str,
 ) -> Predicate {
-    Predicate::Match {
-        table: column.table,
-        name: column.name,
-        query: query.into(),
-        config: Some(config),
-        stored: true,
-    }
+    full_text(column, query, Some(config), true)
 }
 
 /// Case-sensitive literal-substring match: `column LIKE '%<needle>%'`.
@@ -898,20 +891,14 @@ mod tests {
     }
 
     #[test]
-    fn any_of_multi_is_single_array_bind() {
-        let mut writer = SqlWriter::new();
-        any_of(ID, &[1_i32, 2, 3]).write(&mut writer).unwrap();
-        assert_eq!(writer.sql(), r#""t"."id" = any($1)"#);
-        assert_eq!(writer.bind_count(), 1);
-    }
-
-    #[test]
-    fn any_of_empty_is_single_array_bind() {
-        let mut writer = SqlWriter::new();
-        let none: [i32; 0] = [];
-        any_of(ID, &none).write(&mut writer).unwrap();
-        assert_eq!(writer.sql(), r#""t"."id" = any($1)"#);
-        assert_eq!(writer.bind_count(), 1);
+    fn any_of_multi_and_empty_are_single_array_bind() {
+        let none: &[i32] = &[];
+        for values in [&[1_i32, 2, 3][..], none] {
+            let mut writer = SqlWriter::new();
+            any_of(ID, values).write(&mut writer).unwrap();
+            assert_eq!(writer.sql(), r#""t"."id" = any($1)"#);
+            assert_eq!(writer.bind_count(), 1);
+        }
     }
 
     #[test]
