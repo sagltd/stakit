@@ -30,11 +30,7 @@ pub struct Count {
 /// Streams `0..n` (no ctx needed, so it registers on any router).
 #[action(stream)]
 pub fn count(params: Count) -> impl futures::Stream<Item = Result<u64, Error>> {
-    async_stream::stream! {
-        for i in 0..params.n {
-            yield Ok(i);
-        }
-    }
+    futures::stream::iter((0..params.n).map(Ok))
 }
 
 /// A request context that knows whether its caller is an admin.
