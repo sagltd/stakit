@@ -17,6 +17,9 @@ cargo fmt --all -- --check
 echo "==> clippy (deny warnings)"
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+echo "==> clippy stakit-orm postgres-only (catches feature-gated dead code)"
+cargo clippy -p stakit-orm --no-default-features --features postgres --all-targets -- -D warnings
+
 echo "==> build"
 cargo build --workspace --all-targets --all-features
 

@@ -236,6 +236,7 @@ impl<T: FromValue> FromValue for Option<T> {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "turso"))]
 /// Convert a scalar [`Value`] to JSON, for the array JSON fallback on backends
 /// without native arrays. Non-scalar/nested values map to JSON `null`.
 #[allow(clippy::cast_precision_loss)]
@@ -264,6 +265,7 @@ pub(crate) fn scalar_to_json(value: &Value) -> serde_json::Value {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "turso"))]
 /// Convert a JSON scalar back into a [`Value`] of `kind` (array JSON fallback read).
 #[allow(clippy::cast_possible_truncation)]
 fn json_to_scalar(json: &serde_json::Value, kind: ValueKind) -> Result<Value> {
@@ -329,12 +331,14 @@ fn json_to_scalar(json: &serde_json::Value, kind: ValueKind) -> Result<Value> {
     Ok(value)
 }
 
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "turso"))]
 /// Encode an array's items as a JSON-array text literal (non-native-array backends).
 pub(crate) fn array_to_json_text(items: &[Value]) -> String {
     let array = items.iter().map(scalar_to_json).collect();
     serde_json::Value::Array(array).to_string()
 }
 
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "turso"))]
 /// Decode a JSON-array text literal into a [`Value::Array`] of `elem` kind.
 ///
 /// # Errors
