@@ -1,9 +1,8 @@
 //! Inclusive input cannot disappear when provider cache categories are refined.
 
-use crate::{ProviderError, StreamEvent};
-use futures::StreamExt as _;
+use crate::StreamEvent;
+use crate::provider::test_util::{Events, assert_uncertified, collect, one_chunk, sse_wire};
 use serde_json::{Value, json};
-use std::fmt::Write as _;
 
 fn initial() -> Value {
     json!({"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":0}}})
@@ -13,30 +12,16 @@ fn delta(usage: &Value) -> Value {
     json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":usage})
 }
 
-async fn decoded(usage: Value) -> Vec<Result<StreamEvent, ProviderError>> {
-    let mut wire = String::new();
-    for event in [initial(), delta(&usage), json!({"type":"message_stop"})] {
-        write!(wire, "data: {event}\n\n").expect("write fixture");
-    }
-    super::super::sse::decode(futures::stream::iter([Ok::<_, String>(
-        bytes::Bytes::from(wire),
-    )]))
-    .collect()
-    .await
+async fn decoded(usage: Value) -> Events {
+    let wire = sse_wire(&[initial(), delta(&usage), json!({"type":"message_stop"})]);
+    collect(super::super::sse::decode(one_chunk(wire))).await
 }
 
 #[tokio::test]
 async fn final_delta_cannot_erase_previously_observed_inclusive_input() {
     let usage = json!({"input_tokens":0,"output_tokens":1});
     let events = decoded(usage.clone()).await;
-    assert!(
-        matches!(events.last(), Some(Err(ProviderError::Decode { body, .. })) if body.is_empty())
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, Ok(StreamEvent::End { .. })))
-    );
+    assert_uncertified(&events);
     assert!(events.iter().any(
         |event| matches!(event, Ok(StreamEvent::Start { usage }) if usage.total_input() == 100)
     ));

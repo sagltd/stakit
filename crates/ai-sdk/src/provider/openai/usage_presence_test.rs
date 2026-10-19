@@ -1,9 +1,10 @@
 //! Missing usage must never certify a successful zero-cost request.
 use super::{response::parse_response, sse::decode};
-use crate::{ProviderError, StreamEvent, Usage};
-use futures::StreamExt as _;
+use crate::provider::test_util::{
+    Events, assert_uncertified, collect, end_usage, one_chunk, sse_wire,
+};
+use crate::{StreamEvent, Usage};
 use serde_json::{Value, json};
-use std::fmt::Write as _;
 
 fn response(usage: Option<Value>) -> Value {
     let mut value = json!({"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]});
@@ -46,22 +47,18 @@ fn complete_rejects_impossible_cache_and_reasoning_subsets() {
     }
 }
 
-async fn stream(usage: &[Value], tools: bool) -> Vec<Result<StreamEvent, ProviderError>> {
+async fn stream(usage: &[Value], tools: bool) -> Events {
     let choice = if tools {
         json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call","function":{"name":"work","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})
     } else {
         json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]})
     };
-    let mut wire = format!("data: {choice}\n\n");
-    for usage in usage {
-        write!(wire, "data: {}\n\n", json!({"choices":[],"usage":usage})).expect("write fixture");
-    }
-    wire.push_str("data: [DONE]\n\n");
-    decode(futures::stream::iter([Ok::<_, String>(
-        bytes::Bytes::from(wire),
-    )]))
-    .collect()
-    .await
+    let footers: Vec<_> = usage
+        .iter()
+        .map(|usage| json!({"choices":[],"usage":usage}))
+        .collect();
+    let wire = sse_wire(std::iter::once(&choice).chain(&footers)) + "data: [DONE]\n\n";
+    collect(decode(one_chunk(wire))).await
 }
 
 #[tokio::test]
@@ -75,13 +72,7 @@ async fn stream_requires_usage_before_end_or_tool_release() {
         vec![json!({"prompt_tokens":null,"completion_tokens":0})],
     ] {
         let events = stream(&usage, true).await;
-        assert!(
-            matches!(events.last(), Some(Err(ProviderError::Decode { body, .. })) if body.is_empty())
-        );
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            Ok(StreamEvent::End { .. } | StreamEvent::ToolCall { .. })
-        )));
+        assert_uncertified(&events);
     }
 }
 
@@ -92,9 +83,7 @@ async fn stream_accepts_explicit_zero_and_incrementally_observed_counters() {
         vec![json!({"prompt_tokens":0}), json!({"completion_tokens":0})],
     ] {
         let events = stream(&usage, false).await;
-        assert!(
-            matches!(events.last(), Some(Ok(StreamEvent::End { usage, .. })) if *usage == Usage::zero())
-        );
+        assert_eq!(end_usage(&events), Some(Usage::zero()));
     }
 }
 
@@ -106,15 +95,7 @@ async fn missing_final_counter_keeps_known_progress_without_certifying_completio
             |event| matches!(event, Ok(StreamEvent::Usage { usage }) if usage.input_tokens == 7)
         )
     );
-    assert!(matches!(
-        events.last(),
-        Some(Err(ProviderError::Decode { .. }))
-    ));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, Ok(StreamEvent::End { .. })))
-    );
+    assert_uncertified(&events);
 }
 
 #[tokio::test]
@@ -124,14 +105,7 @@ async fn stream_rejects_inconsistent_cache_and_reasoning_subsets() {
         json!({"prompt_tokens":0,"completion_tokens":1,"completion_tokens_details":{"reasoning_tokens":2}}),
     ] {
         let events = stream(&[usage], true).await;
-        assert!(matches!(
-            events.last(),
-            Some(Err(ProviderError::Decode { .. }))
-        ));
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            Ok(StreamEvent::End { .. } | StreamEvent::ToolCall { .. })
-        )));
+        assert_uncertified(&events);
     }
 }
 

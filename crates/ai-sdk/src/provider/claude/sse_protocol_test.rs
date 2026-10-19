@@ -1,5 +1,6 @@
 use super::decode;
-use super::sse_test::{collect, frame, text_and_tool};
+use super::sse_test::{collect, decode_events, frame, text_and_tool};
+use crate::provider::test_util::assert_uncertified;
 use crate::{ProviderError, StopReason, StreamEvent};
 use bytes::Bytes;
 use futures::StreamExt;
@@ -80,17 +81,8 @@ async fn message_stop_rejects_unfinished_tools_and_missing_stop_reason() {
             events.push(json!({"type":"message_delta", "delta":{"stop_reason":"tool_use"}, "usage":{"output_tokens":5}}));
         }
         events.push(json!({"type":"message_stop"}));
-        let wire: String = events.iter().map(frame).collect();
-        let decoded = collect(vec![Bytes::from(wire)]).await;
-        assert!(matches!(
-            decoded.last(),
-            Some(Err(ProviderError::Decode { .. }))
-        ));
-        assert!(
-            !decoded
-                .iter()
-                .any(|event| matches!(event, Ok(StreamEvent::End { .. })))
-        );
+        let decoded = decode_events(&events).await;
+        assert_uncertified(&decoded);
     }
 }
 

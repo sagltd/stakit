@@ -21,10 +21,14 @@ use crate::{
 mod capabilities;
 #[cfg(feature = "claude")]
 pub(crate) mod claude;
+#[cfg(any(feature = "claude", feature = "openai"))]
+mod http;
 #[cfg(feature = "openai")]
 pub(crate) mod openai;
 #[cfg(any(feature = "claude", feature = "openai"))]
 mod sse;
+#[cfg(all(test, any(feature = "claude", feature = "openai")))]
+mod test_util;
 
 pub use capabilities::{ProviderCapabilities, ThinkingSupport};
 
@@ -420,7 +424,7 @@ pub trait Provider: Send + Sync {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use futures::future::BoxFuture;
 
     use super::*;
@@ -446,9 +450,9 @@ mod tests {
         assert_eq!(v["parameters"]["type"], "object");
     }
 
-    /// A trivial provider used in unit tests. Returns a canned response for
-    /// `complete` and an error for `stream`.
-    struct MockProvider;
+    /// A trivial provider used in unit tests: a canned `"hello"` text
+    /// completion and an empty, well-terminated stream.
+    pub(crate) struct MockProvider;
 
     impl Provider for MockProvider {
         #[allow(

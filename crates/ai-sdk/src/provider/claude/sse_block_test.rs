@@ -1,4 +1,5 @@
-use super::sse_test::{collect, frame, text_and_tool};
+use super::sse_test::{collect, decode_events, frame, text_and_tool};
+use crate::provider::test_util::assert_uncertified;
 use crate::{AssistantContent, ProviderError, StreamEvent, Thinking};
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -114,8 +115,7 @@ async fn indexed_complete_blocks_keep_interleaved_signatures_separate() {
     }
     events.push(json!({"type":"message_delta", "delta":{"stop_reason":"end_turn"}, "usage":{"output_tokens":4}}));
     events.push(json!({"type":"message_stop"}));
-    let wire: String = events.iter().map(frame).collect();
-    let decoded = collect(vec![Bytes::from(wire)]).await;
+    let decoded = decode_events(&events).await;
     assert_eq!(
         blocks(&decoded),
         vec![
@@ -142,16 +142,8 @@ async fn malformed_tool_json_fails_without_fabricating_a_complete_tool_block() {
     let mut events = text_and_tool();
     let arguments = events.get_mut(5).expect("tool delta");
     *arguments = json!({"type":"content_block_delta", "index":1, "delta":{"type":"input_json_delta", "partial_json":"{malformed"}});
-    let wire: String = events.iter().map(frame).collect();
-    let decoded = collect(vec![Bytes::from(wire)]).await;
-    assert!(matches!(
-        decoded.last(),
-        Some(Err(ProviderError::Decode { .. }))
-    ));
-    assert!(!decoded.iter().any(|event| matches!(
-        event,
-        Ok(StreamEvent::ToolCall { .. } | StreamEvent::End { .. })
-    )));
+    let decoded = decode_events(&events).await;
+    assert_uncertified(&decoded);
 }
 
 #[tokio::test]
@@ -163,8 +155,7 @@ async fn tool_start_input_is_preserved_when_no_argument_deltas_are_sent() {
         json!({"type":"message_delta", "delta":{"stop_reason":"tool_use"}, "usage":{"output_tokens":1}}),
         json!({"type":"message_stop"}),
     ];
-    let wire: String = events.iter().map(frame).collect();
-    let decoded = collect(vec![Bytes::from(wire)]).await;
+    let decoded = decode_events(&events).await;
     assert_eq!(
         blocks(&decoded),
         vec![(
@@ -188,8 +179,7 @@ async fn empty_tool_argument_fragments_preserve_the_initial_empty_object() {
         json!({"type":"message_delta", "delta":{"stop_reason":"tool_use"}, "usage":{"output_tokens":1}}),
         json!({"type":"message_stop"}),
     ];
-    let wire: String = events.iter().map(frame).collect();
-    let decoded = collect(vec![Bytes::from(wire)]).await;
+    let decoded = decode_events(&events).await;
     assert!(decoded.iter().all(Result::is_ok), "{decoded:?}");
     assert!(decoded.iter().any(|event| matches!(event,
         Ok(StreamEvent::ToolCall { arguments, .. }) if arguments == "{}"

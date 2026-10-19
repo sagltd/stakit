@@ -1,9 +1,10 @@
 //! Completion requires observed counters, while interrupted progress stays useful.
 use super::{parse_response, sse::decode};
+use crate::provider::test_util::{
+    Events, assert_uncertified, collect, end_usage, one_chunk, sse_wire,
+};
 use crate::{ProviderError, StreamEvent, Usage};
-use futures::StreamExt as _;
 use serde_json::{Value, json};
-use std::fmt::Write as _;
 
 #[test]
 fn complete_requires_both_observed_usage_counters() {
@@ -38,27 +39,17 @@ fn complete_rejects_invalid_counters_and_subsets_without_echoing_payload() {
     }
 }
 
-async fn stream(
-    start: Value,
-    final_usage: Option<Value>,
-) -> Vec<Result<StreamEvent, ProviderError>> {
+async fn stream(start: Value, final_usage: Option<Value>) -> Events {
     let mut delta = json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}});
     if let Some(usage) = final_usage {
         delta["usage"] = usage;
     }
-    let mut wire = String::new();
-    for event in [
+    let wire = sse_wire(&[
         json!({"type":"message_start","message":{"usage":start}}),
         delta,
         json!({"type":"message_stop"}),
-    ] {
-        write!(wire, "data: {event}\n\n").expect("write fixture");
-    }
-    decode(futures::stream::iter([Ok::<_, String>(
-        bytes::Bytes::from(wire),
-    )]))
-    .collect()
-    .await
+    ]);
+    collect(decode(one_chunk(wire))).await
 }
 
 #[tokio::test]
@@ -70,15 +61,7 @@ async fn stream_rejects_absent_null_and_partial_usage() {
         json!({"output_tokens":0}),
     ] {
         let events = stream(start, Some(json!({"output_tokens":0}))).await;
-        assert!(matches!(
-            events.last(),
-            Some(Err(ProviderError::Decode { .. }))
-        ));
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, Ok(StreamEvent::End { .. })))
-        );
+        assert_uncertified(&events);
     }
     for final_usage in [
         None,
@@ -91,15 +74,7 @@ async fn stream_rejects_absent_null_and_partial_usage() {
         assert!(events.iter().any(
             |event| matches!(event,Ok(StreamEvent::Start { usage }) if usage.input_tokens == 7)
         ));
-        assert!(matches!(
-            events.last(),
-            Some(Err(ProviderError::Decode { .. }))
-        ));
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, Ok(StreamEvent::End { .. })))
-        );
+        assert_uncertified(&events);
     }
 }
 
@@ -110,9 +85,7 @@ async fn stream_accepts_explicit_zero_only_after_final_delta() {
         Some(json!({"output_tokens":0})),
     )
     .await;
-    assert!(
-        matches!(events.last(),Some(Ok(StreamEvent::End { usage, .. })) if *usage == Usage::zero())
-    );
+    assert_eq!(end_usage(&events), Some(Usage::zero()));
 }
 
 #[test]
@@ -137,14 +110,6 @@ async fn stream_rejects_inconsistent_reasoning_and_cache_subsets() {
         json!({"output_tokens":0,"cache_creation":{"ephemeral_1h_input_tokens":1}}),
     ] {
         let events = stream(json!({"input_tokens":1,"output_tokens":0}), Some(usage)).await;
-        assert!(matches!(
-            events.last(),
-            Some(Err(ProviderError::Decode { .. }))
-        ));
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, Ok(StreamEvent::End { .. })))
-        );
+        assert_uncertified(&events);
     }
 }

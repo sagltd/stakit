@@ -1,10 +1,9 @@
 //! A terminal tally must follow all content and cannot erase known progress.
 
 use super::Accum;
-use crate::{ProviderError, StreamEvent};
-use futures::StreamExt as _;
+use crate::StreamEvent;
+use crate::provider::test_util::{Events, assert_uncertified, collect, one_chunk, sse_wire};
 use serde_json::{Value, json};
-use std::fmt::Write as _;
 
 fn initial() -> Value {
     json!({"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":0}}})
@@ -22,28 +21,8 @@ fn usage(output: u64, reason: Option<&str>) -> Value {
     json!({"type":"message_delta","delta":{"stop_reason":reason},"usage":{"output_tokens":output}})
 }
 
-async fn decoded(events: &[Value]) -> Vec<Result<StreamEvent, ProviderError>> {
-    let mut wire = String::new();
-    for event in events {
-        write!(wire, "data: {event}\n\n").expect("write fixture");
-    }
-    super::super::sse::decode(futures::stream::iter([Ok::<_, String>(
-        bytes::Bytes::from(wire),
-    )]))
-    .collect()
-    .await
-}
-
-fn assert_rejected(events: &[Result<StreamEvent, ProviderError>]) {
-    assert!(matches!(
-        events.last(),
-        Some(Err(ProviderError::Decode { body, .. })) if body.is_empty()
-    ));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, Ok(StreamEvent::End { .. })))
-    );
+async fn decoded(events: &[Value]) -> Events {
+    collect(super::super::sse::decode(one_chunk(sse_wire(events)))).await
 }
 
 #[tokio::test]
@@ -57,7 +36,7 @@ async fn decoder_rejects_message_delta_before_every_wire_block_closes() {
             json!({"type":"message_stop"}),
         ])
         .await;
-        assert_rejected(&events);
+        assert_uncertified(&events);
     }
 }
 
@@ -72,7 +51,7 @@ async fn decoder_rejects_new_text_and_tools_after_terminal_usage() {
             json!({"type":"message_stop"}),
         ])
         .await;
-        assert_rejected(&events);
+        assert_uncertified(&events);
         assert!(
             !events
                 .iter()
@@ -132,7 +111,7 @@ async fn decreasing_final_output_is_rejected_without_losing_known_progress() {
         json!({"type":"message_stop"}),
     ])
     .await;
-    assert_rejected(&events);
+    assert_uncertified(&events);
     assert!(events.iter().any(
         |event| matches!(event, Ok(StreamEvent::Usage { usage }) if usage.output_tokens == 2)
     ));

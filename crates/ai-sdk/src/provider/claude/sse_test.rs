@@ -33,6 +33,14 @@ pub(super) async fn collect(chunks: Vec<Bytes>) -> Vec<Result<StreamEvent, Provi
     .await
 }
 
+/// Decodes `events`, each framed with its `event:` name, as one chunk.
+pub(super) async fn decode_events(events: &[Value]) -> Vec<Result<StreamEvent, ProviderError>> {
+    collect(vec![Bytes::from(
+        events.iter().map(frame).collect::<String>(),
+    )])
+    .await
+}
+
 #[tokio::test]
 async fn split_utf8_keeps_text_and_tool_arguments_exact() {
     let wire: String = text_and_tool().iter().map(frame).collect();

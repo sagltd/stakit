@@ -1,7 +1,8 @@
 //! Optional totals must agree with the counters they summarize.
 use super::decoded;
+use crate::StreamEvent;
 use crate::provider::openai::response::parse_response;
-use crate::{ProviderError, StreamEvent};
+use crate::provider::test_util::assert_uncertified;
 use serde_json::json;
 
 #[test]
@@ -47,15 +48,7 @@ async fn partial_total_is_checked_when_both_counters_become_observed() {
         if total == 8 {
             assert!(matches!(events.last(), Some(Ok(StreamEvent::End { .. }))));
         } else {
-            assert!(matches!(
-                events.last(),
-                Some(Err(ProviderError::Decode { .. }))
-            ));
-            assert!(
-                !events
-                    .iter()
-                    .any(|event| matches!(event, Ok(StreamEvent::End { .. })))
-            );
+            assert_uncertified(&events);
         }
     }
 }

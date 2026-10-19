@@ -1,9 +1,8 @@
 //! Byte-buffered, bounded SSE decoding. Each incoming byte is scanned once;
 //! completed lines are cleared rather than draining or rescanning a prefix.
 use super::{Accum, MAX_INFLIGHT_TOOLS};
-use crate::provider::sse::Framer;
+use crate::provider::sse::{ByteStream, Framer, drive};
 use crate::{EventStream, ProviderError, StreamEvent};
-use futures::{Stream, StreamExt};
 use hashbrown::HashMap;
 use serde_json::Value;
 
@@ -46,7 +45,6 @@ struct Decoder {
     accum: Accum,
     blocks: HashMap<u64, BlockKind>,
     started: bool,
-    complete: bool,
 }
 
 impl Decoder {
@@ -116,16 +114,14 @@ impl Decoder {
                     return Err(decode_error("Claude stop for an unopened block"));
                 }
             }
-            "message_stop" => {
+            "message_stop"
                 if !self.blocks.is_empty()
                     || self.accum.has_open_blocks()
-                    || self.accum.stop.is_none()
-                {
-                    return Err(decode_error(
-                        "Claude message_stop before blocks and stop reason completed",
-                    ));
-                }
-                self.complete = true;
+                    || self.accum.stop.is_none() =>
+            {
+                return Err(decode_error(
+                    "Claude message_stop before blocks and stop reason completed",
+                ));
             }
             _ => {}
         }
@@ -142,34 +138,11 @@ impl Decoder {
     }
 }
 
-pub(super) fn decode<S, E>(bytes: S) -> EventStream
-where
-    S: Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
-    E: std::fmt::Display + Send + 'static,
-{
-    let mut bytes = Box::pin(bytes);
-    async_stream::stream! {
-        let mut decoder = Decoder::default();
-        while let Some(chunk) = bytes.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => { yield Err(ProviderError::Transport(error.to_string())); return; }
-            };
-            // No complete-chunk output queue and no front-drain: retain at most
-            // one bounded line/frame plus the bounded open tool arguments.
-            for part in chunk.split_inclusive(|byte| *byte == b'\n') {
-                match decoder.accept(part) {
-                    Ok(events) => for event in events {
-                        let is_end = matches!(event, StreamEvent::End { .. });
-                        yield Ok(event);
-                        if is_end { return; }
-                    },
-                    Err(error) => { yield Err(error); return; }
-                }
-            }
-        }
-        if !decoder.complete {
-            yield Err(ProviderError::Transport("Claude stream ended before message_stop".to_owned()));
-        }
-    }.boxed()
+pub(super) fn decode(bytes: impl ByteStream) -> EventStream {
+    let mut decoder = Decoder::default();
+    drive(
+        bytes,
+        move |part| decoder.accept(part),
+        "Claude stream ended before message_stop",
+    )
 }

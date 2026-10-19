@@ -1,5 +1,7 @@
 //! Shared bounded SSE framing. Vendor modules validate JSON and termination.
-use crate::ProviderError;
+use futures::{Stream, StreamExt};
+
+use crate::{EventStream, ProviderError, StreamEvent};
 
 pub(super) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 #[derive(Debug, PartialEq, Eq)]
@@ -72,6 +74,55 @@ impl Framer {
         self.line.clear();
         Ok(None)
     }
+}
+
+/// Drives a vendor decoder over a byte stream. `accept` takes one line
+/// segment (see [`Framer::accept`]); the stream ends after the terminal
+/// [`StreamEvent::End`] or the first error, and a body that closes before
+/// `End` fails with `eof`.
+/// A response body: a sendable stream of byte chunks or transport errors.
+pub(super) trait ByteStream:
+    Stream<Item = Result<bytes::Bytes, Self::Error>> + Send + 'static
+{
+    /// The transport error, surfaced as [`ProviderError::Transport`].
+    type Error: std::fmt::Display + Send + 'static;
+}
+
+impl<S, E> ByteStream for S
+where
+    S: Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    type Error = E;
+}
+
+pub(super) fn drive<D>(bytes: impl ByteStream, mut accept: D, eof: &'static str) -> EventStream
+where
+    D: FnMut(&[u8]) -> Result<Vec<StreamEvent>, ProviderError> + Send + 'static,
+{
+    let mut bytes = Box::pin(bytes);
+    async_stream::stream! {
+        while let Some(chunk) = bytes.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => { yield Err(ProviderError::Transport(error.to_string())); return; }
+            };
+            // No complete-chunk output queue and no front-drain: retain at most
+            // one bounded line/frame plus the bounded open tool arguments.
+            for part in chunk.split_inclusive(|byte| *byte == b'\n') {
+                match accept(part) {
+                    Ok(events) => for event in events {
+                        let is_end = matches!(event, StreamEvent::End { .. });
+                        yield Ok(event);
+                        if is_end { return; }
+                    },
+                    Err(error) => { yield Err(error); return; }
+                }
+            }
+        }
+        yield Err(ProviderError::Transport(eof.to_owned()));
+    }
+    .boxed()
 }
 
 #[cfg(test)]

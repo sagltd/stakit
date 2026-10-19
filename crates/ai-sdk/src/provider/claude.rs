@@ -12,6 +12,9 @@ use crate::cache::{
     CacheCapabilities, CacheStrategy, CacheTarget, CacheTtl, ExplicitCacheCapabilities,
 };
 use crate::message::{AssistantContent, Image, Message, Thinking, ToolResultPart, UserContent};
+use crate::provider::http::{
+    HttpConfig, api_error, ensure_success, http_client_builders, pick_model, send, wire_count,
+};
 use crate::provider::{
     ChatRequest, ChatResponse, EventStream, Provider, ProviderCapabilities, StopReason,
     ThinkingConfig, ToolChoice, ToolDef, parse_retry_after,
@@ -44,20 +47,13 @@ const MAX_INFLIGHT_TOOLS: usize = crate::provider::MAX_STREAM_OPEN_BLOCKS;
 /// A handle to the Anthropic API. Cheap to clone; mints per-model handles.
 #[derive(Clone)]
 pub struct ClaudeClient {
-    api_key: String,
-    base_url: String,
-    endpoint: Option<String>,
-    http: Option<reqwest::Client>,
+    config: HttpConfig,
 }
 
 // Hand-written so the API key never leaks through `{:?}` (logs, panics, tests).
 impl std::fmt::Debug for ClaudeClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClaudeClient")
-            .field("api_key", &"[redacted]")
-            .field("base_url", &self.base_url)
-            .field("endpoint", &self.endpoint)
-            .finish_non_exhaustive()
+        self.config.debug("ClaudeClient", f)
     }
 }
 
@@ -66,10 +62,7 @@ impl ClaudeClient {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
-            base_url: DEFAULT_BASE_URL.to_owned(),
-            endpoint: None,
-            http: crate::provider::http_client(),
+            config: HttpConfig::new(api_key.into(), DEFAULT_BASE_URL),
         }
     }
 
@@ -78,41 +71,13 @@ impl ClaudeClient {
     /// # Errors
     /// Returns [`ProviderError::InvalidArgument`] if the variable is unset.
     pub fn from_env() -> Result<Self, ProviderError> {
-        let key = std::env::var("ANTHROPIC_API_KEY")
-            .map_err(|_| ProviderError::InvalidArgument("ANTHROPIC_API_KEY is not set".into()))?;
-        Ok(Self::new(key))
+        HttpConfig::key_from_env("ANTHROPIC_API_KEY").map(Self::new)
     }
 
-    /// Overrides the base URL (e.g. a proxy or gateway).
-    #[must_use]
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
-    }
-
-    /// Overrides the full request URL (instead of `{base_url}/v1/messages`), for
-    /// compatible APIs mounted under a different path, e.g. Gemini's
-    /// `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`.
-    #[must_use]
-    pub fn with_endpoint(mut self, url: impl Into<String>) -> Self {
-        self.endpoint = Some(url.into());
-        self
-    }
-
-    /// Uses `http` for every request instead of the shared default client, e.g.
-    /// one with a custom DNS resolver or proxy. The caller owns its retry and
-    /// redirect policy.
-    #[must_use]
-    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
-        self.http = Some(http);
-        self
-    }
-
-    fn url(&self) -> String {
-        self.endpoint
-            .clone()
-            .unwrap_or_else(|| format!("{}/v1/messages", self.base_url))
-    }
+    http_client_builders!(
+        base_url_doc: "Overrides the base URL (e.g. a proxy or gateway).",
+        path: "/v1/messages"
+    );
 
     /// Mints a [`ClaudeModel`] for the given model id.
     #[must_use]
@@ -164,11 +129,11 @@ impl Provider for ClaudeModel {
         mut request: ChatRequest,
     ) -> futures::future::BoxFuture<'_, Result<ChatResponse, ProviderError>> {
         Box::pin(async move {
-            let model = self.pick_model(&request);
+            let model = pick_model(&self.model, &request);
             request.fit_to(&rules_for(&model).capabilities);
             request.validate_cache(&self.cache_capabilities_for(&model))?;
             let body = build_body(&model, &request, false);
-            let resp = self.send(body).await?;
+            let resp = self.send(&body).await?;
             let status = resp.status();
             let retry_after = parse_retry_after(resp.headers());
             let text = resp
@@ -191,68 +156,28 @@ impl Provider for ClaudeModel {
         mut request: ChatRequest,
     ) -> futures::future::BoxFuture<'_, Result<EventStream, ProviderError>> {
         Box::pin(async move {
-            let model = self.pick_model(&request);
+            let model = pick_model(&self.model, &request);
             request.fit_to(&rules_for(&model).capabilities);
             request.validate_cache(&self.cache_capabilities_for(&model))?;
             let body = build_body(&model, &request, true);
-            let resp = self.send(body).await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let retry_after = parse_retry_after(resp.headers());
-                let text = resp.text().await.unwrap_or_default();
-                return Err(api_error(status.as_u16(), &text, retry_after));
-            }
+            let resp = ensure_success(self.send(&body).await?).await?;
             Ok(sse::decode(resp.bytes_stream()))
         })
     }
 }
 
 impl ClaudeModel {
-    /// The request's model id when set, else this handle's bound model.
-    fn pick_model(&self, request: &ChatRequest) -> String {
-        if request.model.is_empty() {
-            self.model.clone()
-        } else {
-            request.model.clone()
-        }
-    }
-
-    async fn send(&self, body: Value) -> Result<reqwest::Response, ProviderError> {
-        let http = self.client.http.as_ref().ok_or_else(|| {
-            ProviderError::Transport("provider HTTP client initialization failed".into())
-        })?;
-        http.post(self.client.url())
-            .header("x-api-key", &self.client.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))
-    }
-}
-
-/// Builds an [`ProviderError::Api`] from a 4xx/5xx response.
-///
-/// Extracts only the provider's structured `error.type` / `error.message`; the
-/// raw `body` is never stored, since it can echo back request material
-/// (including the API key) and would surface via `Display` into the run
-/// outcome. When the body lacks the expected shape, falls back to a concise,
-/// safe message.
-fn api_error(status: u16, body: &str, retry_after: Option<std::time::Duration>) -> ProviderError {
-    let parsed = serde_json::from_str::<Value>(body).ok();
-    let kind = parsed
-        .as_ref()
-        .and_then(|v| v["error"]["type"].as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "api_error".to_owned());
-    let message = parsed
-        .as_ref()
-        .and_then(|v| v["error"]["message"].as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| format!("provider error: {status} {kind}"));
-    ProviderError::Api {
-        status,
-        kind,
-        message,
-        retry_after,
+    async fn send(&self, body: &Value) -> Result<reqwest::Response, ProviderError> {
+        let request = self
+            .client
+            .config
+            .post("/v1/messages", body)
+            .map(|request| {
+                request
+                    .header("x-api-key", &self.client.config.api_key)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+            });
+        send(request).await
     }
 }
 
@@ -705,7 +630,7 @@ fn map_stop_reason(reason: &str, stop_sequence: Option<&str>) -> StopReason {
 }
 
 fn map_usage(usage: &Value) -> Usage {
-    let n = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let n = |key: &str| wire_count(usage, key);
     Usage {
         input_tokens: n("input_tokens"),
         output_tokens: n("output_tokens"),
@@ -729,6 +654,7 @@ mod tests {
     use super::*;
     use crate::StreamEvent;
     use crate::message::UserContent;
+    use crate::provider::test_util::{assert_open_tools_capped, expect_decode_error};
 
     #[test]
     fn build_body_sets_core_fields_and_caches_system() {
@@ -866,17 +792,10 @@ mod tests {
     #[test]
     fn accumulator_caps_inflight_tool_count() {
         let mut accum = Accum::default();
-        // Opening MAX_INFLIGHT_TOOLS distinct tool blocks is fine.
-        for idx in 0..MAX_INFLIGHT_TOOLS as u64 {
-            let ev = json!({ "type": "content_block_start", "index": idx,
-                "content_block": { "type": "tool_use", "id": format!("t{idx}"), "name": "wx", "input": {} } });
-            accum.push(&ev).expect("under cap");
-        }
-        // One more distinct tool index must trip the decode error.
-        let over = json!({ "type": "content_block_start", "index": MAX_INFLIGHT_TOOLS as u64,
-            "content_block": { "type": "tool_use", "id": "tX", "name": "wx", "input": {} } });
-        let err = accum.push(&over).expect_err("over cap must error");
-        assert!(matches!(err, ProviderError::Decode { .. }), "{err:?}");
+        assert_open_tools_capped(|idx| {
+            accum.push(&json!({ "type": "content_block_start", "index": idx,
+                "content_block": { "type": "tool_use", "id": format!("t{idx}"), "name": "wx", "input": {} } }))
+        });
     }
 
     #[test]
@@ -888,52 +807,9 @@ mod tests {
             .expect("start ok");
         // A single oversized argument fragment must trip the decode error.
         let huge = "x".repeat(crate::provider::MAX_STREAM_BLOCK_BYTES + 1);
-        let err = accum
-            .push(&json!({ "type": "content_block_delta", "index": 0,
-                "delta": { "type": "input_json_delta", "partial_json": huge } }))
-            .expect_err("oversized args must error");
-        assert!(matches!(err, ProviderError::Decode { .. }), "{err:?}");
-    }
-
-    #[test]
-    fn api_error_does_not_surface_raw_body_secrets() {
-        // The raw body echoes back request material (here a fake key); only the
-        // provider's structured error.message must reach Display.
-        let body = json!({
-            "error": {
-                "type": "invalid_request_error",
-                "message": "model not found"
-            },
-            "request_echo": { "x-api-key": "sk-secret-LEAK" }
-        })
-        .to_string();
-        let err = api_error(400, &body, None);
-        let surfaced = err.to_string();
-        assert!(
-            !surfaced.contains("sk-secret-LEAK"),
-            "raw body leaked into Display: {surfaced}"
+        expect_decode_error(
+            accum.push(&json!({ "type": "content_block_delta", "index": 0,
+            "delta": { "type": "input_json_delta", "partial_json": huge } })),
         );
-        assert!(surfaced.contains("model not found"), "{surfaced}");
-    }
-
-    #[test]
-    fn api_error_falls_back_to_safe_message_for_opaque_body() {
-        // An HTML/plain body (no JSON error.message) must not be surfaced verbatim.
-        let err = api_error(502, "<html>sk-secret-LEAK gateway</html>", None);
-        let surfaced = err.to_string();
-        assert!(!surfaced.contains("sk-secret-LEAK"), "{surfaced}");
-        assert!(surfaced.contains("502"), "{surfaced}");
-    }
-
-    #[test]
-    fn client_debug_redacts_api_key() {
-        let client = ClaudeClient::new("sk-secret-LEAK");
-        let dbg = format!("{client:?}");
-        assert!(!dbg.contains("sk-secret-LEAK"), "{dbg}");
-        assert!(dbg.contains("[redacted]"), "{dbg}");
-        // The model handle embeds the client and must inherit redaction.
-        let model = client.model("claude-opus-4-8");
-        let dbg = format!("{model:?}");
-        assert!(!dbg.contains("sk-secret-LEAK"), "{dbg}");
     }
 }

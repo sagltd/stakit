@@ -10,6 +10,9 @@
 use serde_json::{Map, Value, json};
 
 use crate::message::{AssistantContent, Image, Message, ToolResultPart, UserContent};
+use crate::provider::http::{
+    HttpConfig, api_error, ensure_success, http_client_builders, pick_model, send, wire_count,
+};
 use crate::provider::{
     ChatRequest, ChatResponse, EventStream, Provider, StopReason, ToolChoice, ToolDef,
     parse_retry_after,
@@ -39,20 +42,13 @@ const MAX_TOOL_ARGS: usize = crate::provider::MAX_STREAM_BLOCK_BYTES;
 /// A handle to the `OpenAI` API. Cheap to clone; mints per-model handles.
 #[derive(Clone)]
 pub struct OpenAiClient {
-    api_key: String,
-    base_url: String,
-    endpoint: Option<String>,
-    http: Option<reqwest::Client>,
+    config: HttpConfig,
 }
 
 // Hand-written so the API key never leaks through `{:?}` (logs, panics, tests).
 impl std::fmt::Debug for OpenAiClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpenAiClient")
-            .field("api_key", &"[redacted]")
-            .field("base_url", &self.base_url)
-            .field("endpoint", &self.endpoint)
-            .finish_non_exhaustive()
+        self.config.debug("OpenAiClient", f)
     }
 }
 
@@ -61,10 +57,7 @@ impl OpenAiClient {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
-            base_url: DEFAULT_BASE_URL.to_owned(),
-            endpoint: None,
-            http: crate::provider::http_client(),
+            config: HttpConfig::new(api_key.into(), DEFAULT_BASE_URL),
         }
     }
 
@@ -73,41 +66,13 @@ impl OpenAiClient {
     /// # Errors
     /// Returns [`ProviderError::InvalidArgument`] if the variable is unset.
     pub fn from_env() -> Result<Self, ProviderError> {
-        let key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| ProviderError::InvalidArgument("OPENAI_API_KEY is not set".into()))?;
-        Ok(Self::new(key))
+        HttpConfig::key_from_env("OPENAI_API_KEY").map(Self::new)
     }
 
-    /// Overrides the base URL (e.g. an `OpenAI`-compatible endpoint).
-    #[must_use]
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
-    }
-
-    /// Overrides the full request URL (instead of `{base_url}/v1/chat/completions`), for
-    /// compatible APIs mounted under a different path, e.g. Gemini's
-    /// `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`.
-    #[must_use]
-    pub fn with_endpoint(mut self, url: impl Into<String>) -> Self {
-        self.endpoint = Some(url.into());
-        self
-    }
-
-    /// Uses `http` for every request instead of the shared default client, e.g.
-    /// one with a custom DNS resolver or proxy. The caller owns its retry and
-    /// redirect policy.
-    #[must_use]
-    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
-        self.http = Some(http);
-        self
-    }
-
-    fn url(&self) -> String {
-        self.endpoint
-            .clone()
-            .unwrap_or_else(|| format!("{}/v1/chat/completions", self.base_url))
-    }
+    http_client_builders!(
+        base_url_doc: "Overrides the base URL (e.g. an `OpenAI`-compatible endpoint).",
+        path: "/v1/chat/completions"
+    );
 
     /// Mints an [`OpenAiModel`] for the given model id.
     #[must_use]
@@ -132,7 +97,7 @@ impl Provider for OpenAiModel {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
-        self.capabilities_for(&self.model)
+        capabilities::model_capabilities(&self.model)
     }
 
     fn capabilities_for(&self, model: &str) -> ProviderCapabilities {
@@ -152,10 +117,11 @@ impl Provider for OpenAiModel {
         request: ChatRequest,
     ) -> futures::future::BoxFuture<'_, Result<ChatResponse, ProviderError>> {
         Box::pin(async move {
-            request.validate_cache(&self.cache_capabilities_for(&self.pick_model(&request)))?;
-            let body = build_body(&self.pick_model(&request), &request, false);
+            let model = pick_model(&self.model, &request);
+            request.validate_cache(&self.cache_capabilities_for(&model))?;
+            let body = build_body(&model, &request, false);
             validate_body(&body)?;
-            let resp = self.send(body).await?;
+            let resp = self.send(&body).await?;
             let status = resp.status();
             let retry_after = parse_retry_after(resp.headers());
             let bytes = resp
@@ -187,65 +153,20 @@ impl Provider for OpenAiModel {
         request: ChatRequest,
     ) -> futures::future::BoxFuture<'_, Result<EventStream, ProviderError>> {
         Box::pin(async move {
-            request.validate_cache(&self.cache_capabilities_for(&self.pick_model(&request)))?;
-            let body = build_body(&self.pick_model(&request), &request, true);
+            let model = pick_model(&self.model, &request);
+            request.validate_cache(&self.cache_capabilities_for(&model))?;
+            let body = build_body(&model, &request, true);
             validate_body(&body)?;
-            let resp = self.send(body).await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let retry_after = parse_retry_after(resp.headers());
-                let text = resp.text().await.unwrap_or_default();
-                return Err(api_error(status.as_u16(), &text, retry_after));
-            }
+            let resp = ensure_success(self.send(&body).await?).await?;
             Ok(sse::decode(resp.bytes_stream()))
         })
     }
 }
 
 impl OpenAiModel {
-    fn pick_model(&self, request: &ChatRequest) -> String {
-        if request.model.is_empty() {
-            self.model.clone()
-        } else {
-            request.model.clone()
-        }
-    }
-
-    async fn send(&self, body: Value) -> Result<reqwest::Response, ProviderError> {
-        let http = self.client.http.as_ref().ok_or_else(|| {
-            ProviderError::Transport("provider HTTP client initialization failed".into())
-        })?;
-        http.post(self.client.url())
-            .bearer_auth(&self.client.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))
-    }
-}
-
-/// Builds an [`ProviderError::Api`] from a 4xx/5xx response.
-///
-/// Extracts only the provider's structured `error.type` / `error.message`; the
-/// raw `body` is never stored, since it can echo back request material
-/// (including the API key) and would surface via `Display` into the run
-/// outcome. When the body lacks the expected shape, falls back to a concise,
-/// safe message.
-fn api_error(status: u16, body: &str, retry_after: Option<std::time::Duration>) -> ProviderError {
-    let parsed = serde_json::from_str::<Value>(body).ok();
-    let kind = parsed
-        .as_ref()
-        .and_then(|v| v["error"]["type"].as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "api_error".to_owned());
-    let message = parsed
-        .as_ref()
-        .and_then(|v| v["error"]["message"].as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| format!("provider error: {status} {kind}"));
-    ProviderError::Api {
-        status,
-        kind,
-        message,
-        retry_after,
+    async fn send(&self, body: &Value) -> Result<reqwest::Response, ProviderError> {
+        let request = self.client.config.post("/v1/chat/completions", body);
+        send(request.map(|request| request.bearer_auth(&self.client.config.api_key))).await
     }
 }
 
@@ -483,7 +404,7 @@ fn map_finish_reason(reason: &str) -> StopReason {
 }
 
 fn map_usage(usage: &Value) -> Usage {
-    let n = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let n = |key: &str| wire_count(usage, key);
     let details = &usage["prompt_tokens_details"];
     let cache_read_tokens = details["cached_tokens"].as_u64().unwrap_or(0);
     let cache_create_tokens = details["cache_write_tokens"].as_u64().unwrap_or(0);
@@ -509,6 +430,7 @@ fn map_usage(usage: &Value) -> Usage {
 mod tests {
     use super::*;
     use crate::StreamEvent;
+    use crate::provider::test_util::{assert_open_tools_capped, expect_decode_error};
 
     #[test]
     fn build_body_maps_system_and_tool_messages() {
@@ -610,65 +532,21 @@ mod tests {
     #[test]
     fn accumulator_caps_inflight_tool_count() {
         let mut accum = Accum::default();
-        // Opening MAX_INFLIGHT_TOOLS distinct tool indices is fine.
-        for index in 0..MAX_INFLIGHT_TOOLS as u64 {
-            let ev = json!({ "choices": [{ "delta": { "tool_calls": [{
+        assert_open_tools_capped(|index| {
+            accum.push(&json!({ "choices": [{ "delta": { "tool_calls": [{
                 "index": index, "id": format!("c{index}"),
-                "function": { "name": "wx", "arguments": "" } }] } }] });
-            accum.push(&ev).expect("under cap");
-        }
-        // One more distinct index must trip the decode error.
-        let over = json!({ "choices": [{ "delta": { "tool_calls": [{
-            "index": MAX_INFLIGHT_TOOLS as u64, "id": "cX",
-            "function": { "name": "wx", "arguments": "" } }] } }] });
-        let err = accum.push(&over).expect_err("over cap must error");
-        assert!(matches!(err, ProviderError::Decode { .. }), "{err:?}");
+                "function": { "name": "wx", "arguments": "" } }] } }] }))
+        });
     }
 
     #[test]
     fn accumulator_caps_single_tool_arg_buffer() {
         let mut accum = Accum::default();
         let huge = "x".repeat(MAX_TOOL_ARGS + 1);
-        let err = accum
-            .push(&json!({ "choices": [{ "delta": { "tool_calls": [{
-                "index": 0, "id": "c0", "function": { "name": "wx", "arguments": huge } }] } }] }))
-            .expect_err("oversized args must error");
-        assert!(matches!(err, ProviderError::Decode { .. }), "{err:?}");
-    }
-
-    #[test]
-    fn api_error_does_not_surface_raw_body_secrets() {
-        let body = json!({
-            "error": { "type": "invalid_request_error", "message": "model not found" },
-            "request_echo": { "authorization": "Bearer sk-secret-LEAK" }
-        })
-        .to_string();
-        let err = api_error(400, &body, None);
-        let surfaced = err.to_string();
-        assert!(
-            !surfaced.contains("sk-secret-LEAK"),
-            "raw body leaked into Display: {surfaced}"
+        expect_decode_error(
+            accum.push(&json!({ "choices": [{ "delta": { "tool_calls": [{
+            "index": 0, "id": "c0", "function": { "name": "wx", "arguments": huge } }] } }] })),
         );
-        assert!(surfaced.contains("model not found"), "{surfaced}");
-    }
-
-    #[test]
-    fn api_error_falls_back_to_safe_message_for_opaque_body() {
-        let err = api_error(502, "sk-secret-LEAK upstream timeout", None);
-        let surfaced = err.to_string();
-        assert!(!surfaced.contains("sk-secret-LEAK"), "{surfaced}");
-        assert!(surfaced.contains("502"), "{surfaced}");
-    }
-
-    #[test]
-    fn client_debug_redacts_api_key() {
-        let client = OpenAiClient::new("sk-secret-LEAK");
-        let dbg = format!("{client:?}");
-        assert!(!dbg.contains("sk-secret-LEAK"), "{dbg}");
-        assert!(dbg.contains("[redacted]"), "{dbg}");
-        let model = client.model("gpt-4o");
-        let dbg = format!("{model:?}");
-        assert!(!dbg.contains("sk-secret-LEAK"), "{dbg}");
     }
 }
 

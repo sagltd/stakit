@@ -1,21 +1,11 @@
 //! Final output counters must describe all generated content.
 use super::super::sse::decode;
-use crate::{ProviderError, StreamEvent};
-use futures::StreamExt as _;
+use crate::StreamEvent;
+use crate::provider::test_util::{Events, assert_uncertified, collect, one_chunk, sse_wire};
 use serde_json::{Value, json};
-use std::fmt::Write as _;
 
-async fn decoded(events: &[Value]) -> Vec<Result<StreamEvent, ProviderError>> {
-    let mut wire = String::new();
-    for event in events {
-        write!(wire, "data: {event}\n\n").expect("write fixture");
-    }
-    wire.push_str("data: [DONE]\n\n");
-    decode(futures::stream::iter([Ok::<_, String>(
-        bytes::Bytes::from(wire),
-    )]))
-    .collect()
-    .await
+async fn decoded(events: &[Value]) -> Events {
+    collect(decode(one_chunk(sse_wire(events) + "data: [DONE]\n\n"))).await
 }
 
 #[tokio::test]
@@ -35,14 +25,7 @@ async fn early_output_progress_cannot_certify_later_generated_content() {
         }
         let events = decoded(&wire_events).await;
         assert!(events.iter().any(|event| matches!(event,Ok(StreamEvent::Usage { usage }) if usage.input_tokens == 7 && usage.output_tokens == 1)));
-        assert!(matches!(
-            events.last(),
-            Some(Err(ProviderError::Decode { .. }))
-        ));
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            Ok(StreamEvent::End { .. } | StreamEvent::ToolCall { .. })
-        )));
+        assert_uncertified(&events);
     }
 }
 
@@ -96,14 +79,7 @@ async fn decreasing_final_output_cannot_erase_known_progress() {
             |event| matches!(event,Ok(StreamEvent::Usage { usage }) if usage.output_tokens < 2)
         )
     );
-    assert!(matches!(
-        events.last(),
-        Some(Err(ProviderError::Decode { .. }))
-    ));
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        Ok(StreamEvent::End { .. } | StreamEvent::ToolCall { .. })
-    )));
+    assert_uncertified(&events);
 }
 
 #[tokio::test]
@@ -116,15 +92,7 @@ async fn decreasing_inclusive_prompt_usage_cannot_erase_known_input() {
     assert!(events.iter().any(
         |event| matches!(event,Ok(StreamEvent::Usage { usage }) if usage.total_input() == 100)
     ));
-    assert!(matches!(
-        events.last(),
-        Some(Err(ProviderError::Decode { .. }))
-    ));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, Ok(StreamEvent::End { .. })))
-    );
+    assert_uncertified(&events);
 }
 
 #[tokio::test]

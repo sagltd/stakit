@@ -209,6 +209,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::provider::tests::MockProvider;
     use crate::{
         ProviderError,
         provider::{ChatResponse, EventStream, StopReason},
@@ -253,40 +254,6 @@ mod tests {
         }
     }
 
-    // ── Mock for text ────────────────────────────────────────────────────────
-
-    struct TextMock;
-
-    impl Provider for TextMock {
-        #[allow(
-            clippy::unnecessary_literal_bound,
-            reason = "trait method must return &str"
-        )]
-        fn model_id(&self) -> &str {
-            "mock-text"
-        }
-
-        fn complete(
-            &self,
-            _req: ChatRequest,
-        ) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-            Box::pin(async {
-                Ok(ChatResponse {
-                    content: vec![AssistantContent::Text("hello".into())],
-                    stop: StopReason::EndTurn,
-                    usage: Usage {
-                        output_tokens: 1,
-                        ..Usage::default()
-                    },
-                })
-            })
-        }
-
-        fn stream(&self, _req: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-            unimplemented!("TextMock does not support streaming")
-        }
-    }
-
     // ── Test structs ─────────────────────────────────────────────────────────
 
     #[derive(Debug, serde::Deserialize, stakit_model::Model, stakit_model::JsonSchema)]
@@ -313,20 +280,20 @@ mod tests {
 
     #[tokio::test]
     async fn llm_text_returns_string() {
-        let s = LLM::new(TextMock).user("hi").text().await.unwrap();
+        let s = LLM::new(MockProvider).user("hi").text().await.unwrap();
         assert_eq!(s, "hello");
     }
 
     #[tokio::test]
     async fn llm_missing_user_returns_schema_error() {
-        let err = LLM::new(TextMock).text().await.unwrap_err();
+        let err = LLM::new(MockProvider).text().await.unwrap_err();
         assert!(matches!(err, AgentError::Schema(_)));
     }
 
     #[tokio::test]
     async fn llm_extract_missing_tool_use_returns_schema_error() {
-        // TextMock returns a Text block, not a ToolUse block.
-        let err = LLM::new(TextMock)
+        // MockProvider returns a Text block, not a ToolUse block.
+        let err = LLM::new(MockProvider)
             .user("test")
             .extract::<User>()
             .await
