@@ -4,12 +4,12 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use futures::future::BoxFuture;
 use stakit_ai_sdk::{
-    Agent, AgentCx, AgentError, AgentMiddleware, Approval, AssistantContent, ChatRequest,
-    ChatResponse, EventStream, Finish, Message, PendingToolCall, Provider, ProviderError,
-    StopReason, StreamEvent, Usage, event_stream, tool,
+    Agent, AgentCx, AgentError, AgentMiddleware, Approval, AssistantContent, Finish, Message,
+    PendingToolCall, ProviderError, StopReason, StreamEvent, Usage, event_stream, tool,
 };
+
+use super::mock::{Scripted, stream_of, tool_call};
 
 #[derive(Clone)]
 pub(super) enum Terminal {
@@ -40,69 +40,44 @@ fn effect(
     Ok("done")
 }
 
-struct RecordingProvider {
-    observed: Arc<Observed>,
-    terminal: Terminal,
-}
-
-impl Provider for RecordingProvider {
-    #[expect(
-        clippy::unnecessary_literal_bound,
-        reason = "Provider returns a borrowed model id"
-    )]
-    fn model_id(&self) -> &str {
-        "recording"
-    }
-
-    fn complete(
-        &self,
-        _request: ChatRequest,
-    ) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-
-    fn stream(&self, _request: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        let first = self.observed.requests.fetch_add(1, Ordering::SeqCst) == 0;
-        let terminal = self.terminal.clone();
-        Box::pin(async move {
-            let usage = Usage {
-                input_tokens: 100,
-                output_tokens: 4,
-                ..Usage::zero()
-            };
-            if !first {
-                return Ok(event_stream(vec![
-                    Ok(StreamEvent::TextDelta("finished".into())),
-                    Ok(StreamEvent::End {
-                        stop: StopReason::EndTurn,
-                        usage,
-                    }),
-                ]));
+/// Streams `terminal` on the first request and a plain final answer after.
+fn recording(observed: &Arc<Observed>, terminal: Terminal) -> Scripted {
+    let observed = Arc::clone(observed);
+    Scripted::new("recording", move |_, _| {
+        let first = observed.requests.fetch_add(1, Ordering::SeqCst) == 0;
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 4,
+            ..Usage::zero()
+        };
+        if !first {
+            return Ok(stream_of(vec![
+                StreamEvent::TextDelta("finished".into()),
+                StreamEvent::End {
+                    stop: StopReason::EndTurn,
+                    usage,
+                },
+            ]));
+        }
+        if matches!(terminal, Terminal::Empty) {
+            return Ok(stream_of(Vec::new()));
+        }
+        let mut events = vec![
+            Ok(StreamEvent::Start { usage }),
+            Ok(StreamEvent::TextDelta("partial answer".into())),
+        ];
+        if !matches!(terminal, Terminal::EndWithoutTools(_)) {
+            events.push(Ok(tool_call("effect-1", "effect", "{}")));
+        }
+        match terminal.clone() {
+            Terminal::End(stop) | Terminal::EndWithoutTools(stop) => {
+                events.push(Ok(StreamEvent::End { stop, usage }));
             }
-            if matches!(terminal, Terminal::Empty) {
-                return Ok(event_stream(Vec::new()));
-            }
-            let mut events = vec![
-                Ok(StreamEvent::Start { usage }),
-                Ok(StreamEvent::TextDelta("partial answer".into())),
-            ];
-            if !matches!(terminal, Terminal::EndWithoutTools(_)) {
-                events.push(Ok(StreamEvent::ToolCall {
-                    id: "effect-1".into(),
-                    name: "effect".into(),
-                    arguments: "{}".into(),
-                }));
-            }
-            match terminal {
-                Terminal::End(stop) | Terminal::EndWithoutTools(stop) => {
-                    events.push(Ok(StreamEvent::End { stop, usage }));
-                }
-                Terminal::Error => events.push(Err(ProviderError::Transport("interrupted".into()))),
-                Terminal::Eof | Terminal::Empty => {}
-            }
-            Ok(event_stream(events))
-        })
-    }
+            Terminal::Error => events.push(Err(ProviderError::Transport("interrupted".into()))),
+            Terminal::Eof | Terminal::Empty => {}
+        }
+        Ok(event_stream(events))
+    })
 }
 
 struct ObserveFinish(Arc<Observed>);
@@ -127,10 +102,7 @@ impl AgentMiddleware<Arc<Observed>> for ObserveFinish {
 pub(super) fn scripted(terminal: Terminal) -> (Agent<Arc<Observed>>, Arc<Observed>) {
     let observed = Arc::new(Observed::default());
     let agent = Agent::new(Arc::clone(&observed))
-        .provider(RecordingProvider {
-            observed: Arc::clone(&observed),
-            terminal,
-        })
+        .provider(recording(&observed, terminal))
         .register_tool(effect)
         .register_middleware(ObserveFinish(Arc::clone(&observed)))
         .with_context(vec![Message::user("go")]);

@@ -14,9 +14,10 @@ use stakit_ai_sdk::{
 };
 use stakit_model::{JsonSchema, Model};
 
-type Script = dyn Fn(u32) -> Result<EventStream, ProviderError> + Send + Sync;
+type Script = dyn Fn(u32, &ChatRequest) -> Result<EventStream, ProviderError> + Send + Sync;
 
-/// A provider that answers its n-th (0-based) streaming call with `script(n)`
+/// A provider that answers its n-th (0-based) streaming call with
+/// `script(n, &request)`
 /// and records every request; `complete` is unsupported. Clones share the call
 /// counter and the request log.
 #[derive(Clone)]
@@ -31,7 +32,7 @@ impl Scripted {
     /// Serves `model` with full control over each call's stream (or error).
     pub(crate) fn new(
         model: &'static str,
-        script: impl Fn(u32) -> Result<EventStream, ProviderError> + Send + Sync + 'static,
+        script: impl Fn(u32, &ChatRequest) -> Result<EventStream, ProviderError> + Send + Sync + 'static,
     ) -> Self {
         Self {
             model,
@@ -46,7 +47,7 @@ impl Scripted {
         model: &'static str,
         turn: impl Fn(u32) -> Vec<StreamEvent> + Send + Sync + 'static,
     ) -> Self {
-        Self::new(model, move |call| Ok(stream_of(turn(call))))
+        Self::new(model, move |call, _| Ok(stream_of(turn(call))))
     }
 
     /// Calls `tool` with `arguments` on the first step, then answers `text`.
@@ -86,8 +87,8 @@ impl Provider for Scripted {
     }
 
     fn stream(&self, request: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
+        let turn = (self.script)(self.calls.fetch_add(1, Ordering::SeqCst), &request);
         self.requests.lock().expect("request log").push(request);
-        let turn = (self.script)(self.calls.fetch_add(1, Ordering::SeqCst));
         Box::pin(async move { turn })
     }
 }

@@ -1,17 +1,12 @@
 //! Signed replay uses complete ordered blocks and an immutable request prefix.
 #[path = "provider_signed_replay/fixture.rs"]
 mod fixture;
-use fixture::{Mutation, agent, call, end};
+#[path = "support/mock.rs"]
+mod mock;
+use fixture::{Mutation, agent, assert_ends_turn, assert_stops_without_effects, call, end, signed};
 use serde_json::json;
 use stakit_ai_sdk::{AssistantContent, Finish, Message, StopReason, StreamEvent, Thinking};
-use std::sync::atomic::Ordering;
 
-fn signed(signature: &str) -> AssistantContent {
-    AssistantContent::Thinking(Thinking::Visible {
-        text: "".into(),
-        signature: Some(signature.into()),
-    })
-}
 fn tool_block() -> AssistantContent {
     AssistantContent::ToolUse {
         id: "call-1".into(),
@@ -53,7 +48,7 @@ async fn preserves_separate_empty_signed_redacted_blocks_and_original_order() {
     let (mut agent, observed) = agent(signed_events(), Mutation::None);
     let outcome = agent.run().await.expect("outcome");
     assert!(matches!(outcome.finish, Finish::EndTurn));
-    assert_eq!(observed.effects.load(Ordering::SeqCst), 1);
+    assert_eq!(observed.effect_count(), 1);
     let requests = observed.requests.lock().expect("requests");
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].messages[1], Message::Assistant(replay_blocks()));
@@ -65,12 +60,8 @@ async fn assert_mutation_stops(mutation: Mutation) {
     let (mut agent, observed) = agent(signed_events(), mutation);
     let outcome = agent.run().await.expect("outcome");
     assert!(matches!(outcome.finish, Finish::Stopped { .. }));
-    assert_eq!(
-        observed.requests.lock().expect("requests").len(),
-        1,
-        "invalid signed context sent"
-    );
-    assert_eq!(observed.effects.load(Ordering::SeqCst), 1);
+    assert_eq!(observed.request_count(), 1, "invalid signed context sent");
+    assert_eq!(observed.effect_count(), 1);
     assert_eq!(outcome.usage.input_tokens, 10);
 }
 #[tokio::test]
@@ -95,10 +86,8 @@ async fn signature_deltas_without_complete_blocks_never_dispatch() {
         end(StopReason::ToolUse),
     ];
     let (mut agent, observed) = agent(events, Mutation::None);
-    let outcome = agent.run().await.expect("outcome");
-    assert!(matches!(outcome.finish, Finish::Stopped { .. }));
-    assert_eq!(observed.effects.load(Ordering::SeqCst), 0);
-    assert_eq!(observed.requests.lock().expect("requests").len(), 1);
+    assert_stops_without_effects(&mut agent, &observed).await;
+    assert_eq!(observed.request_count(), 1);
     assert_eq!(agent.messages().len(), 1);
 }
 
@@ -113,9 +102,7 @@ async fn incomplete_complete_tool_protocol_never_dispatches() {
         end(StopReason::ToolUse),
     ];
     let (mut agent, observed) = agent(events, Mutation::None);
-    let outcome = agent.run().await.expect("outcome");
-    assert!(matches!(outcome.finish, Finish::Stopped { .. }));
-    assert_eq!(observed.effects.load(Ordering::SeqCst), 0);
+    assert_stops_without_effects(&mut agent, &observed).await;
 }
 
 #[tokio::test]
@@ -126,11 +113,8 @@ async fn preloaded_signed_history_is_trusted_with_original_context() {
         Message::Assistant(vec![signed("preloaded")]),
         Message::user("continue"),
     ]);
-    assert!(matches!(
-        agent.run().await.expect("outcome").finish,
-        Finish::EndTurn
-    ));
-    assert_eq!(observed.requests.lock().expect("requests").len(), 1);
+    assert_ends_turn(&mut agent).await;
+    assert_eq!(observed.request_count(), 1);
 }
 
 #[tokio::test]
@@ -140,13 +124,13 @@ async fn signed_context_remains_bound_across_runs() {
         agent.run().await.expect("first outcome").finish,
         Finish::EndTurn
     ));
-    assert_eq!(observed.requests.lock().expect("requests").len(), 2);
+    assert_eq!(observed.request_count(), 2);
     agent = agent.system("changed between runs");
     assert!(matches!(
         agent.run().await.expect("second outcome").finish,
         Finish::Stopped { .. }
     ));
-    assert_eq!(observed.requests.lock().expect("requests").len(), 2);
+    assert_eq!(observed.request_count(), 2);
 }
 
 #[tokio::test]
@@ -160,5 +144,5 @@ async fn signed_context_allows_new_appended_turns() {
         agent.run().await.expect("second outcome").finish,
         Finish::EndTurn
     ));
-    assert_eq!(observed.requests.lock().expect("requests").len(), 3);
+    assert_eq!(observed.request_count(), 3);
 }

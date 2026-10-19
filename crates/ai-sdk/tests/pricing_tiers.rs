@@ -4,12 +4,14 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use futures::future::BoxFuture;
 use stakit_ai_sdk::{
-    Agent, AgentCx, AgentError, AgentMiddleware, ChatRequest, ChatResponse, EventStream, Flow,
-    Message, ModelPrice, Pricing, Provider, ProviderError, StopReason, StreamEvent, Usage,
-    event_stream, tool,
+    Agent, AgentCx, AgentError, AgentMiddleware, Flow, Message, ModelPrice, Pricing, ProviderError,
+    StreamEvent, Usage, event_stream, tool,
 };
+
+#[path = "support/mock.rs"]
+mod mock;
+use mock::{Scripted, stream_of, text_turn, tool_turn};
 
 const BASE: ModelPrice = ModelPrice {
     input: 0.10,
@@ -105,63 +107,36 @@ fn next_step() -> Result<&'static str, ToolError> {
     Ok("ok")
 }
 
-struct TwoRequests {
-    model: String,
-    calls: Arc<AtomicUsize>,
+/// Calls `next_step` on the run's first request (counted in `calls`, which
+/// providers may share), then answers; each request reports its own input.
+fn two_requests(
+    model: &'static str,
+    calls: &Arc<AtomicUsize>,
     first: u64,
     second: u64,
-}
-
-impl Provider for TwoRequests {
-    fn model_id(&self) -> &str {
-        &self.model
-    }
-
-    fn complete(
-        &self,
-        _request: ChatRequest,
-    ) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-
-    fn stream(&self, _request: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
-        let input_tokens = if first { self.first } else { self.second };
-        Box::pin(async move {
-            let mut events = Vec::new();
-            if first {
-                events.push(Ok(StreamEvent::ToolCall {
-                    id: "call-1".into(),
-                    name: "next_step".into(),
-                    arguments: "{}".into(),
-                }));
-            } else {
-                events.push(Ok(StreamEvent::TextDelta("done".into())));
-            }
-            events.push(Ok(StreamEvent::End {
-                stop: if first {
-                    StopReason::ToolUse
-                } else {
-                    StopReason::EndTurn
-                },
-                usage: Usage {
-                    input_tokens,
-                    ..Usage::zero()
-                },
-            }));
-            Ok(event_stream(events))
-        })
-    }
+) -> Scripted {
+    let calls = Arc::clone(calls);
+    Scripted::new(model, move |_, _| {
+        let is_first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+        let usage = Usage {
+            input_tokens: if is_first { first } else { second },
+            ..Usage::zero()
+        };
+        let mut events = if is_first {
+            tool_turn("call-1", "next_step", "{}")
+        } else {
+            text_turn("done")
+        };
+        if let Some(StreamEvent::End { usage: end, .. }) = events.last_mut() {
+            *end = usage;
+        }
+        Ok(stream_of(events))
+    })
 }
 
 async fn run_cost(first: u64, second: u64) -> f64 {
     let mut agent = Agent::new(())
-        .provider(TwoRequests {
-            model: "tiered".to_owned(),
-            calls: Arc::default(),
-            first,
-            second,
-        })
+        .provider(two_requests("tiered", &Arc::default(), first, second))
         .pricing(pricing())
         .register_tool(next_step)
         .with_context(vec![Message::user("go")]);
@@ -193,18 +168,8 @@ impl AgentMiddleware<()> for SwitchAfterTool {
 async fn switched_cost(prices: Pricing) -> Option<f64> {
     let calls = Arc::default();
     let mut agent = Agent::new(())
-        .provider(TwoRequests {
-            model: "first".to_owned(),
-            calls: Arc::clone(&calls),
-            first: 60_000,
-            second: 40_000,
-        })
-        .register_provider(TwoRequests {
-            model: "second".to_owned(),
-            calls,
-            first: 60_000,
-            second: 40_000,
-        })
+        .provider(two_requests("first", &calls, 60_000, 40_000))
+        .register_provider(two_requests("second", &calls, 60_000, 40_000))
         .pricing(prices)
         .register_tool(next_step)
         .register_middleware(SwitchAfterTool)
@@ -246,42 +211,26 @@ async fn a_consumed_unpriced_request_keeps_the_total_unknown_after_a_model_switc
     );
 }
 
-struct Interrupted;
-
-impl Provider for Interrupted {
-    #[expect(
-        clippy::unnecessary_literal_bound,
-        reason = "Provider trait returns a borrowed model id"
-    )]
-    fn model_id(&self) -> &str {
-        "tiered"
-    }
-    fn complete(
-        &self,
-        _request: ChatRequest,
-    ) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-    fn stream(&self, _request: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        Box::pin(async {
-            Ok(event_stream(vec![
-                Ok(StreamEvent::Start {
-                    usage: Usage {
-                        input_tokens: 100_001,
-                        output_tokens: 1000,
-                        ..Usage::zero()
-                    },
-                }),
-                Err(ProviderError::Transport("interrupted".to_owned())),
-            ]))
-        })
-    }
+/// Reports long-prompt progress, then fails mid-stream.
+fn interrupted() -> Scripted {
+    Scripted::new("tiered", |_, _| {
+        Ok(event_stream(vec![
+            Ok(StreamEvent::Start {
+                usage: Usage {
+                    input_tokens: 100_001,
+                    output_tokens: 1000,
+                    ..Usage::zero()
+                },
+            }),
+            Err(ProviderError::Transport("interrupted".to_owned())),
+        ]))
+    })
 }
 
 #[tokio::test]
 async fn an_interrupted_request_is_metered_at_its_own_long_prompt_rate() {
     let mut agent = Agent::new(())
-        .provider(Interrupted)
+        .provider(interrupted())
         .pricing(pricing())
         .with_context(vec![Message::user("go")]);
     let cost = agent.run().await.unwrap().cost.unwrap();

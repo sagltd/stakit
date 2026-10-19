@@ -466,7 +466,7 @@ async fn malformed_tool_args_yield_error_not_empty_call() {
 /// loop forwards each event live, not buffered until the turn ends.
 fn dripple(produced: &Arc<AtomicU32>) -> Scripted {
     let produced = Arc::clone(produced);
-    Scripted::new("ripple", move |_| {
+    Scripted::new("ripple", move |_, _| {
         let produced = Arc::clone(&produced);
         Ok(async_stream::stream! {
             for part in ["a", "b", "c"] {

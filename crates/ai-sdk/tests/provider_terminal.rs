@@ -1,6 +1,8 @@
 //! Only a complete tool-use turn authorizes effects, never refusal or truncation.
 #[path = "provider_terminal/fixture.rs"]
 mod fixture;
+#[path = "support/mock.rs"]
+mod mock;
 
 use fixture::{Terminal, assert_terminal_is_safe, scripted};
 use futures::StreamExt as _;

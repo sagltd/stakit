@@ -118,6 +118,8 @@ fn metadata_and_thirty_minute_ttl_round_trip() {
 
 #[path = "provider_signed_replay/fixture.rs"]
 mod fixture;
+#[path = "support/mock.rs"]
+mod mock;
 
 #[tokio::test]
 async fn agent_rejects_undeclared_explicit_cache_before_transport() {

@@ -1,8 +1,13 @@
-use futures::future::BoxFuture;
+#![allow(
+    dead_code,
+    reason = "Shared fixture is included by suites using different subsets"
+)]
 use stakit_ai_sdk::{
-    Agent, AgentCx, AgentError, AgentMiddleware, ChatRequest, ChatResponse, EventStream, Flow,
-    Message, Provider, ProviderError, StopReason, StreamEvent, Usage, event_stream, tool,
+    Agent, AgentCx, AgentError, AgentMiddleware, AssistantContent, ChatRequest, Finish, Flow,
+    Message, Outcome, StopReason, StreamEvent, Thinking, Usage, tool,
 };
+
+use super::mock::{Scripted, stream_of};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -14,11 +19,19 @@ pub(super) struct Observed {
     pub(super) effects: AtomicUsize,
 }
 
+impl Observed {
+    /// How many requests the providers received.
+    pub(super) fn request_count(&self) -> usize {
+        self.requests.lock().expect("requests").len()
+    }
+
+    /// How many times the effect tool ran.
+    pub(super) fn effect_count(&self) -> usize {
+        self.effects.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "Shared fixture is included by suites using different mutation subsets"
-)]
 pub(super) enum Mutation {
     None,
     System,
@@ -53,36 +66,24 @@ fn effect(
     Ok("done")
 }
 
-struct RecordingProvider {
-    observed: Arc<Observed>,
-    first: Vec<StreamEvent>,
-    model: &'static str,
-}
-impl Provider for RecordingProvider {
-    fn model_id(&self) -> &str {
-        self.model
-    }
-    fn complete(
-        &self,
-        _request: ChatRequest,
-    ) -> BoxFuture<'_, Result<ChatResponse, ProviderError>> {
-        Box::pin(async { Err(ProviderError::Cancelled) })
-    }
-    fn stream(&self, request: ChatRequest) -> BoxFuture<'_, Result<EventStream, ProviderError>> {
-        let mut requests = self.observed.requests.lock().expect("requests");
-        let first = requests.is_empty();
-        requests.push(request);
+/// Serves `model`, logging every request in `observed`; the run's first
+/// request (across providers) gets `first`, later ones a final answer.
+fn recording(observed: &Arc<Observed>, first: Vec<StreamEvent>, model: &'static str) -> Scripted {
+    let observed = Arc::clone(observed);
+    Scripted::new(model, move |_, request| {
+        let mut requests = observed.requests.lock().expect("requests");
+        let is_first = requests.is_empty();
+        requests.push(request.clone());
         drop(requests);
-        let events = if first {
-            self.first.clone()
+        Ok(stream_of(if is_first {
+            first.clone()
         } else {
             vec![
                 StreamEvent::TextDelta("done".into()),
                 end(StopReason::EndTurn),
             ]
-        };
-        Box::pin(async move { Ok(event_stream(events.into_iter().map(Ok).collect())) })
-    }
+        }))
+    })
 }
 
 pub(super) const fn end(stop: StopReason) -> StreamEvent {
@@ -108,19 +109,40 @@ pub(super) fn agent(
 ) -> (Agent<Arc<Observed>>, Arc<Observed>) {
     let observed = Arc::new(Observed::default());
     let agent = Agent::new(Arc::clone(&observed))
-        .provider(RecordingProvider {
-            observed: Arc::clone(&observed),
-            first: events,
-            model: "recording",
-        })
-        .register_provider(RecordingProvider {
-            observed: Arc::clone(&observed),
-            first: vec![],
-            model: "replacement",
-        })
+        .provider(recording(&observed, events, "recording"))
+        .register_provider(recording(&observed, vec![], "replacement"))
         .system("original system")
         .register_tool(effect)
         .register_middleware(Mutate(mutation))
         .with_context(vec![Message::user("original prefix")]);
     (agent, observed)
+}
+
+/// An empty visible thinking block carrying `signature`.
+pub(super) fn signed(signature: &str) -> AssistantContent {
+    AssistantContent::Thinking(Thinking::Visible {
+        text: "".into(),
+        signature: Some(signature.into()),
+    })
+}
+
+/// Runs `agent`, asserting it ends its turn.
+pub(super) async fn assert_ends_turn(agent: &mut Agent<Arc<Observed>>) {
+    let finish = agent.run().await.expect("outcome").finish;
+    assert!(matches!(finish, Finish::EndTurn), "{finish:?}");
+}
+
+/// Runs `agent`, asserting it stops before the effect tool ever runs.
+pub(super) async fn assert_stops_without_effects(
+    agent: &mut Agent<Arc<Observed>>,
+    observed: &Observed,
+) -> Outcome {
+    let outcome = agent.run().await.expect("outcome");
+    assert!(
+        matches!(outcome.finish, Finish::Stopped { .. }),
+        "{:?}",
+        outcome.finish
+    );
+    assert_eq!(observed.effect_count(), 0);
+    outcome
 }

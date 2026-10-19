@@ -20,7 +20,7 @@ use mock::{Scripted, assert_stopped, stream_of, text_turn};
 // ── flaky: transient failures for the first N calls ──────────────────────────
 
 fn flaky(fail_times: u32) -> Scripted {
-    Scripted::new("flaky", move |call| {
+    Scripted::new("flaky", move |call, _| {
         if call < fail_times {
             return Err(ProviderError::Transport("transient error".into()));
         }
@@ -32,13 +32,13 @@ fn flaky(fail_times: u32) -> Scripted {
 
 fn hanging() -> Scripted {
     // The first event never arrives — the per-attempt timeout must cut it.
-    Scripted::new("hanging", |_| Ok(futures::stream::pending().boxed()))
+    Scripted::new("hanging", |_, _| Ok(futures::stream::pending().boxed()))
 }
 
 // ── fatal: always returns 400 ────────────────────────────────────────────────
 
 fn fatal() -> Scripted {
-    Scripted::new("fatal", |_| {
+    Scripted::new("fatal", |_, _| {
         Err(ProviderError::Api {
             status: 400,
             kind: "invalid_request_error".into(),
@@ -51,7 +51,7 @@ fn fatal() -> Scripted {
 // ── rate_limited_once: a 429 with Retry-After on the first call, then success ─
 
 fn rate_limited_once(retry_after: Duration) -> Scripted {
-    Scripted::new("ratelimited", move |call| {
+    Scripted::new("ratelimited", move |call, _| {
         if call == 0 {
             return Err(ProviderError::Api {
                 status: 429,
