@@ -348,80 +348,24 @@ async fn end_to_end_against_real_postgres() {
     postgres.stop().await.ok();
 }
 
-#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    A,
-    B,
-}
-
-#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
-#[db_enum(int)]
-enum Rank {
-    Low = 1,
-    High = 9,
-}
-
-#[derive(Table, Debug)]
-#[table(name = "pg_things")]
-#[allow(dead_code)]
-struct PgThing {
-    #[column(pk)]
-    id: i64,
-    #[column(sql_type = "text")]
-    kind: Kind,
-    #[column(sql_type = "int")]
-    rank: Rank,
-    at: chrono::DateTime<chrono::Utc>,
-    local: chrono::NaiveDateTime,
-    day: chrono::NaiveDate,
-    alarm: chrono::NaiveTime,
-    meta: serde_json::Value,
-}
+#[path = "support/things.rs"]
+mod things;
 
 /// Native Postgres temporal types (timestamptz/timestamp/date/time), jsonb, and
 /// `#[derive(DbEnum)]` (text + int) — round-tripped against real Postgres.
 #[tokio::test]
 async fn postgres_enums_temporal_json_native() {
-    use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
     let (postgres, db) = setup().await;
 
     db.raw(
-        "create table pg_things (id bigint primary key, kind text not null, rank int not null, \
+        "create table things (id bigint primary key, kind text not null, rank int not null, \
          at timestamptz not null, local timestamp not null, day date not null, \
          alarm time not null, meta jsonb not null)",
     )
     .exec()
     .await
-    .expect("create pg_things");
-
-    let at = Utc.with_ymd_and_hms(2026, 6, 2, 8, 30, 0).unwrap();
-    let day = NaiveDate::from_ymd_opt(1990, 1, 15).unwrap();
-    let alarm = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
-    let local = day.and_hms_opt(8, 30, 0).unwrap();
-    let meta = serde_json::json!({ "k": [1, 2, 3], "ok": true });
-
-    db.insert(PgThingNew {
-        id: 1,
-        kind: Kind::B,
-        rank: Rank::High,
-        at,
-        local,
-        day,
-        alarm,
-        meta: meta.clone(),
-    })
-    .exec()
-    .await
-    .expect("insert pg_thing");
-
-    let got = db.get::<PgThing>(1).one().await.unwrap().unwrap();
-    assert_eq!(got.kind, Kind::B);
-    assert_eq!(got.rank, Rank::High);
-    assert_eq!(got.at, at);
-    assert_eq!(got.local, local);
-    assert_eq!(got.day, day);
-    assert_eq!(got.alarm, alarm);
-    assert_eq!(got.meta, meta);
+    .expect("create things");
+    things::assert_round_trips(&db).await;
 
     // FK ON DELETE CASCADE against real Postgres (users <- posts, defined in setup).
     let owner = uuid::Uuid::new_v4();
@@ -688,123 +632,30 @@ fn postgis_gist_index_ddl_renders_using_gist() {
 // row per device, refreshes chosen columns, and `set_coalesce(location)` preserves a
 // previously-learned location when a later login's location is still NULL.
 
-#[derive(Table, Debug)]
-#[table(name = "pg_login_devices")]
-#[allow(dead_code)]
-struct PgLoginDevice {
-    #[column(pk)]
-    id: i64,
-    user_id: i64,
-    device_id: String,
-    platform: String,
-    #[column(nullable)]
-    location: Option<String>,
-}
+#[path = "support/devices.rs"]
+mod devices;
+use devices::LoginDevice;
 
 #[tokio::test]
 async fn upsert_composite_key_coalesce_remembers_device_on_postgres() {
-    async fn remember(db: &Db, row: PgLoginDeviceNew) -> stakit_orm::Result<u64> {
-        db.insert(row)
-            .on_conflict((PgLoginDevice::user_id, PgLoginDevice::device_id))
-            .set(PgLoginDevice::platform)
-            .set_coalesce(PgLoginDevice::location)
-            .exec()
-            .await
-    }
-
     let (postgres, db) = setup().await;
     db.raw(
-        "create table pg_login_devices (id bigint primary key, user_id bigint not null, \
+        "create table login_devices (id bigint primary key, user_id bigint not null, \
          device_id text not null, platform text not null, location text, \
          unique(user_id, device_id))",
     )
     .exec()
     .await
-    .expect("create pg_login_devices");
-
-    // Mon: first login, location NULL.
-    remember(
-        &db,
-        PgLoginDeviceNew {
-            id: 1,
-            user_id: 7,
-            device_id: "phone".to_owned(),
-            platform: "ios-16".to_owned(),
-            location: None,
-        },
-    )
-    .await
-    .unwrap();
-    db.raw("update pg_login_devices set location = 'Berlin' where id = 1")
-        .exec()
-        .await
-        .unwrap();
-
-    // Tue: same device, platform refreshed, location still NULL -> Berlin preserved.
-    remember(
-        &db,
-        PgLoginDeviceNew {
-            id: 2,
-            user_id: 7,
-            device_id: "phone".to_owned(),
-            platform: "ios-17".to_owned(),
-            location: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let rows = db
-        .find::<PgLoginDevice>()
-        .order_by(asc(PgLoginDevice::id))
-        .all()
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1, "one row per (user, device)");
-    assert_eq!(rows[0].id, 1, "existing row updated in place");
-    assert_eq!(rows[0].platform, "ios-17", "platform refreshed");
-    assert_eq!(
-        rows[0].location.as_deref(),
-        Some("Berlin"),
-        "coalesce kept the learned location"
-    );
-
-    // Wed: a resolved location overwrites.
-    remember(
-        &db,
-        PgLoginDeviceNew {
-            id: 3,
-            user_id: 7,
-            device_id: "phone".to_owned(),
-            platform: "ios-17".to_owned(),
-            location: Some("Munich".to_owned()),
-        },
-    )
-    .await
-    .unwrap();
-    let one = db
-        .find::<PgLoginDevice>()
-        .filter(eq(PgLoginDevice::id, 1_i64))
-        .one()
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(one.location.as_deref(), Some("Munich"));
-    assert_eq!(db.find::<PgLoginDevice>().count().await.unwrap(), 1);
+    .expect("create login_devices");
+    devices::assert_remembers_device(&db).await;
 
     // on_conflict + RETURNING: an upsert that conflicts updates in place and returns
     // the surviving row's id (proves the conflict clause precedes RETURNING).
     let returned: i64 = db
-        .insert(PgLoginDeviceNew {
-            id: 99,
-            user_id: 7,
-            device_id: "phone".to_owned(),
-            platform: "ios-18".to_owned(),
-            location: None,
-        })
-        .on_conflict((PgLoginDevice::user_id, PgLoginDevice::device_id))
-        .set(PgLoginDevice::platform)
-        .returning(PgLoginDevice::id)
+        .insert(devices::login(99, "phone", "ios-18", None))
+        .on_conflict((LoginDevice::user_id, LoginDevice::device_id))
+        .set(LoginDevice::platform)
+        .returning(LoginDevice::id)
         .one()
         .await
         .unwrap();
@@ -812,7 +663,7 @@ async fn upsert_composite_key_coalesce_remembers_device_on_postgres() {
         returned, 1,
         "RETURNING yields the existing row id on conflict-update"
     );
-    assert_eq!(db.find::<PgLoginDevice>().count().await.unwrap(), 1);
+    assert_eq!(db.find::<LoginDevice>().count().await.unwrap(), 1);
 
     postgres.stop().await.ok();
 }

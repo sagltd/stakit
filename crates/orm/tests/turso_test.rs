@@ -12,65 +12,29 @@
 
 use stakit_orm::prelude::*;
 
-#[derive(Table, Debug, PartialEq, Eq)]
-#[table(name = "users")]
-struct User {
-    #[column(pk)]
-    id: i64,
-    #[column(unique)]
-    email: String,
-    name: String,
-    age: i32,
-}
+#[path = "support/users.rs"]
+mod users;
+use users::{User, user};
 
 async fn setup() -> Db {
     let db = Db::connect_turso_local(":memory:")
         .await
         .expect("open libsql memory");
-    db.raw(
-        "create table users (\
-            id integer primary key, \
-            email text not null unique, \
-            name text not null, \
-            age integer not null)",
-    )
-    .exec()
-    .await
-    .expect("create table");
+    db.raw(users::SQLITE_USERS_DDL)
+        .exec()
+        .await
+        .expect("create table");
     db
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn end_to_end_against_turso() {
     let db = setup().await;
-
-    db.insert_many(vec![
-        UserNew {
-            id: 1,
-            email: "alice@x.com".to_owned(),
-            name: "Alice".to_owned(),
-            age: 30,
-        },
-        UserNew {
-            id: 2,
-            email: "bob@x.com".to_owned(),
-            name: "Bob".to_owned(),
-            age: 25,
-        },
-    ])
-    .exec()
-    .await
-    .expect("seed");
+    users::seed_alice_bob(&db).await;
 
     // insert + RETURNING (libSQL supports it).
     let created = db
-        .insert(UserNew {
-            id: 3,
-            email: "carol@x.com".to_owned(),
-            name: "Carol".to_owned(),
-            age: 40,
-        })
+        .insert(user(3, "Carol", 40))
         .returning((User::id, User::name))
         .one()
         .await
@@ -78,15 +42,7 @@ async fn end_to_end_against_turso() {
     assert_eq!(created, (3, "Carol".to_owned()));
 
     // whole-row select.
-    let fetched = db
-        .select(User::all())
-        .from::<User>()
-        .filter(eq(User::id, 1_i64))
-        .one()
-        .await
-        .expect("select one")
-        .expect("present");
-    assert_eq!(fetched.email, "alice@x.com");
+    users::select_alice(&db).await;
 
     // ordered + partial projection.
     let names = db
@@ -99,18 +55,10 @@ async fn end_to_end_against_turso() {
     assert_eq!(names, vec!["Carol", "Alice", "Bob"]);
 
     // any_of -> IN (?, ?).
-    let some = db
-        .select(User::all())
-        .from::<User>()
-        .filter(any_of(User::id, &[1_i64, 3]))
-        .all()
-        .await
-        .unwrap();
-    assert_eq!(some.len(), 2);
+    assert_eq!(users::users_in(&db, &[1, 3]).await.len(), 2);
 
     // aggregate + count.
-    let count = db.select(User::all()).from::<User>().count().await.unwrap();
-    assert_eq!(count, 3);
+    assert_eq!(users::user_count(&db).await, 3);
     let oldest = db
         .select(max(User::age))
         .from::<User>()
@@ -119,73 +67,19 @@ async fn end_to_end_against_turso() {
         .unwrap();
     assert_eq!(oldest, Some(Some(40)));
 
-    // update.
-    db.update::<User>()
-        .set(User::age, 31)
-        .filter(eq(User::id, 1_i64))
-        .exec()
-        .await
-        .unwrap();
-    let age = db
-        .select(User::age)
-        .from::<User>()
-        .filter(eq(User::id, 1_i64))
-        .one()
-        .await
-        .unwrap();
-    assert_eq!(age, Some(31));
-
-    // transaction rollback.
-    let result: Result<()> = db
-        .transaction(|tx| async move {
-            tx.insert(UserNew {
-                id: 4,
-                email: "dave@x.com".to_owned(),
-                name: "Dave".to_owned(),
-                age: 50,
-            })
-            .exec()
-            .await?;
-            Err(Error::Transaction("rollback"))
-        })
-        .await;
-    assert!(result.is_err());
-    assert_eq!(
-        db.select(User::all()).from::<User>().count().await.unwrap(),
-        3,
-        "rolled-back insert must not persist"
-    );
-
-    // delete.
-    let deleted = db
-        .delete::<User>()
-        .filter(eq(User::id, 2_i64))
-        .exec()
-        .await
-        .unwrap();
-    assert_eq!(deleted, 1);
-    assert_eq!(
-        db.select(User::all()).from::<User>().count().await.unwrap(),
-        2
-    );
+    users::assert_updates_alice_age(&db).await;
+    users::assert_failed_transaction_rolls_back(&db, user(4, "Dave", 50), 3).await;
+    users::assert_deletes_bob(&db, 2).await;
 }
 
-#[derive(Table, Debug, Clone, PartialEq, Eq)]
-#[table(name = "authors")]
-struct Author {
-    #[column(pk)]
-    id: i64,
-    name: String,
-}
+#[path = "support/blog.rs"]
+mod blog;
+use blog::Post;
 
-#[derive(Table, Debug, PartialEq, Eq)]
-#[table(name = "posts")]
-struct Post {
-    #[column(pk)]
-    id: i64,
-    #[column(references = Author::id)]
-    author_id: i64,
-    views: i32,
+async fn setup_blog() -> Db {
+    let db = Db::connect_turso_local(":memory:").await.expect("open");
+    blog::create_and_seed(&db, &blog::SQLITE_BLOG_DDL).await;
+    db
 }
 
 /// Joins (multi-table positional decode) + grouped aggregate on the non-sqlx
@@ -193,63 +87,24 @@ struct Post {
 #[tokio::test]
 async fn turso_joins_and_grouping() {
     use futures::StreamExt as _;
-    let db = Db::connect_turso_local(":memory:").await.expect("open");
-    db.raw("create table authors (id integer primary key, name text not null)")
-        .exec()
-        .await
-        .unwrap();
-    db.raw(
-        "create table posts (id integer primary key, author_id integer not null \
-         references authors(id), views integer not null)",
-    )
-    .exec()
-    .await
-    .unwrap();
-    db.insert(AuthorNew {
-        id: 1,
-        name: "Ann".to_owned(),
-    })
-    .exec()
-    .await
-    .unwrap();
-    db.insert_many(vec![
-        PostNew {
-            id: 1,
-            author_id: 1,
-            views: 4,
-        },
-        PostNew {
-            id: 2,
-            author_id: 1,
-            views: 6,
-        },
-    ])
-    .exec()
-    .await
-    .unwrap();
+    let db = setup_blog().await;
 
     // inner join whole-row tuple (Post, Author) decoded positionally via libsql.
-    let joined: Vec<(Post, Author)> = db
-        .select((Post::all(), Author::all()))
-        .from::<Post>()
-        .inner_join::<Author>(eq(Post::author_id, Author::id))
-        .order_by(asc(Post::id))
-        .all()
-        .await
-        .expect("join");
-    assert_eq!(joined.len(), 2);
+    let joined = blog::posts_with_authors(&db).await;
+    assert_eq!(joined.len(), 3);
     assert_eq!(joined[0].1.name, "Ann");
 
-    // group_by + sum aggregate.
+    // group_by + sum aggregate (Ann's group).
     let total: Option<i64> = db
         .select(stakit_orm::sum::<Option<i64>, _, _>(Post::views))
         .from::<Post>()
+        .filter(eq(Post::author_id, 1_i64))
         .group_by(Post::author_id)
         .one()
         .await
         .expect("sum")
         .flatten();
-    assert_eq!(total, Some(10));
+    assert_eq!(total, Some(15));
 
     // streaming on libSQL.
     let stream = db.find::<Post>().stream();
@@ -259,7 +114,7 @@ async fn turso_joins_and_grouping() {
         r.expect("row");
         n += 1;
     }
-    assert_eq!(n, 2);
+    assert_eq!(n, 3);
 }
 
 /// Universal migrations run out-of-box on the non-sqlx libSQL backend too.
@@ -295,157 +150,27 @@ struct Item {
 /// `has_many` / `belongs_to` batched relations on the non-sqlx `libSQL` backend.
 #[tokio::test]
 async fn turso_relations() {
-    let db = Db::connect_turso_local(":memory:").await.expect("open");
-    db.raw("create table authors (id integer primary key, name text not null)")
-        .exec()
-        .await
-        .unwrap();
-    db.raw(
-        "create table posts (id integer primary key, author_id integer not null \
-         references authors(id), views integer not null)",
-    )
-    .exec()
-    .await
-    .unwrap();
-    db.insert_many(vec![
-        AuthorNew {
-            id: 1,
-            name: "Ann".to_owned(),
-        },
-        AuthorNew {
-            id: 2,
-            name: "Bo".to_owned(),
-        },
-    ])
-    .exec()
-    .await
-    .unwrap();
-    db.insert_many(vec![
-        PostNew {
-            id: 1,
-            author_id: 1,
-            views: 4,
-        },
-        PostNew {
-            id: 2,
-            author_id: 1,
-            views: 6,
-        },
-        PostNew {
-            id: 3,
-            author_id: 2,
-            views: 1,
-        },
-    ])
-    .exec()
-    .await
-    .unwrap();
-
-    let authors = db
-        .find::<Author>()
-        .order_by(asc(Author::id))
-        .all()
-        .await
-        .unwrap();
-    let with_posts = db
-        .load_has_many::<Author, Post, i64>(authors, Post::author_id, |a| a.id, |p| p.author_id)
-        .await
-        .expect("has_many");
-    assert_eq!(with_posts[0].1.len(), 2);
-    assert_eq!(with_posts[1].1.len(), 1);
-
-    let posts = db
-        .find::<Post>()
-        .order_by(asc(Post::id))
-        .all()
-        .await
-        .unwrap();
-    let with_author = db
-        .load_belongs_to::<Post, Author, i64>(posts, |p| p.author_id, Author::id, |a| a.id)
-        .await
-        .expect("belongs_to");
-    assert_eq!(with_author[0].1.as_ref().unwrap().name, "Ann");
-    assert_eq!(with_author[2].1.as_ref().unwrap().name, "Bo");
+    let db = setup_blog().await;
+    blog::assert_has_many_and_belongs_to(&db).await;
 }
 
-#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    A,
-    B,
-}
-
-#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
-#[db_enum(int)]
-enum Rank {
-    Low = 1,
-    High = 9,
-}
-
-#[derive(Table, Debug, PartialEq)]
-#[table(name = "things")]
-struct Thing {
-    #[column(pk)]
-    id: i64,
-    #[column(sql_type = "text")]
-    kind: Kind,
-    #[column(sql_type = "int")]
-    rank: Rank,
-    at: chrono::DateTime<chrono::Utc>,
-    day: chrono::NaiveDate,
-    alarm: chrono::NaiveTime,
-    local: chrono::NaiveDateTime,
-    #[column(sql_type = "text")]
-    meta: serde_json::Value,
-}
+#[path = "support/things.rs"]
+mod things;
 
 /// Enums (string + int), all chrono temporal types, and JSON on the non-sqlx
 /// libSQL backend (stored as TEXT/INTEGER and round-tripped).
 #[tokio::test]
 async fn turso_enums_temporal_json() {
-    use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
     let db = Db::connect_turso_local(":memory:").await.expect("open");
-    db.raw("create table things (id integer primary key, kind text not null, rank integer not null, at text not null, day text not null, alarm text not null, local text not null, meta text not null)")
-        .exec()
-        .await
-        .unwrap();
-
-    let at = Utc.with_ymd_and_hms(2026, 6, 2, 8, 30, 0).unwrap();
-    let day = NaiveDate::from_ymd_opt(1990, 1, 15).unwrap();
-    let alarm = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
-    let local = day.and_hms_opt(8, 30, 0).unwrap();
-    let meta = serde_json::json!({ "k": [1, 2, 3] });
-
-    db.insert(ThingNew {
-        id: 1,
-        kind: Kind::B,
-        rank: Rank::High,
-        at,
-        day,
-        alarm,
-        local,
-        meta: meta.clone(),
-    })
+    db.raw(
+        "create table things (id integer primary key, kind text not null, rank integer not null, \
+         at text not null, day text not null, alarm text not null, local text not null, \
+         meta text not null)",
+    )
     .exec()
     .await
     .unwrap();
-
-    let got = db.get::<Thing>(1).one().await.unwrap().unwrap();
-    assert_eq!(got.kind, Kind::B);
-    assert_eq!(got.rank, Rank::High);
-    assert_eq!(got.at, at);
-    assert_eq!(got.day, day);
-    assert_eq!(got.alarm, alarm);
-    assert_eq!(got.local, local);
-    assert_eq!(got.meta, meta);
-
-    // filter on enum columns
-    let highs = db
-        .find::<Thing>()
-        .filter(eq(Thing::rank, Rank::High))
-        .all()
-        .await
-        .unwrap();
-    assert_eq!(highs.len(), 1);
+    things::assert_round_trips(&db).await;
 }
 
 #[derive(Table, Debug)]
@@ -638,75 +363,14 @@ async fn turso_fts5_match() {
 // end-to-end on the non-sqlx engine: one row per (user_id, device_id), and
 // `set_coalesce` preserves a learned location across a later NULL-location login.
 
-#[derive(Table, Debug)]
-#[table(name = "tt_login_devices")]
-#[allow(dead_code)]
-struct TtLoginDevice {
-    #[column(pk)]
-    id: i64,
-    user_id: i64,
-    #[column(sql_type = "text")]
-    device_id: String,
-    platform: String,
-    #[column(nullable)]
-    location: Option<String>,
-}
+#[path = "support/devices.rs"]
+mod devices;
 
 #[tokio::test]
 async fn upsert_composite_key_coalesce_remembers_device_on_turso() {
-    async fn remember(db: &Db, row: TtLoginDeviceNew) -> stakit_orm::Result<u64> {
-        db.insert(row)
-            .on_conflict((TtLoginDevice::user_id, TtLoginDevice::device_id))
-            .set(TtLoginDevice::platform)
-            .set_coalesce(TtLoginDevice::location)
-            .exec()
-            .await
-    }
-
     let db = Db::connect_turso_local(":memory:").await.expect("open");
-    db.raw(
-        "create table tt_login_devices (id integer primary key, user_id integer not null, \
-         device_id text not null, platform text not null, location text, \
-         unique(user_id, device_id))",
-    )
-    .exec()
-    .await
-    .expect("create");
-
-    remember(
-        &db,
-        TtLoginDeviceNew {
-            id: 1,
-            user_id: 7,
-            device_id: "phone".to_owned(),
-            platform: "ios-16".to_owned(),
-            location: None,
-        },
-    )
-    .await
-    .unwrap();
-    db.raw("update tt_login_devices set location = 'Berlin' where id = 1")
-        .exec()
-        .await
-        .unwrap();
-    remember(
-        &db,
-        TtLoginDeviceNew {
-            id: 2,
-            user_id: 7,
-            device_id: "phone".to_owned(),
-            platform: "ios-17".to_owned(),
-            location: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let rows = db.find::<TtLoginDevice>().all().await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].id, 1);
-    assert_eq!(rows[0].platform, "ios-17");
-    assert_eq!(rows[0].location.as_deref(), Some("Berlin"));
+    db.raw(devices::SQLITE_DDL).exec().await.expect("create");
+    devices::assert_remembers_device(&db).await;
 }
 
 // ----- Vec<T> + HashMap columns via JSON fallback on Turso/libSQL -----

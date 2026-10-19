@@ -9,16 +9,9 @@
 use sqlx::sqlite::SqlitePoolOptions;
 use stakit_orm::prelude::*;
 
-#[derive(Table, Debug, PartialEq, Eq)]
-#[table(name = "users")]
-struct User {
-    #[column(pk)]
-    id: i64,
-    #[column(unique)]
-    email: String,
-    name: String,
-    age: i32,
-}
+#[path = "support/users.rs"]
+mod users;
+use users::{User, user};
 
 /// Connect to a single-connection in-memory `SQLite` (so the schema persists
 /// across queries) and create the schema.
@@ -30,16 +23,10 @@ async fn setup() -> Db {
         .await
         .expect("connect sqlite");
     let db = Db::sqlite(pool);
-    db.raw(
-        "create table users (\
-            id integer primary key, \
-            email text not null unique, \
-            name text not null, \
-            age integer not null)",
-    )
-    .exec()
-    .await
-    .expect("create table");
+    db.raw(users::SQLITE_USERS_DDL)
+        .exec()
+        .await
+        .expect("create table");
     db
 }
 
@@ -49,32 +36,11 @@ async fn end_to_end_against_sqlite() {
     let db = setup().await;
 
     // insert_many via the typed builder.
-    db.insert_many(vec![
-        UserNew {
-            id: 1,
-            email: "alice@x.com".to_owned(),
-            name: "Alice".to_owned(),
-            age: 30,
-        },
-        UserNew {
-            id: 2,
-            email: "bob@x.com".to_owned(),
-            name: "Bob".to_owned(),
-            age: 25,
-        },
-    ])
-    .exec()
-    .await
-    .expect("seed users");
+    users::seed_alice_bob(&db).await;
 
     // single insert with RETURNING (SQLite >= 3.35).
     let created = db
-        .insert(UserNew {
-            id: 3,
-            email: "carol@x.com".to_owned(),
-            name: "Carol".to_owned(),
-            age: 40,
-        })
+        .insert(user(3, "Carol", 40))
         .returning((User::id, User::email))
         .one()
         .await
@@ -82,15 +48,7 @@ async fn end_to_end_against_sqlite() {
     assert_eq!(created, (3, "carol@x.com".to_owned()));
 
     // select one -> whole row.
-    let fetched = db
-        .select(User::all())
-        .from::<User>()
-        .filter(eq(User::id, 1_i64))
-        .one()
-        .await
-        .expect("select one")
-        .expect("row present");
-    assert_eq!(fetched.email, "alice@x.com");
+    let fetched = users::select_alice(&db).await;
     assert_eq!(fetched.name, "Alice");
 
     // ergonomic find(): no T::all()/from()/type annotation.
@@ -135,30 +93,15 @@ async fn end_to_end_against_sqlite() {
     assert_eq!(rows, vec![(2, "bob@x.com".to_owned())]);
 
     // any_of -> IN (?, ?) expansion on SQLite (no array type).
-    let some = db
-        .select(User::all())
-        .from::<User>()
-        .filter(any_of(User::id, &[1_i64, 3]))
-        .all()
-        .await
-        .unwrap();
-    assert_eq!(some.len(), 2);
+    assert_eq!(users::users_in(&db, &[1, 3]).await.len(), 2);
 
     // empty any_of -> always-false `1 = 0`.
-    let none = db
-        .select(User::all())
-        .from::<User>()
-        .filter(any_of(User::id, &[] as &[i64]))
-        .all()
-        .await
-        .unwrap();
-    assert!(none.is_empty());
+    assert!(users::users_in(&db, &[]).await.is_empty());
 
     // aggregate + count.
     let total = db.select(count()).from::<User>().one().await.unwrap();
     assert_eq!(total, Some(3));
-    let count = db.select(User::all()).from::<User>().count().await.unwrap();
-    assert_eq!(count, 3);
+    assert_eq!(users::user_count(&db).await, 3);
     let max_age = db
         .select(max(User::age))
         .from::<User>()
@@ -168,101 +111,30 @@ async fn end_to_end_against_sqlite() {
     assert_eq!(max_age, Some(Some(40)));
 
     // update.
-    let affected = db
-        .update::<User>()
-        .set(User::age, 31)
-        .filter(eq(User::id, 1_i64))
-        .exec()
-        .await
-        .unwrap();
-    assert_eq!(affected, 1);
-    let alice = db
-        .select(User::age)
-        .from::<User>()
-        .filter(eq(User::id, 1_i64))
-        .one()
-        .await
-        .unwrap();
-    assert_eq!(alice, Some(31));
+    users::assert_updates_alice_age(&db).await;
 
     // transaction: commit.
     db.transaction(|tx| async move {
-        tx.insert(UserNew {
-            id: 4,
-            email: "dave@x.com".to_owned(),
-            name: "Dave".to_owned(),
-            age: 50,
-        })
-        .exec()
-        .await?;
+        tx.insert(user(4, "Dave", 50)).exec().await?;
         Ok(())
     })
     .await
     .expect("tx commit");
-    assert_eq!(
-        db.select(User::all()).from::<User>().count().await.unwrap(),
-        4
-    );
+    assert_eq!(users::user_count(&db).await, 4);
 
     // transaction: rollback on error.
-    let result: Result<()> = db
-        .transaction(|tx| async move {
-            tx.insert(UserNew {
-                id: 5,
-                email: "erin@x.com".to_owned(),
-                name: "Erin".to_owned(),
-                age: 60,
-            })
-            .exec()
-            .await?;
-            Err(Error::Transaction("forced rollback"))
-        })
-        .await;
-    assert!(result.is_err());
-    assert_eq!(
-        db.select(User::all()).from::<User>().count().await.unwrap(),
-        4,
-        "rolled-back insert must not persist"
-    );
+    users::assert_failed_transaction_rolls_back(&db, user(5, "Erin", 60), 4).await;
 
     // delete.
-    let deleted = db
-        .delete::<User>()
-        .filter(eq(User::id, 2_i64))
-        .exec()
-        .await
-        .unwrap();
-    assert_eq!(deleted, 1);
-    assert_eq!(
-        db.select(User::all()).from::<User>().count().await.unwrap(),
-        3
-    );
+    users::assert_deletes_bob(&db, 3).await;
 }
 
 // ----- Comprehensive cross-feature coverage (joins, grouping, aggregates,
 // derive(Row), streaming, predicates, on_conflict, typed errors) -----
 
-#[derive(Table, Debug, Clone, PartialEq, Eq)]
-#[table(name = "authors")]
-struct Author {
-    #[column(pk)]
-    id: i64,
-    name: String,
-    // nullable column, for is_null / outer-join coverage.
-    #[column(nullable)]
-    country: Option<String>,
-}
-
-#[derive(Table, Debug, PartialEq, Eq)]
-#[table(name = "posts")]
-struct Post {
-    #[column(pk)]
-    id: i64,
-    #[column(references = Author::id)]
-    author_id: i64,
-    title: String,
-    views: i32,
-}
+#[path = "support/blog.rs"]
+mod blog;
+use blog::{Author, Post, PostNew};
 
 /// A `#[derive(Row)]` projection: grouped aggregate decoded into a named struct.
 #[derive(stakit_orm::Row, Debug, PartialEq)]
@@ -282,55 +154,7 @@ async fn setup_blog() -> Db {
         .await
         .expect("connect");
     let db = Db::sqlite(pool);
-    db.raw("create table authors (id integer primary key, name text not null, country text)")
-        .exec()
-        .await
-        .expect("authors");
-    db.raw(
-        "create table posts (id integer primary key, author_id integer not null \
-         references authors(id), title text not null, views integer not null)",
-    )
-    .exec()
-    .await
-    .expect("posts");
-    db.insert_many(vec![
-        AuthorNew {
-            id: 1,
-            name: "Ann".to_owned(),
-            country: Some("US".to_owned()),
-        },
-        AuthorNew {
-            id: 2,
-            name: "Bo".to_owned(),
-            country: None,
-        },
-    ])
-    .exec()
-    .await
-    .expect("seed authors");
-    db.insert_many(vec![
-        PostNew {
-            id: 1,
-            author_id: 1,
-            title: "A1".to_owned(),
-            views: 10,
-        },
-        PostNew {
-            id: 2,
-            author_id: 1,
-            title: "A2".to_owned(),
-            views: 5,
-        },
-        PostNew {
-            id: 3,
-            author_id: 2,
-            title: "B1".to_owned(),
-            views: 7,
-        },
-    ])
-    .exec()
-    .await
-    .expect("seed posts");
+    blog::create_and_seed(&db, &blog::SQLITE_BLOG_DDL).await;
     db
 }
 
@@ -339,14 +163,7 @@ async fn joins_inner_and_left_with_nullable() {
     let db = setup_blog().await;
 
     // inner join: (Post, Author) whole-row tuple, positional decode.
-    let mut rows: Vec<(Post, Author)> = db
-        .select((Post::all(), Author::all()))
-        .from::<Post>()
-        .inner_join::<Author>(eq(Post::author_id, Author::id))
-        .order_by(asc(Post::id))
-        .all()
-        .await
-        .expect("inner join");
+    let mut rows = blog::posts_with_authors(&db).await;
     assert_eq!(rows.len(), 3);
     let (post, author) = rows.remove(0);
     assert_eq!(post.title, "A1");
@@ -596,37 +413,7 @@ async fn migrations_run_out_of_box() {
 #[tokio::test]
 async fn relations_has_many_and_belongs_to() {
     let db = setup_blog().await;
-
-    // has_many: each author with their posts, one batched IN query (no N+1).
-    let authors = db
-        .find::<Author>()
-        .order_by(asc(Author::id))
-        .all()
-        .await
-        .unwrap();
-    let with_posts = db
-        .load_has_many::<Author, Post, i64>(authors, Post::author_id, |a| a.id, |p| p.author_id)
-        .await
-        .expect("has_many");
-    assert_eq!(with_posts.len(), 2);
-    assert_eq!(with_posts[0].0.name, "Ann");
-    assert_eq!(with_posts[0].1.len(), 2); // Ann has 2 posts
-    assert_eq!(with_posts[1].1.len(), 1); // Bo has 1 post
-
-    // belongs_to: each post with its author.
-    let posts = db
-        .find::<Post>()
-        .order_by(asc(Post::id))
-        .all()
-        .await
-        .unwrap();
-    let with_author = db
-        .load_belongs_to::<Post, Author, i64>(posts, |p| p.author_id, Author::id, |a| a.id)
-        .await
-        .expect("belongs_to");
-    assert_eq!(with_author.len(), 3);
-    assert_eq!(with_author[0].1.as_ref().unwrap().name, "Ann");
-    assert_eq!(with_author[2].1.as_ref().unwrap().name, "Bo");
+    blog::assert_has_many_and_belongs_to(&db).await;
 }
 
 // ----- Custom column type via the ToValue/FromValue extension point -----
@@ -1488,139 +1275,26 @@ struct RawGeo {
 }
 
 // ----- composite-key upsert: "remember this device" (the goal scenario) -----
-//
-// One row per (user_id, device_id). First login inserts; later logins update only
-// the chosen columns. `set_coalesce(location)` keeps the stored location when a
-// later login's location is still NULL (async geolocation not yet resolved), so a
-// previously-learned location is never wiped — all in ONE atomic statement.
 
-#[derive(Table, Debug)]
-#[table(name = "login_devices")]
-#[allow(dead_code)]
-struct LoginDevice {
-    #[column(pk)]
-    id: i64,
-    user_id: i64,
-    #[column(sql_type = "text")]
-    device_id: String,
-    platform: String,
-    #[column(nullable)]
-    location: Option<String>,
-}
+#[path = "support/devices.rs"]
+mod devices;
 
 #[tokio::test]
 async fn upsert_composite_key_coalesce_remembers_device() {
-    // The reusable "remember this device" upsert: key on (user_id, device_id),
-    // refresh platform, and keep an existing location when the new one is NULL.
-    async fn remember(db: &Db, row: LoginDeviceNew) -> stakit_orm::Result<u64> {
-        db.insert(row)
-            .on_conflict((LoginDevice::user_id, LoginDevice::device_id))
-            .set(LoginDevice::platform)
-            .set_coalesce(LoginDevice::location)
-            .exec()
-            .await
-    }
-
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .expect("connect");
     let db = Db::sqlite(pool);
-    db.raw(
-        "create table login_devices (id integer primary key, user_id integer not null, \
-         device_id text not null, platform text not null, location text, \
-         unique(user_id, device_id))",
-    )
-    .exec()
-    .await
-    .unwrap();
-
-    // Mon: first login from the phone — geolocation not resolved yet (NULL).
-    remember(
-        &db,
-        LoginDeviceNew {
-            id: 1,
-            user_id: 7,
-            device_id: "phone".to_owned(),
-            platform: "ios-16".to_owned(),
-            location: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    // Async geolocation resolves a little later -> Berlin.
-    db.raw("update login_devices set location = 'Berlin' where id = 1")
-        .exec()
-        .await
-        .unwrap();
-
-    // Tue: same phone logs in again, platform refreshed, location still NULL.
-    remember(
-        &db,
-        LoginDeviceNew {
-            id: 2, // a fresh candidate id; the conflict updates the existing row instead
-            user_id: 7,
-            device_id: "phone".to_owned(),
-            platform: "ios-17".to_owned(),
-            location: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    // Exactly one row, platform refreshed, and "Berlin" PRESERVED (not wiped).
-    let rows = db
-        .find::<LoginDevice>()
-        .order_by(asc(LoginDevice::id))
-        .all()
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1, "exactly one device row per (user, device)");
-    assert_eq!(rows[0].id, 1, "the original row is updated in place");
-    assert_eq!(rows[0].platform, "ios-17", "platform refreshed");
-    assert_eq!(
-        rows[0].location.as_deref(),
-        Some("Berlin"),
-        "coalesce kept the previously-learned location"
-    );
-
-    // Wed: a login that DID resolve a location overwrites the stored one.
-    remember(
-        &db,
-        LoginDeviceNew {
-            id: 3,
-            user_id: 7,
-            device_id: "phone".to_owned(),
-            platform: "ios-17".to_owned(),
-            location: Some("Munich".to_owned()),
-        },
-    )
-    .await
-    .unwrap();
-    let rows = db.find::<LoginDevice>().all().await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(
-        rows[0].location.as_deref(),
-        Some("Munich"),
-        "a non-NULL incoming location overwrites"
-    );
+    db.raw(devices::SQLITE_DDL).exec().await.unwrap();
+    devices::assert_remembers_device(&db).await;
 
     // A different device for the same user is a separate row (key is composite).
-    remember(
-        &db,
-        LoginDeviceNew {
-            id: 4,
-            user_id: 7,
-            device_id: "laptop".to_owned(),
-            platform: "macos".to_owned(),
-            location: None,
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(db.find::<LoginDevice>().count().await.unwrap(), 2);
+    devices::remember(&db, devices::login(4, "laptop", "macos", None))
+        .await
+        .unwrap();
+    assert_eq!(db.find::<devices::LoginDevice>().count().await.unwrap(), 2);
 }
 
 // ----- Vec<T> + HashMap columns via JSON fallback on SQLite (no native arrays) -----

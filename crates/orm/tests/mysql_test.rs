@@ -12,16 +12,9 @@
 
 use stakit_orm::prelude::*;
 
-#[derive(Table, Debug, Clone, PartialEq, Eq)]
-#[table(name = "users")]
-struct User {
-    #[column(pk)]
-    id: i64,
-    #[column(unique)]
-    email: String,
-    name: String,
-    age: i32,
-}
+#[path = "support/users.rs"]
+mod users;
+use users::{User, user};
 
 #[tokio::test]
 async fn end_to_end_against_mysql() {
@@ -48,33 +41,8 @@ async fn end_to_end_against_mysql() {
     .await
     .expect("create table");
 
-    db.insert_many(vec![
-        UserNew {
-            id: 1,
-            email: "alice@x.com".to_owned(),
-            name: "Alice".to_owned(),
-            age: 30,
-        },
-        UserNew {
-            id: 2,
-            email: "bob@x.com".to_owned(),
-            name: "Bob".to_owned(),
-            age: 25,
-        },
-    ])
-    .exec()
-    .await
-    .expect("seed");
-
-    let fetched = db
-        .select(User::all())
-        .from::<User>()
-        .filter(eq(User::id, 1_i64))
-        .one()
-        .await
-        .expect("select one")
-        .expect("row present");
-    assert_eq!(fetched.email, "alice@x.com");
+    users::seed_alice_bob(&db).await;
+    users::select_alice(&db).await;
 
     // any_of -> IN (?, ?) and ordering.
     let some = db
@@ -89,45 +57,14 @@ async fn end_to_end_against_mysql() {
     assert_eq!(some[0].name, "Bob");
 
     // aggregate.
-    let count = db.select(User::all()).from::<User>().count().await.unwrap();
-    assert_eq!(count, 2);
+    assert_eq!(users::user_count(&db).await, 2);
 
     // update + transaction rollback.
-    db.update::<User>()
-        .set(User::age, 31)
-        .filter(eq(User::id, 1_i64))
-        .exec()
-        .await
-        .unwrap();
-
-    let result: Result<()> = db
-        .transaction(|tx| async move {
-            tx.insert(UserNew {
-                id: 3,
-                email: "carol@x.com".to_owned(),
-                name: "Carol".to_owned(),
-                age: 40,
-            })
-            .exec()
-            .await?;
-            Err(Error::Transaction("rollback"))
-        })
-        .await;
-    assert!(result.is_err());
-    assert_eq!(
-        db.select(User::all()).from::<User>().count().await.unwrap(),
-        2,
-        "rolled-back insert must not persist"
-    );
+    users::assert_updates_alice_age(&db).await;
+    users::assert_failed_transaction_rolls_back(&db, user(3, "Carol", 40), 2).await;
 
     // delete.
-    let deleted = db
-        .delete::<User>()
-        .filter(eq(User::id, 2_i64))
-        .exec()
-        .await
-        .unwrap();
-    assert_eq!(deleted, 1);
+    users::assert_deletes_bob(&db, 1).await;
 }
 
 #[tokio::test]
@@ -150,27 +87,11 @@ async fn mysql_migrations_run_out_of_box() {
     assert_eq!(db.migrate(&migrations).await.expect("again"), 0);
 }
 
+#[path = "support/blog.rs"]
+mod blog;
+
 // Dedicated tables (not the shared `users`) so this test is parallel-safe under
 // nextest's default concurrency.
-#[derive(Table, Debug, Clone)]
-#[table(name = "mt_authors")]
-#[allow(dead_code)]
-struct MtAuthor {
-    #[column(pk)]
-    id: i64,
-    name: String,
-}
-
-#[derive(Table, Debug)]
-#[table(name = "mt_posts")]
-#[allow(dead_code)]
-struct MtPost {
-    #[column(pk)]
-    id: i64,
-    author_id: i64,
-    title: String,
-}
-
 #[tokio::test]
 async fn mysql_relations() {
     let Ok(url) = std::env::var("MYSQL_URL") else {
@@ -178,139 +99,42 @@ async fn mysql_relations() {
         return;
     };
     let db = Db::connect_mysql(&url).await.expect("connect");
-    db.raw("drop table if exists mt_posts").exec().await.ok();
-    db.raw("drop table if exists mt_authors").exec().await.ok();
-    db.raw("create table mt_authors (id bigint primary key, name varchar(255) not null)")
-        .exec()
-        .await
-        .expect("authors");
-    db.raw("create table mt_posts (id bigint primary key, author_id bigint not null, title varchar(255) not null)").exec().await.expect("posts");
-    db.insert(MtAuthorNew {
-        id: 1,
-        name: "Ann".to_owned(),
-    })
-    .exec()
-    .await
-    .unwrap();
-    db.insert_many(vec![
-        MtPostNew {
-            id: 1,
-            author_id: 1,
-            title: "p1".to_owned(),
-        },
-        MtPostNew {
-            id: 2,
-            author_id: 1,
-            title: "p2".to_owned(),
-        },
-    ])
-    .exec()
-    .await
-    .unwrap();
-
-    let authors = db.find::<MtAuthor>().all().await.unwrap();
-    let with_posts = db
-        .load_has_many::<MtAuthor, MtPost, i64>(
-            authors,
-            MtPost::author_id,
-            |a| a.id,
-            |p| p.author_id,
-        )
-        .await
-        .expect("has_many");
-    assert_eq!(with_posts[0].1.len(), 2);
-
-    let posts = db.find::<MtPost>().all().await.unwrap();
-    let with_author = db
-        .load_belongs_to::<MtPost, MtAuthor, i64>(posts, |p| p.author_id, MtAuthor::id, |a| a.id)
-        .await
-        .expect("belongs_to");
-    assert_eq!(with_author[0].1.as_ref().unwrap().name, "Ann");
+    db.raw("drop table if exists posts").exec().await.ok();
+    db.raw("drop table if exists authors").exec().await.ok();
+    blog::create_and_seed(
+        &db,
+        &[
+            "create table authors (id bigint primary key, name varchar(255) not null, \
+             country varchar(255))",
+            "create table posts (id bigint primary key, author_id bigint not null, \
+             title varchar(255) not null, views int not null)",
+        ],
+    )
+    .await;
+    blog::assert_has_many_and_belongs_to(&db).await;
 }
 
-#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
-enum MyKind {
-    A,
-    B,
-}
-
-#[derive(DbEnum, Debug, Clone, Copy, PartialEq, Eq)]
-#[db_enum(int)]
-enum MyRank {
-    Low = 1,
-    High = 9,
-}
-
-#[derive(Table, Debug)]
-#[table(name = "mt_things")]
-#[allow(dead_code)]
-struct MtThing {
-    #[column(pk)]
-    id: i64,
-    #[column(sql_type = "varchar(16)")]
-    kind: MyKind,
-    #[column(sql_type = "int")]
-    rank: MyRank,
-    at: chrono::DateTime<chrono::Utc>,
-    local: chrono::NaiveDateTime,
-    day: chrono::NaiveDate,
-    alarm: chrono::NaiveTime,
-    meta: serde_json::Value,
-}
+#[path = "support/things.rs"]
+mod things;
 
 /// Enums (text + int), all chrono temporal types, and JSON against real `MySQL`.
 #[tokio::test]
 async fn mysql_enums_temporal_json() {
-    use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
     let Ok(url) = std::env::var("MYSQL_URL") else {
         eprintln!("MYSQL_URL not set; skipping MySQL types e2e");
         return;
     };
     let db = Db::connect_mysql(&url).await.expect("connect");
-    db.raw("drop table if exists mt_things").exec().await.ok();
+    db.raw("drop table if exists things").exec().await.ok();
     db.raw(
-        "create table mt_things (id bigint primary key, kind varchar(16) not null, rank int not null, \
-         at datetime not null, local datetime not null, day date not null, alarm time not null, meta json not null)",
+        "create table things (id bigint primary key, kind varchar(16) not null, rank int not null, \
+         at datetime not null, local datetime not null, day date not null, alarm time not null, \
+         meta json not null)",
     )
     .exec()
     .await
     .expect("create");
-
-    let at = Utc.with_ymd_and_hms(2026, 6, 2, 8, 30, 0).unwrap();
-    let day = NaiveDate::from_ymd_opt(1990, 1, 15).unwrap();
-    let alarm = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
-    let local = day.and_hms_opt(8, 30, 0).unwrap();
-    let meta = serde_json::json!({ "k": [1, 2, 3] });
-
-    db.insert(MtThingNew {
-        id: 1,
-        kind: MyKind::B,
-        rank: MyRank::High,
-        at,
-        local,
-        day,
-        alarm,
-        meta: meta.clone(),
-    })
-    .exec()
-    .await
-    .expect("insert");
-
-    let got = db.get::<MtThing>(1).one().await.unwrap().unwrap();
-    assert_eq!(got.kind, MyKind::B);
-    assert_eq!(got.rank, MyRank::High);
-    assert_eq!(got.local, local);
-    assert_eq!(got.day, day);
-    assert_eq!(got.alarm, alarm);
-    assert_eq!(got.meta, meta);
-
-    let highs = db
-        .find::<MtThing>()
-        .filter(eq(MtThing::rank, MyRank::High))
-        .all()
-        .await
-        .unwrap();
-    assert_eq!(highs.len(), 1);
+    things::assert_round_trips(&db).await;
 }
 
 // ----- composite-key upsert with coalesce against real MySQL (env-gated) -----
@@ -319,42 +143,23 @@ async fn mysql_enums_temporal_json() {
 // col)` path against a live MySQL server: one row per (user_id, device_id), and
 // a learned location survives a later NULL-location login. Skips without MYSQL_URL.
 
-#[derive(Table, Debug)]
-#[table(name = "mt_login_devices")]
-#[allow(dead_code)]
-struct MtLoginDevice {
-    #[column(pk)]
-    id: i64,
-    user_id: i64,
-    device_id: String,
-    platform: String,
-    #[column(nullable)]
-    location: Option<String>,
-}
+#[path = "support/devices.rs"]
+mod devices;
 
 #[tokio::test]
 async fn upsert_composite_key_coalesce_remembers_device_on_mysql() {
-    async fn remember(db: &Db, row: MtLoginDeviceNew) -> stakit_orm::Result<u64> {
-        db.insert(row)
-            .on_conflict((MtLoginDevice::user_id, MtLoginDevice::device_id))
-            .set(MtLoginDevice::platform)
-            .set_coalesce(MtLoginDevice::location)
-            .exec()
-            .await
-    }
-
     let Ok(url) = std::env::var("MYSQL_URL") else {
         eprintln!("MYSQL_URL not set; skipping MySQL upsert e2e");
         return;
     };
     let db = Db::connect_mysql(&url).await.expect("connect mysql");
 
-    db.raw("drop table if exists mt_login_devices")
+    db.raw("drop table if exists login_devices")
         .exec()
         .await
         .expect("drop");
     db.raw(
-        "create table mt_login_devices (\
+        "create table login_devices (\
             id bigint primary key, \
             user_id bigint not null, \
             device_id varchar(255) not null, \
@@ -365,39 +170,5 @@ async fn upsert_composite_key_coalesce_remembers_device_on_mysql() {
     .exec()
     .await
     .expect("create");
-
-    remember(
-        &db,
-        MtLoginDeviceNew {
-            id: 1,
-            user_id: 7,
-            device_id: "phone".to_owned(),
-            platform: "ios-16".to_owned(),
-            location: None,
-        },
-    )
-    .await
-    .unwrap();
-    db.raw("update mt_login_devices set location = 'Berlin' where id = 1")
-        .exec()
-        .await
-        .unwrap();
-    remember(
-        &db,
-        MtLoginDeviceNew {
-            id: 2,
-            user_id: 7,
-            device_id: "phone".to_owned(),
-            platform: "ios-17".to_owned(),
-            location: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let rows = db.find::<MtLoginDevice>().all().await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].id, 1);
-    assert_eq!(rows[0].platform, "ios-17");
-    assert_eq!(rows[0].location.as_deref(), Some("Berlin"));
+    devices::assert_remembers_device(&db).await;
 }
