@@ -19,6 +19,8 @@ mod mysql;
 mod postgres;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+#[cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql"))]
+mod sqlx_backend;
 #[cfg(feature = "turso")]
 mod turso;
 

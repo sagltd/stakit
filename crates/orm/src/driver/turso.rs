@@ -50,6 +50,28 @@ impl TursoDriver {
     }
 }
 
+/// Run a query on `connection` (a pooled connection or a transaction, which
+/// derefs to one), pushing each row into `sink`.
+async fn fetch_into(
+    connection: &Connection,
+    sql: &str,
+    binds: BindBuffer,
+    sink: &mut dyn RowSink,
+) -> Result<()> {
+    let params = libsql_params(binds)?;
+    let mut rows = connection.query(sql, params).await.map_err(map_libsql)?;
+    while let Some(row) = rows.next().await.map_err(map_libsql)? {
+        sink.push(&row)?;
+    }
+    Ok(())
+}
+
+/// Run a statement on `connection`, returning the affected-row count.
+async fn execute_on(connection: &Connection, sql: &str, binds: BindBuffer) -> Result<u64> {
+    let params = libsql_params(binds)?;
+    connection.execute(sql, params).await.map_err(map_libsql)
+}
+
 impl Driver for TursoDriver {
     fn dialect(&self) -> &'static dyn Dialect {
         &TursoDialect
@@ -61,30 +83,11 @@ impl Driver for TursoDriver {
         binds: BindBuffer,
         sink: &'a mut dyn RowSink,
     ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let params = libsql_params(binds)?;
-            let mut rows = self
-                .connection
-                .query(&sql, params)
-                .await
-                .map_err(map_libsql)?;
-            while let Some(row) = rows.next().await.map_err(map_libsql)? {
-                sink.push(&row)?;
-            }
-            Ok(())
-        })
+        Box::pin(async move { fetch_into(&self.connection, &sql, binds, sink).await })
     }
 
     fn execute(&self, sql: String, binds: BindBuffer) -> BoxFuture<'_, Result<u64>> {
-        Box::pin(async move {
-            let params = libsql_params(binds)?;
-            let affected = self
-                .connection
-                .execute(&sql, params)
-                .await
-                .map_err(map_libsql)?;
-            Ok(affected)
-        })
+        Box::pin(async move { execute_on(&self.connection, &sql, binds).await })
     }
 
     fn stream(&self, sql: String, binds: BindBuffer) -> BoxStream<'_, Result<BoxRow>> {
@@ -121,44 +124,19 @@ impl TxConn for TursoTxConn {
         binds: BindBuffer,
         sink: &'a mut dyn RowSink,
     ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let params = libsql_params(binds)?;
-            let mut rows = self
-                .transaction
-                .query(&sql, params)
-                .await
-                .map_err(map_libsql)?;
-            while let Some(row) = rows.next().await.map_err(map_libsql)? {
-                sink.push(&row)?;
-            }
-            Ok(())
-        })
+        Box::pin(async move { fetch_into(&self.transaction, &sql, binds, sink).await })
     }
 
     fn execute(&mut self, sql: String, binds: BindBuffer) -> BoxFuture<'_, Result<u64>> {
-        Box::pin(async move {
-            let params = libsql_params(binds)?;
-            let affected = self
-                .transaction
-                .execute(&sql, params)
-                .await
-                .map_err(map_libsql)?;
-            Ok(affected)
-        })
+        Box::pin(async move { execute_on(&self.transaction, &sql, binds).await })
     }
 
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            self.transaction.commit().await.map_err(map_libsql)?;
-            Ok(())
-        })
+        Box::pin(async move { self.transaction.commit().await.map_err(map_libsql) })
     }
 
     fn rollback(self: Box<Self>) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            self.transaction.rollback().await.map_err(map_libsql)?;
-            Ok(())
-        })
+        Box::pin(async move { self.transaction.rollback().await.map_err(map_libsql) })
     }
 }
 
