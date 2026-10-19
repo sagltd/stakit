@@ -62,3 +62,47 @@ async fn openai_default_path_is_unchanged() {
         "POST /v1/chat/completions HTTP/1.1"
     );
 }
+
+/// Accepts one request, records its full head, answers 500.
+fn capture_request_head() -> (String, thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let handle = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("accept");
+        let mut buffer = [0; 8192];
+        let count = socket.read(&mut buffer).expect("read");
+        let _ =
+            socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 2\r\n\r\n{}");
+        String::from_utf8_lossy(&buffer[..count]).to_ascii_lowercase()
+    });
+    (url, handle)
+}
+
+fn probing_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-probe", reqwest::header::HeaderValue::from_static("1"));
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("client")
+}
+
+#[tokio::test]
+async fn openai_uses_the_given_http_client() {
+    let (url, server) = capture_request_head();
+    let client = OpenAiClient::new("k")
+        .with_base_url(url)
+        .with_http_client(probing_client());
+    send_once(Box::new(client.model("gpt-x"))).await;
+    assert!(server.join().expect("server").contains("x-probe: 1"));
+}
+
+#[tokio::test]
+async fn claude_uses_the_given_http_client() {
+    let (url, server) = capture_request_head();
+    let client = ClaudeClient::new("k")
+        .with_base_url(url)
+        .with_http_client(probing_client());
+    send_once(Box::new(client.model("claude-x"))).await;
+    assert!(server.join().expect("server").contains("x-probe: 1"));
+}

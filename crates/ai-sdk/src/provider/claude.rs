@@ -99,6 +99,15 @@ impl ClaudeClient {
         self
     }
 
+    /// Uses `http` for every request instead of the shared default client, e.g.
+    /// one with a custom DNS resolver or proxy. The caller owns its retry and
+    /// redirect policy.
+    #[must_use]
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = Some(http);
+        self
+    }
+
     fn url(&self) -> String {
         self.endpoint
             .clone()
