@@ -17,7 +17,7 @@ use stakit_ai_sdk::{
 
 #[path = "support/mock.rs"]
 mod mock;
-use mock::{EchoTool, Scripted, last_tool_result};
+use mock::{EchoTool, Scripted, assert_stopped, last_tool_result};
 
 // ── Shared app context that carries the event log ───────────────────────────
 
@@ -188,20 +188,32 @@ async fn first_stop_in_on_step_skips_later_middlewares() {
 //
 // Stop fires in on_step (both on_start already ran) → both A and B get on_finish.
 
-struct FinishTracker {
+/// Logs `start:` / `finish:` with its name; optionally stops in `on_start`
+/// ("halted") or `on_step` ("stopped").
+struct Tracker {
     name: &'static str,
     /// Shared log for sequencing assertions.
     log: Arc<Mutex<Vec<String>>>,
+    stop_in_start: bool,
     stop_in_step: bool,
 }
 
-#[async_trait::async_trait]
-impl AgentMiddleware<()> for FinishTracker {
-    async fn on_start(&self, _cx: &mut AgentCx<'_, ()>) -> Result<Flow, AgentError> {
+impl Tracker {
+    fn log(&self, hook: &str) {
         self.log
             .lock()
             .unwrap()
-            .push(format!("start:{}", self.name));
+            .push(format!("{hook}:{}", self.name));
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentMiddleware<()> for Tracker {
+    async fn on_start(&self, _cx: &mut AgentCx<'_, ()>) -> Result<Flow, AgentError> {
+        self.log("start");
+        if self.stop_in_start {
+            return Ok(Flow::Stop("halted".into()));
+        }
         Ok(Flow::Continue)
     }
     async fn on_step(&self, _cx: &mut AgentCx<'_, ()>) -> Result<Flow, AgentError> {
@@ -211,37 +223,35 @@ impl AgentMiddleware<()> for FinishTracker {
         Ok(Flow::Continue)
     }
     async fn on_finish(&self, _cx: &AgentCx<'_, ()>) -> Result<(), AgentError> {
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("finish:{}", self.name));
+        self.log("finish");
         Ok(())
     }
 }
 
-#[tokio::test]
-async fn on_finish_runs_for_all_started_middlewares_after_step_stop() {
+/// Runs trackers A (stopping as configured) then B, which never stops; asserts
+/// the run stopped and returns the shared log.
+async fn tracked_run(a_stops_in_start: bool, a_stops_in_step: bool) -> Vec<String> {
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let tracker = |name, stop_in_start, stop_in_step| Tracker {
+        name,
+        log: Arc::clone(&log),
+        stop_in_start,
+        stop_in_step,
+    };
     let mut agent = Agent::new(())
         .provider(two_step())
         .model("two-step")
         .register_tool(EchoTool)
-        .register_middleware(FinishTracker {
-            name: "A",
-            log: Arc::clone(&log),
-            stop_in_step: true,
-        })
-        .register_middleware(FinishTracker {
-            name: "B",
-            log: Arc::clone(&log),
-            stop_in_step: false,
-        })
+        .register_middleware(tracker("A", a_stops_in_start, a_stops_in_step))
+        .register_middleware(tracker("B", false, false))
         .with_context(vec![Message::user("go")]);
+    assert_stopped(&agent.run().await.expect("outcome"));
+    log.lock().unwrap().clone()
+}
 
-    let out = agent.run().await.expect("outcome");
-    assert!(matches!(out.finish, Finish::Stopped { .. }));
-
-    let entries = log.lock().unwrap().clone();
+#[tokio::test]
+async fn on_finish_runs_for_all_started_middlewares_after_step_stop() {
+    let entries = tracked_run(false, true).await;
     // Both on_start ran → both on_finish must appear.
     assert!(entries.contains(&"start:A".to_string()), "start:A missing");
     assert!(entries.contains(&"start:B".to_string()), "start:B missing");
@@ -257,58 +267,11 @@ async fn on_finish_runs_for_all_started_middlewares_after_step_stop() {
 
 // ── Test 3b: stop in on_start — later ones do NOT get on_finish ──────────────
 
-struct OnStartStopper {
-    name: &'static str,
-    log: Arc<Mutex<Vec<String>>>,
-    stop: bool,
-}
-
-#[async_trait::async_trait]
-impl AgentMiddleware<()> for OnStartStopper {
-    async fn on_start(&self, _cx: &mut AgentCx<'_, ()>) -> Result<Flow, AgentError> {
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("start:{}", self.name));
-        if self.stop {
-            return Ok(Flow::Stop("halted".into()));
-        }
-        Ok(Flow::Continue)
-    }
-    async fn on_finish(&self, _cx: &AgentCx<'_, ()>) -> Result<(), AgentError> {
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("finish:{}", self.name));
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn on_finish_only_for_started_middlewares_when_on_start_stops() {
-    let log = Arc::new(Mutex::new(Vec::<String>::new()));
     // Middleware A stops in on_start → B's on_start never runs.
     // Expected: finish:A runs, finish:B does NOT.
-    let mut agent = Agent::new(())
-        .provider(two_step())
-        .model("two-step")
-        .register_tool(EchoTool)
-        .register_middleware(OnStartStopper {
-            name: "A",
-            log: Arc::clone(&log),
-            stop: true,
-        })
-        .register_middleware(OnStartStopper {
-            name: "B",
-            log: Arc::clone(&log),
-            stop: false,
-        })
-        .with_context(vec![Message::user("go")]);
-
-    let out = agent.run().await.expect("outcome");
-    assert!(matches!(out.finish, Finish::Stopped { .. }));
-
-    let entries = log.lock().unwrap().clone();
+    let entries = tracked_run(true, false).await;
     assert!(
         entries.contains(&"start:A".to_string()),
         "start:A must be present"
@@ -334,64 +297,47 @@ fn single_tool() -> Scripted {
     Scripted::tool_then_text("single-tool", "echo", r#"{"text":"hi"}"#, "done")
 }
 
-struct AllowMiddleware;
+/// Answers every tool approval with a fixed decision.
+struct Approver(Approval);
 
 #[async_trait::async_trait]
-impl AgentMiddleware<()> for AllowMiddleware {
+impl AgentMiddleware<()> for Approver {
     async fn on_tool_approve(
         &self,
         _cx: &AgentCx<'_, ()>,
         _call: &PendingToolCall,
     ) -> Result<Approval, AgentError> {
-        Ok(Approval::Allow)
+        Ok(self.0.clone())
     }
 }
 
-struct DenyMiddleware {
-    deny_message: &'static str,
+/// A single-tool agent whose approvals are `first` then `second`.
+fn approving(first: Approval, second: Approval) -> Agent<()> {
+    Agent::new(())
+        .provider(single_tool())
+        .model("single-tool")
+        .register_tool(EchoTool)
+        .register_middleware(Approver(first))
+        .register_middleware(Approver(second))
+        .with_context(vec![Message::user("go")])
 }
 
-#[async_trait::async_trait]
-impl AgentMiddleware<()> for DenyMiddleware {
-    async fn on_tool_approve(
-        &self,
-        _cx: &AgentCx<'_, ()>,
-        _call: &PendingToolCall,
-    ) -> Result<Approval, AgentError> {
-        Ok(Approval::Deny {
-            message: self.deny_message.to_string(),
-        })
+fn deny(message: &str) -> Approval {
+    Approval::Deny {
+        message: message.into(),
     }
 }
 
-struct StopMiddleware;
-
-#[async_trait::async_trait]
-impl AgentMiddleware<()> for StopMiddleware {
-    async fn on_tool_approve(
-        &self,
-        _cx: &AgentCx<'_, ()>,
-        _call: &PendingToolCall,
-    ) -> Result<Approval, AgentError> {
-        Ok(Approval::Stop {
-            message: Some("stop-from-approve".to_string()),
-        })
+fn stop() -> Approval {
+    Approval::Stop {
+        message: Some("stop-from-approve".to_string()),
     }
 }
 
 #[tokio::test]
 async fn deny_beats_allow_in_tool_approve() {
     // A=Allow, B=Deny → effective approval is Deny.
-    let mut agent = Agent::new(())
-        .provider(single_tool())
-        .model("single-tool")
-        .register_tool(EchoTool)
-        .register_middleware(AllowMiddleware)
-        .register_middleware(DenyMiddleware {
-            deny_message: "not-allowed",
-        })
-        .with_context(vec![Message::user("go")]);
-
+    let mut agent = approving(Approval::Allow, deny("not-allowed"));
     match last_tool_result(agent.run()).await {
         ToolOutcome::Denied { message } => {
             assert_eq!(
@@ -404,41 +350,10 @@ async fn deny_beats_allow_in_tool_approve() {
 }
 
 #[tokio::test]
-async fn stop_beats_deny_in_tool_approve() {
-    // A=Deny, B=Stop → effective approval is Stop (run halts).
-    let mut agent = Agent::new(())
-        .provider(single_tool())
-        .model("single-tool")
-        .register_tool(EchoTool)
-        .register_middleware(DenyMiddleware {
-            deny_message: "denied",
-        })
-        .register_middleware(StopMiddleware)
-        .with_context(vec![Message::user("go")]);
-
-    let out = agent.run().await.expect("outcome");
-    assert!(
-        matches!(out.finish, Finish::Stopped { .. }),
-        "Stop from approval must halt the run; got {:?}",
-        out.finish
-    );
-}
-
-#[tokio::test]
-async fn stop_beats_allow_in_tool_approve() {
-    // A=Allow, B=Stop → run halts.
-    let mut agent = Agent::new(())
-        .provider(single_tool())
-        .model("single-tool")
-        .register_tool(EchoTool)
-        .register_middleware(AllowMiddleware)
-        .register_middleware(StopMiddleware)
-        .with_context(vec![Message::user("go")]);
-
-    let out = agent.run().await.expect("outcome");
-    assert!(
-        matches!(out.finish, Finish::Stopped { .. }),
-        "Stop from approval must halt the run; got {:?}",
-        out.finish
-    );
+async fn stop_beats_deny_and_allow_in_tool_approve() {
+    // A=Deny or Allow, B=Stop → effective approval is Stop (run halts).
+    for first in [deny("denied"), Approval::Allow] {
+        let mut agent = approving(first, stop());
+        assert_stopped(&agent.run().await.expect("outcome"));
+    }
 }

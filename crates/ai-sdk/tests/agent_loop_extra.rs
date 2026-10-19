@@ -12,7 +12,7 @@ use stakit_ai_sdk::{
 
 #[path = "support/mock.rs"]
 mod mock;
-use mock::{EchoTool, Scripted, drain, end, tool_call};
+use mock::{EchoTool, Scripted, assert_stopped, drain, end, tool_call};
 
 // ── Shared scripted/recording infrastructure ─────────────────────────────────
 
@@ -101,11 +101,7 @@ async fn approval_stop_halts_run_not_just_tool() {
     let (results, out) = drain(agent.run()).await;
 
     // Stop must have halted the run.
-    assert!(
-        matches!(out.finish, Finish::Stopped { .. }),
-        "expected Finish::Stopped, got {:?}",
-        out.finish
-    );
+    assert_stopped(&out);
 
     // Approval::Stop must NOT produce a Denied tool-result (only Deny does).
     assert!(
@@ -247,11 +243,7 @@ async fn mid_batch_stop_records_tool_result_for_every_tool_use() {
         .with_context(vec![Message::user("go")]);
 
     let out = agent.run().await.expect("outcome");
-    assert!(
-        matches!(out.finish, Finish::Stopped { .. }),
-        "expected Finish::Stopped, got {:?}",
-        out.finish
-    );
+    assert_stopped(&out);
 
     // Collect every tool_use id from assistant turns and every tool_result id
     // from user turns.

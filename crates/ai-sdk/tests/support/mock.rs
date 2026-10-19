@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use stakit_ai_sdk::{
-    AgentEvent, AgentRun, ChatRequest, ChatResponse, EventStream, Outcome, Provider, ProviderError,
-    StopReason, StreamEvent, Tool, ToolCx, ToolError, ToolOutcome, Usage, event_stream,
+    AgentEvent, AgentRun, ChatRequest, ChatResponse, EventStream, Finish, Outcome, Provider,
+    ProviderError, StopReason, StreamEvent, Tool, ToolCx, ToolError, ToolOutcome, Usage,
+    event_stream,
 };
 use stakit_model::{JsonSchema, Model};
 
@@ -183,4 +184,26 @@ pub(crate) async fn assert_tool_error(run: AgentRun<'_>, needle: &str) {
         ),
         other => panic!("expected ToolOutcome::Error, got {other:?}"),
     }
+}
+
+/// Asserts the run was stopped (by middleware or an error), not finished.
+pub(crate) fn assert_stopped(out: &Outcome) {
+    assert!(
+        matches!(out.finish, Finish::Stopped { .. }),
+        "expected Finish::Stopped, got {:?}",
+        out.finish
+    );
+}
+
+/// Asserts the run stopped with a message containing `needle`.
+pub(crate) fn assert_stopped_with(out: &Outcome, needle: &str) {
+    assert_stopped(out);
+    let Finish::Stopped { message } = &out.finish else {
+        unreachable!("checked by assert_stopped")
+    };
+    let message = message.as_deref().unwrap_or_default();
+    assert!(
+        message.contains(needle),
+        "expected {needle:?} in {message:?}"
+    );
 }

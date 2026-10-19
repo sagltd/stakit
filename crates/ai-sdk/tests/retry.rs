@@ -15,7 +15,7 @@ use stakit_ai_sdk::{Agent, Finish, Message, ProviderError};
 
 #[path = "support/mock.rs"]
 mod mock;
-use mock::{Scripted, stream_of, text_turn};
+use mock::{Scripted, assert_stopped, stream_of, text_turn};
 
 // ── flaky: transient failures for the first N calls ──────────────────────────
 
@@ -137,11 +137,7 @@ async fn fatal_4xx_not_retried() {
 
     let out = agent.run().await.expect("outcome");
 
-    assert!(
-        matches!(out.finish, Finish::Stopped { .. }),
-        "expected Stopped for a fatal error, got {:?}",
-        out.finish
-    );
+    assert_stopped(&out);
     assert_eq!(
         provider.calls(),
         1,
@@ -195,11 +191,7 @@ async fn retries_exhausted_stops_after_cap() {
 
     let out = agent.run().await.expect("outcome");
 
-    assert!(
-        matches!(out.finish, Finish::Stopped { .. }),
-        "expected Stopped after retries exhausted, got {:?}",
-        out.finish
-    );
+    assert_stopped(&out);
     // 1 initial attempt + 2 retries = 3 total calls.
     assert_eq!(
         provider.calls(),

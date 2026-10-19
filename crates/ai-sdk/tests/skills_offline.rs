@@ -59,6 +59,23 @@ impl SkillLoader<()> for MockLoader {
     }
 }
 
+fn skill(id: &str, name: &str, description: &str) -> Skill {
+    Skill {
+        id: id.into(),
+        name: name.into(),
+        description: description.into(),
+    }
+}
+
+/// An agent on `provider` (model "recorder") with `skills`, asked `prompt`.
+fn recorder_agent(provider: &Scripted, skills: Vec<Skill>, prompt: &str) -> Agent<()> {
+    Agent::new(())
+        .provider(provider.clone())
+        .model("recorder")
+        .skills(MockLoader::new(skills))
+        .with_context(vec![Message::user(prompt)])
+}
+
 // ── Recording provider ───────────────────────────────────────────────────────
 //
 // `Scripted` captures the full ChatRequest for each call so tests can assert
@@ -79,23 +96,11 @@ fn with_tool_call(name: &'static str, args: &'static str) -> Scripted {
 #[tokio::test]
 async fn list_is_called_at_start_and_injected_into_system_prompt() {
     let skills = vec![
-        Skill {
-            id: "s1".into(),
-            name: "Skill One".into(),
-            description: "first skill".into(),
-        },
-        Skill {
-            id: "s2".into(),
-            name: "Skill Two".into(),
-            description: "second skill".into(),
-        },
+        skill("s1", "Skill One", "first skill"),
+        skill("s2", "Skill Two", "second skill"),
     ];
     let provider = text_only();
-    let mut agent = Agent::new(())
-        .provider(provider.clone())
-        .model("recorder")
-        .skills(MockLoader::new(skills))
-        .with_context(vec![Message::user("hi")]);
+    let mut agent = recorder_agent(&provider, skills, "hi");
 
     let _ = agent.run().await.expect("outcome");
 
@@ -139,16 +144,8 @@ async fn list_is_called_at_start_and_injected_into_system_prompt() {
 #[tokio::test]
 async fn search_skills_returns_matches_for_query() {
     let skills = vec![
-        Skill {
-            id: "s1".into(),
-            name: "Rust coding".into(),
-            description: "write Rust".into(),
-        },
-        Skill {
-            id: "s2".into(),
-            name: "Python scripting".into(),
-            description: "write Python".into(),
-        },
+        skill("s1", "Rust coding", "write Rust"),
+        skill("s2", "Python scripting", "write Python"),
     ];
     // A provider that calls `search_skills` on the first turn.
     let provider =
@@ -177,17 +174,9 @@ async fn search_skills_returns_matches_for_query() {
 
 #[tokio::test]
 async fn load_skill_returns_body_on_known_id() {
-    let skills = vec![Skill {
-        id: "rust".into(),
-        name: "Rust guide".into(),
-        description: "guides for Rust".into(),
-    }];
+    let skills = vec![skill("rust", "Rust guide", "guides for Rust")];
     let provider = with_tool_call("load_skill", r#"{"id":"rust"}"#);
-    let mut agent = Agent::new(())
-        .provider(provider.clone())
-        .model("recorder")
-        .skills(MockLoader::new(skills))
-        .with_context(vec![Message::user("load it")]);
+    let mut agent = recorder_agent(&provider, skills, "load it");
 
     let result = match last_tool_result(agent.run()).await {
         ToolOutcome::Ok(v) => v,
@@ -204,17 +193,9 @@ async fn load_skill_returns_body_on_known_id() {
 
 #[tokio::test]
 async fn load_skill_with_unknown_id_yields_error_not_panic() {
-    let skills = vec![Skill {
-        id: "known".into(),
-        name: "Known Skill".into(),
-        description: "a skill".into(),
-    }];
+    let skills = vec![skill("known", "Known Skill", "a skill")];
     let provider = with_tool_call("load_skill", r#"{"id":"unknown-id"}"#);
-    let mut agent = Agent::new(())
-        .provider(provider.clone())
-        .model("recorder")
-        .skills(MockLoader::new(skills))
-        .with_context(vec![Message::user("load unknown")]);
+    let mut agent = recorder_agent(&provider, skills, "load unknown");
 
     assert_tool_error(agent.run(), "unknown skill id: unknown-id").await;
 }
@@ -223,17 +204,9 @@ async fn load_skill_with_unknown_id_yields_error_not_panic() {
 
 #[tokio::test]
 async fn load_skill_with_empty_id_yields_error() {
-    let skills = vec![Skill {
-        id: "s1".into(),
-        name: "S1".into(),
-        description: "a skill".into(),
-    }];
+    let skills = vec![skill("s1", "S1", "a skill")];
     let provider = with_tool_call("load_skill", r"{}");
-    let mut agent = Agent::new(())
-        .provider(provider.clone())
-        .model("recorder")
-        .skills(MockLoader::new(skills))
-        .with_context(vec![Message::user("load empty")]);
+    let mut agent = recorder_agent(&provider, skills, "load empty");
 
     assert_tool_error(agent.run(), "missing required argument: id").await;
 }
@@ -243,11 +216,7 @@ async fn load_skill_with_empty_id_yields_error() {
 #[tokio::test]
 async fn loader_load_not_called_eagerly() {
     let load_counter = Arc::new(AtomicU32::new(0));
-    let skills = vec![Skill {
-        id: "s1".into(),
-        name: "Skill One".into(),
-        description: "a skill".into(),
-    }];
+    let skills = vec![skill("s1", "Skill One", "a skill")];
     // Provider that just emits text — no load_skill tool call.
     let provider = text_only();
     let mut agent = Agent::new(())
@@ -282,11 +251,7 @@ impl AgentMiddleware<()> for SetSystemAtStep1 {
 
 #[tokio::test]
 async fn skill_manifest_is_injected_each_step_and_set_system_still_applies() {
-    let skills = vec![Skill {
-        id: "s1".into(),
-        name: "Skill One".into(),
-        description: "first skill".into(),
-    }];
+    let skills = vec![skill("s1", "Skill One", "first skill")];
     // Step 0 calls a built-in skill tool so the loop runs a second step; the
     // middleware then swaps the base system prompt before step 1.
     let provider = with_tool_call("search_skills", r#"{"query":"x"}"#);

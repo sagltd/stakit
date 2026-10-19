@@ -14,7 +14,10 @@ use stakit_model::{JsonSchema, Model};
 
 #[path = "support/mock.rs"]
 mod mock;
-use mock::{EchoTool, Scripted, assert_tool_error, drain, end, text_turn, tool_turn};
+use mock::{
+    EchoTool, Scripted, assert_stopped, assert_stopped_with, assert_tool_error, drain, end,
+    text_turn, tool_turn,
+};
 
 // ── A scripted provider: step 1 → tool call, step 2 → text "done" ───────────
 
@@ -151,7 +154,7 @@ async fn middleware_stop_in_on_start_halts_with_message() {
         .register_middleware(StopAtStart)
         .with_context(vec![Message::user("hi")]);
     let out = agent.run().await.expect("outcome");
-    assert!(matches!(out.finish, Finish::Stopped { .. }));
+    assert_stopped(&out);
     assert_eq!(out.text, "halted before any model call");
     assert_eq!(out.steps, 0);
 }
@@ -338,14 +341,7 @@ async fn no_provider_for_model_stops_with_error() {
         .model("ghost")
         .with_context(vec![Message::user("hi")]);
     let out = agent.run().await.expect("outcome");
-    assert!(matches!(out.finish, Finish::Stopped { .. }));
-    let Finish::Stopped { message } = out.finish else {
-        unreachable!()
-    };
-    assert!(
-        message.unwrap_or_default().contains("ghost"),
-        "expected the missing-model error"
-    );
+    assert_stopped_with(&out, "ghost");
 }
 
 #[tokio::test]

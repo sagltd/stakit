@@ -17,6 +17,10 @@ use stakit_ai_sdk::{
 };
 use stakit_model::{JsonSchema, Model};
 
+#[path = "support/mock.rs"]
+mod mock;
+use mock::assert_stopped_with;
+
 // ── A provider that stamps its id in the text it emits ───────────────────────
 
 #[derive(Clone)]
@@ -260,16 +264,5 @@ async fn set_model_to_unregistered_stops_with_error() {
 
     let out = agent.run().await.expect("outcome");
 
-    assert!(
-        matches!(out.finish, Finish::Stopped { .. }),
-        "expected Stopped, got {:?}",
-        out.finish
-    );
-    let Finish::Stopped { message } = out.finish else {
-        unreachable!()
-    };
-    assert!(
-        message.unwrap_or_default().contains("ghost"),
-        "error should mention the missing model id"
-    );
+    assert_stopped_with(&out, "ghost");
 }
