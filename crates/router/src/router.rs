@@ -3,7 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{Stream, StreamExt as _};
+use futures::future::BoxFuture;
+use futures::{Future, FutureExt as _, Stream, StreamExt as _};
 use hashbrown::HashMap;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
@@ -12,8 +13,12 @@ use stakit_model::TSType;
 
 use crate::action::{ErasedAction, ErasedBorrowAction, ErasedStreamAction};
 use crate::client::{ClientAction, ClientHandle, ClientMeta, DEFAULT_CLIENT_CALL_TIMEOUT};
+use crate::pubsub::channel::{ErasedChannel, Registered};
 use crate::session::Session;
-use crate::{Action, BorrowAction, Cx, Error, Frame, Reply, StreamAction};
+use crate::{
+    Action, Authorize, BorrowAction, Cx, Error, Frame, Hub, Identity, Reply, SessionConfig,
+    StreamAction,
+};
 
 /// A registry of actions, generic over the global ctx `G` and request ctx `R`.
 ///
@@ -35,7 +40,16 @@ pub struct Router<G, R> {
     pub(crate) client_actions: Vec<ClientMeta>,
     pub(crate) client_call_timeout: Duration,
     pub(crate) on_error: ErrorHook,
+    pub(crate) hub: Hub,
+    pub(crate) channels: HashMap<&'static str, Arc<dyn ErasedChannel<G, R>>>,
+    pub(crate) channel_meta: Vec<ClientMeta>,
+    pub(crate) session_config: SessionConfig,
+    pub(crate) auth: Option<AuthHook<G, R>>,
 }
+
+/// The duplex `auth` frame hook: `(app, current req, params) → (new req, identity)`.
+pub(crate) type AuthHook<G, R> =
+    Arc<dyn Fn(Arc<G>, R, Value) -> BoxFuture<'static, Result<(R, Identity), Error>> + Send + Sync>;
 
 /// A hook that transforms every outgoing error before it reaches the client —
 /// e.g. redact details in production, or surface them in development.
@@ -57,7 +71,26 @@ where
             client_actions: Vec::new(),
             client_call_timeout: DEFAULT_CLIENT_CALL_TIMEOUT,
             on_error: Arc::new(|error| error),
+            hub: None,
+            channels: HashMap::new(),
+            channel_meta: Vec::new(),
+            session_config: SessionConfig::default(),
+            auth: None,
         }
+    }
+
+    /// The duplex session limits (adapters size their socket buffers from
+    /// [`SessionConfig::max_frame_bytes`]).
+    #[must_use]
+    pub const fn session_config(&self) -> &SessionConfig {
+        &self.session_config
+    }
+
+    /// This router's pub/sub hub — publish from outside an action (jobs,
+    /// webhooks) with [`Hub::publish`].
+    #[must_use]
+    pub const fn hub(&self) -> &Hub {
+        &self.hub
     }
 
     /// Dispatches a unary request. The `payload` carries every call (`action ->
@@ -143,6 +176,7 @@ where
             app: Arc::clone(&self.app),
             req,
             client: ClientHandle::default(),
+            hub: self.hub.clone(),
         };
         if let Some(handler) = self.borrow_actions.get(action) {
             return match handler.dispatch(&cx, params.as_bytes()).await {
@@ -188,6 +222,7 @@ where
             app: Arc::clone(&self.app),
             req,
             client: ClientHandle::default(),
+            hub: self.hub.clone(),
         };
         match handler.dispatch(&cx, params).await {
             Ok(data) => Reply::ok(data),
@@ -205,6 +240,7 @@ where
         R: Clone,
     {
         let app = Arc::clone(&self.app);
+        let hub = self.hub.clone();
         let on_error = Arc::clone(&self.on_error);
         let entries = match payload {
             Value::Array(items) => parse_array(items),
@@ -229,8 +265,12 @@ where
                     action,
                     params,
                     handler,
-                    Arc::clone(&app),
-                    req.clone(),
+                    Cx {
+                        app: Arc::clone(&app),
+                        req: req.clone(),
+                        client: ClientHandle::default(),
+                        hub: hub.clone(),
+                    },
                     Arc::clone(&on_error),
                 )));
             }
@@ -249,6 +289,7 @@ where
             &self.borrow_actions,
             &self.streams,
             &self.client_actions,
+            &self.channel_meta,
         )
     }
 }
@@ -273,8 +314,7 @@ fn action_stream<G, R>(
     action: String,
     params: Value,
     handler: Option<Arc<dyn ErasedStreamAction<G, R>>>,
-    app: Arc<G>,
-    req: R,
+    cx: Cx<G, R>,
     on_error: ErrorHook,
 ) -> impl Stream<Item = Frame>
 where
@@ -285,11 +325,6 @@ where
         let Some(handler) = handler else {
             yield Frame::error(index, action.clone(), (on_error)(Error::not_found(&action)));
             return;
-        };
-        let cx = Cx {
-            app,
-            req,
-            client: ClientHandle::default(),
         };
         // `dispatch` runs the action's `before` guard + deserialize + validate
         // inside the stream; any of those failing surfaces as one `Err` item.
@@ -340,6 +375,11 @@ pub struct Builder<G, R> {
     client_actions: Vec<ClientMeta>,
     client_call_timeout: Duration,
     on_error: ErrorHook,
+    hub: Option<Hub>,
+    channels: HashMap<&'static str, Arc<dyn ErasedChannel<G, R>>>,
+    channel_meta: Vec<ClientMeta>,
+    session_config: SessionConfig,
+    auth: Option<AuthHook<G, R>>,
 }
 
 impl<G, R> Builder<G, R>
@@ -421,6 +461,65 @@ where
         self
     }
 
+    /// Uses `hub` for pub/sub (default: a single-node hub). Share one hub per
+    /// node; link nodes with a [`Broker`](crate::Broker).
+    #[must_use]
+    pub fn hub(mut self, hub: Hub) -> Self {
+        self.hub = Some(hub);
+        self
+    }
+
+    /// Lets clients `subscribe` to channel `C` (authorized per subscribe by
+    /// [`Authorize::authorize`]); its key type is included in the generated
+    /// TypeScript (`Channels`).
+    ///
+    /// # Panics
+    /// If `C::NAME` is a reserved built-in name (`user`, `device`) — a
+    /// startup-time programming error, like a missing [`Builder::ctx`].
+    #[must_use]
+    pub fn channel<C: Authorize<G, R>>(mut self) -> Self {
+        assert!(
+            !crate::pubsub::channel::RESERVED_NAMES.contains(&C::NAME),
+            "channel name `{}` is reserved for the built-in channels",
+            C::NAME
+        );
+        let mut decls = std::collections::BTreeMap::new();
+        <C as TSType>::ts_declarations(&mut decls);
+        self.channel_meta.push(ClientMeta {
+            name: C::NAME,
+            params_ref: <C as TSType>::ts_ref(),
+            return_ref: String::new(),
+            decls,
+        });
+        self.channels
+            .insert(C::NAME, Arc::new(Registered::<C>(std::marker::PhantomData)));
+        self
+    }
+
+    /// Sets duplex session lifecycle limits (heartbeat, idle, auth window,
+    /// caps, frame size).
+    #[must_use]
+    pub const fn session_config(mut self, config: SessionConfig) -> Self {
+        self.session_config = config;
+        self
+    }
+
+    /// Requires duplex sessions to authenticate with an `auth` frame within
+    /// [`SessionConfig::auth_window`]. `hook(app, req, params)` returns the
+    /// authenticated request context and its [`Identity`], or an error (the
+    /// session is then closed).
+    #[must_use]
+    pub fn on_auth<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(Arc<G>, R, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(R, Identity), Error>> + Send + 'static,
+    {
+        self.auth = Some(Arc::new(move |app, req, params| {
+            hook(app, req, params).boxed()
+        }));
+        self
+    }
+
     /// Finalizes the router.
     ///
     /// # Panics
@@ -437,6 +536,11 @@ where
             client_actions: self.client_actions,
             client_call_timeout: self.client_call_timeout,
             on_error: self.on_error,
+            hub: self.hub.unwrap_or_default(),
+            channels: self.channels,
+            channel_meta: self.channel_meta,
+            session_config: self.session_config,
+            auth: self.auth,
         }
     }
 }

@@ -253,6 +253,7 @@ function makeServer(serverName: string): Server<WsData> {
                 id: frame.id,
                 status: 'ok',
                 data: i,
+                more: true,
               }),
             )
           }

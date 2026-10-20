@@ -1,11 +1,12 @@
 //! The action context.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::client::{ClientAction, ClientHandle};
-use crate::{Action, Error};
+use crate::{Action, Channel, Error, Hub};
 
 /// Context handed to every action.
 ///
@@ -21,6 +22,7 @@ pub struct Cx<G, R> {
     /// Per-request context — built fresh per request (e.g. the current user).
     pub req: R,
     pub(crate) client: ClientHandle,
+    pub(crate) hub: Hub,
 }
 
 impl<G, R> Cx<G, R> {
@@ -41,7 +43,22 @@ impl<G, R> Cx<G, R> {
             app: Arc::new(app),
             req,
             client: ClientHandle::default(),
+            hub: Hub::default(),
         }
+    }
+
+    /// Uses `hub` for [`Cx::publish`] / [`Cx::client_call_device`] — chain it onto
+    /// [`Cx::test`] to observe publishes in a unit test.
+    #[must_use]
+    pub fn with_hub(mut self, hub: Hub) -> Self {
+        self.hub = hub;
+        self
+    }
+
+    /// The pub/sub hub of the router running this action.
+    #[must_use]
+    pub const fn hub(&self) -> &Hub {
+        &self.hub
     }
 
     /// Stubs `client_call` with an in-process handler — chain it onto
@@ -87,8 +104,58 @@ impl<G, R> Cx<G, R> {
     where
         C: ClientAction,
     {
-        let params = serde_json::to_value(&params).map_err(|e| Error::encode(&e))?;
-        let value = self.client.call(C::NAME, params).await?;
-        serde_json::from_value(value).map_err(|e| Error::decode(&e))
+        typed_call::<C, _, _>(params, |params| self.client.call(C::NAME, params)).await
     }
+
+    /// Publishes client action `C` to every connection subscribed to
+    /// `channel`, on every node (fire-and-forget, at-most-once). Works from any
+    /// transport — an HTTP action can notify websocket subscribers.
+    ///
+    /// # Errors
+    /// A bad channel key, unserializable params, or a broker rejection (e.g.
+    /// payload too large for the broker).
+    pub async fn publish<C>(&self, channel: &impl Channel, params: &C::Params) -> Result<(), Error>
+    where
+        C: ClientAction,
+    {
+        self.hub.publish::<C>(&channel.topic()?, params).await
+    }
+
+    /// Invokes client action `C` on the connection holding `user`'s `device`
+    /// — on this node or any other — and awaits its reply. The device must be
+    /// bound to `user` (see [`Identity`](crate::Identity)), so an action can't
+    /// be tricked into calling another user's device.
+    ///
+    /// # Errors
+    /// - `404` when no connection holds the device and the broker knows it
+    ///   (this node / [`InMemoryBroker`](crate::InMemoryBroker));
+    /// - `504` when the broker can't know (e.g. Postgres: nodes without the
+    ///   device stay silent) or the device doesn't answer in time;
+    /// - the device's own error (clamped to 4xx/5xx), or a reply that fails to
+    ///   deserialize.
+    pub async fn client_call_device<C>(
+        &self,
+        user: &str,
+        device: &str,
+        params: C::Params,
+    ) -> Result<C::Return, Error>
+    where
+        C: ClientAction,
+    {
+        typed_call::<C, _, _>(params, |params| {
+            self.hub.client_call_device(user, device, C::NAME, params)
+        })
+        .await
+    }
+}
+
+/// Encodes typed params, runs the JSON-level `call`, decodes the typed reply.
+async fn typed_call<C, F, Fut>(params: C::Params, call: F) -> Result<C::Return, Error>
+where
+    C: ClientAction,
+    F: FnOnce(Value) -> Fut,
+    Fut: Future<Output = Result<Value, Error>>,
+{
+    let params = serde_json::to_value(&params).map_err(|e| Error::encode(&e))?;
+    serde_json::from_value(call(params).await?).map_err(|e| Error::decode(&e))
 }

@@ -36,6 +36,7 @@ quote = "1.0"
 proc-macro2 = "1.0"
 # Benchmarking
 divan = "0.1"
+stats_alloc = "0.1.10"
 # Database (stakit-orm)
 # Base sqlx (no backend). Each backend is enabled by a stakit-orm cargo feature
 # (postgres/sqlite/mysql) so consumers compile only the driver they use.
@@ -59,6 +60,7 @@ stakit-ai-sdk = { path = "crates/ai-sdk", version = "0.1.0" }
 stakit-ai-sdk-derive = { path = "crates/ai-sdk-derive", version = "0.1.0" }
 stakit-client = { path = "crates/client", version = "0.1.0" }
 stakit-macro-support = { path = "crates/macro-support", version = "0.1.0" }
+stakit-pubsub-postgres = { path = "crates/pubsub-postgres", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

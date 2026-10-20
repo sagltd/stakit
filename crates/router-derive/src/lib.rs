@@ -56,6 +56,7 @@ pub fn derive_response_error(input: TokenStream) -> TokenStream {
 ///
 /// Examples: `accept_invite` → `acceptInvite`, `oauth_login` → `oauthLogin`,
 /// `ping` → `ping`, `__foo__bar__` → `fooBar`.
+#[cfg(feature = "camel")]
 fn to_lower_camel(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut first = true;

@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use stakit_client::{ActionResult, CallOpts, Client, Method, ServerFrame, TransportError};
 use stakit_model::Model;
-use stakit_router::{ClientAction, Cx, Error, ResponseError, Router, action};
+use stakit_router::{Authorize, Channel, ClientAction, Cx, Error, ResponseError, Router, action};
 
 #[path = "support/fixtures.rs"]
 mod fixtures;
@@ -87,6 +87,31 @@ impl ClientAction for ShowToast {
     type Params = Toast;
     type Return = String;
     const NAME: &'static str = "showToast";
+}
+
+// ── pub/sub ──────────────────────────────────────────────────────────────────
+
+#[derive(Model, Serialize, Deserialize, Clone, Debug)]
+struct Room {
+    id: String,
+}
+
+impl Channel for Room {
+    const NAME: &'static str = "room";
+}
+
+impl Authorize<App, Req> for Room {
+    async fn authorize(&self, _cx: &Cx<App, Req>) -> Result<bool, Error> {
+        Ok(self.id != "secret")
+    }
+}
+
+#[action]
+async fn announce(cx: &Cx<App, Req>, params: Room) -> Result<(), Error> {
+    let toast = Toast {
+        text: format!("news in {}", params.id),
+    };
+    cx.publish::<ShowToast>(&params, &toast).await
 }
 
 // ── actions ──────────────────────────────────────────────────────────────────
@@ -164,6 +189,8 @@ fn build_router(name: &'static str) -> Router<App, Req> {
         .register_stream(count)
         .register_stream(failing)
         .register_stream(progress)
+        .register(announce)
+        .channel::<Room>()
         .build()
 }
 
@@ -252,13 +279,15 @@ async fn handle_socket(router: Arc<Router<App, Req>>, socket: WebSocket) {
         token: None,
         files: Vec::new(),
     });
-    let mut outgoing = session.outgoing();
+    let Some(mut outgoing) = session.outgoing() else {
+        return;
+    };
     let (mut sink, mut stream) = socket.split();
 
     let send_task = tokio::spawn(async move {
-        while let Some(value) = outgoing.recv().await {
-            let text = serde_json::to_string(&value).unwrap();
-            if sink.send(Message::Text(text.into())).await.is_err() {
+        while let Some(frame) = outgoing.recv().await {
+            let text = axum::extract::ws::Utf8Bytes::try_from(frame).unwrap();
+            if sink.send(Message::Text(text)).await.is_err() {
                 break;
             }
         }
@@ -390,11 +419,95 @@ async fn websocket_server_to_client_call() {
                 results += 1;
             }
             Some(Ok(ServerFrame::End { .. })) | None => break,
+            Some(Ok(_)) => {}
             Some(Err(error)) => panic!("ws error: {error}"),
         }
     }
     assert_eq!(toasts, 2);
     assert_eq!(results, 2);
+}
+
+/// Next frame that isn't a call/stream result for another id.
+async fn next_frame(conn: &mut stakit_client::Connection) -> ServerFrame {
+    conn.recv().await.expect("socket closed").expect("ws error")
+}
+
+#[tokio::test] // pub/sub
+async fn websocket_subscribe_receives_publish() {
+    let client = client_for(&spawn_server("A").await);
+    let mut conn = client.connect(CallOpts::new()).await.unwrap();
+
+    let denied = conn
+        .subscribe(
+            "room",
+            Room {
+                id: "secret".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let ServerFrame::Result { id, result } = next_frame(&mut conn).await else {
+        panic!("expected a subscribe result");
+    };
+    assert_eq!(id, denied);
+    assert!(matches!(result, ActionResult::Error(ref error) if error.code == 403));
+
+    let sub = conn
+        .subscribe(
+            "room",
+            Room {
+                id: "r1".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let ServerFrame::Result {
+        id,
+        result: ActionResult::Ok(ack),
+    } = next_frame(&mut conn).await
+    else {
+        panic!("expected a subscribe ack");
+    };
+    assert_eq!(id, sub);
+    assert_eq!(ack["topic"], "room:id=r1");
+
+    conn.send(
+        announce,
+        Room {
+            id: "r1".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut published = None;
+    for _ in 0..2 {
+        if let ServerFrame::Publish {
+            topic,
+            name,
+            seq,
+            params,
+            ..
+        } = next_frame(&mut conn).await
+        {
+            published = Some((topic, name, seq, params));
+        }
+    }
+    let (topic, name, seq, params) = published.expect("no publish frame");
+    assert_eq!(
+        (topic.as_str(), name.as_str(), seq),
+        ("room:id=r1", "showToast", 1)
+    );
+    assert_eq!(params["text"], "news in r1");
+
+    conn.unsubscribe("room:id=r1").await.unwrap();
+    let ServerFrame::Result {
+        result: ActionResult::Ok(removed),
+        ..
+    } = next_frame(&mut conn).await
+    else {
+        panic!("expected an unsubscribe result");
+    };
+    assert_eq!(removed, Value::Bool(true));
 }
 
 #[tokio::test] // 9

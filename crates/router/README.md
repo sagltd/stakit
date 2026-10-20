@@ -83,7 +83,11 @@ let frames = router.on_stream(req_ctx, payload);
 
 // duplex (websocket): a session you pump frames in/out of
 let session = router.session(req_ctx);
+// handle_bytes(inbound) · outgoing() → socket · closed() → close the socket
 ```
+
+Pub/sub (typed channels, `cx.publish`, multi-node brokers) is in
+`docs/pubsub.md`.
 
 See `examples/axum-server` for the full wiring (one `/app` route + `/stream` +
 `/ws`) and the matching Rust + TypeScript clients.

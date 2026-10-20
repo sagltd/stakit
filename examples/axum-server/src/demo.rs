@@ -67,7 +67,7 @@ pub async fn progress_over_ws(client: &Client, n: u64) -> Result<Vec<ServerFrame
         match &frame {
             ServerFrame::ClientCall { id, .. } => conn.reply(*id, "shown").await?,
             ServerFrame::End { .. } => break,
-            ServerFrame::Result { .. } => {}
+            _ => {}
         }
         frames.push(frame);
     }

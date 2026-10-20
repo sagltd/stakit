@@ -19,6 +19,7 @@ serde.workspace = true
 # call's params as a borrowed `&RawValue` slice of the request buffer.
 serde_json = { workspace = true, features = ["raw_value"] }
 futures.workspace = true
+bytes.workspace = true
 async-stream.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 
@@ -32,10 +33,19 @@ camel = ["stakit-model/camel", "stakit-router-derive/camel"]
 [dev-dependencies]
 divan.workspace = true
 thiserror.workspace = true
+stats_alloc.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 
 [[bench]]
 name = "dispatch"
+harness = false
+
+[[bench]]
+name = "pubsub"
+harness = false
+
+[[bench]]
+name = "pubsub_alloc"
 harness = false
 
 [lints]

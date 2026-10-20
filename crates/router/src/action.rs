@@ -90,7 +90,7 @@ impl Signature {
 }
 
 /// The error a panicking action, guard or hook is reported as.
-fn panicked(panic: &(dyn Any + Send)) -> Error {
+pub(crate) fn panicked(panic: &(dyn Any + Send)) -> Error {
     Error::internal(format!("action panicked: {}", panic_message(panic)))
 }
 

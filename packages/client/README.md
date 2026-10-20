@@ -107,6 +107,38 @@ for await (const frame of conn.stream) {
 conn.close()
 ```
 
+### Realtime: auth, calls, pub/sub, reconnect
+
+```ts
+const socket = client.connect({
+  auth: () => ({ token }), // first frame on every (re)connect
+  defineClientActions: { confirm }, // answers the server's client_calls
+  publishHandlers: { showToast }, // runs for `publish` frames
+  onReconnect: () => refetchInbox(), // resync auto channels (user/device)
+})
+const reply = await socket.call('greet', { name: 'a' }) // ActionResult
+const room = socket.subscribe(
+  'room',
+  { id: roomId },
+  {
+    onMessage: (m) => render(m.params),
+    onGap: () => refetchRoom(roomId), // missed messages: resync from the API
+  },
+)
+room.unsubscribe()
+// mobile: close on background, reconnect + resubscribe on foreground
+AppState.addEventListener('change', (s) =>
+  s === 'active' ? socket.resume() : socket.pause(),
+)
+```
+
+Heartbeat `ping`s are answered automatically, and a socket that goes quiet for
+`livenessTimeoutMs` (60s) is replaced. An unexpected close reconnects with
+full-jitter backoff (250ms → 30s) and resubscribes; calls made while
+disconnected are queued (each times out after `callTimeoutMs`). `resume()` is
+also a network hint: it skips a pending backoff and replaces a quiet socket.
+Delivery is at-most-once — see `docs/pubsub.md`.
+
 ## Headers
 
 ```ts

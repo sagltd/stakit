@@ -4,6 +4,8 @@
 
 import { parseFrame, payloadRequest, unaryRequest } from './http'
 import type { HttpRequest } from './http'
+import { connectSocket } from './socket'
+import type { ConnectOpts, Connection } from './socket'
 import { TransportError, failedResponse } from './transport-error'
 import type {
   CallOpts,
@@ -15,16 +17,6 @@ import type {
   ParamsMap,
   ResultMap,
 } from './types'
-
-/** A live duplex websocket connection. */
-export interface Connection<R> {
-  /** Invokes server actions (one `call` frame per entry in the map). */
-  readonly send: <P extends ParamsMap<R>>(params: P) => Promise<void>
-  /** Async stream of result maps (keyed by the action that produced them). */
-  readonly stream: AsyncGenerator<ResultMap<R, ParamsMap<R>>>
-  /** Closes the connection. */
-  readonly close: () => void
-}
 
 /** A stakit client handle. */
 export interface Client<R> {
@@ -42,8 +34,11 @@ export interface Client<R> {
     params: P,
     opts?: CallOpts<R>,
   ) => AsyncGenerator<ResultMap<R, P>>
-  /** Opens a duplex websocket connection. */
-  readonly connect: (opts?: CallOpts<R>) => Connection<R>
+  /**
+   * Opens a reconnecting duplex websocket connection (calls, client actions,
+   * pub/sub subscriptions). See `ConnectOpts` for auth, backoff and pausing.
+   */
+  readonly connect: (opts?: ConnectOpts<R>) => Connection<R>
   /** Per-action proxy: `client.actions.greet(params, opts?)`. */
   readonly actions: ActionsProxy<R>
 }
@@ -222,119 +217,13 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
     }
   }
 
-  const connect: Client<R>['connect'] = (opts) => {
-    const handlers = {
-      ...state.defineClientActions,
-      ...(opts?.defineClientActions ?? {}),
-    } as Record<string, (params: unknown) => unknown>
-    const socket = new WebSocket(toWsUrl(opts?.url ?? state.wsUrl ?? state.url))
-    const idToAction = new Map<number, string>()
-    let nextId = 1
-
-    const queue: ResultMap<R, ParamsMap<R>>[] = []
-    let wake: (() => void) | null = null
-    let closed = false
-    const push = (item: ResultMap<R, ParamsMap<R>>): void => {
-      queue.push(item)
-      if (wake) {
-        wake()
-        wake = null
-      }
-    }
-
-    const ready = new Promise<void>((resolve, reject) => {
-      socket.onopen = () => resolve()
-      socket.onerror = () =>
-        reject(state.onError(new Error('websocket connection failed')))
+  const connect: Client<R>['connect'] = (opts = {}) =>
+    connectSocket({
+      url: toWsUrl(opts.url ?? state.wsUrl ?? state.url),
+      handlers: handlerMap(state.defineClientActions, opts.defineClientActions),
+      publishHandlers: handlerMap(opts.publishHandlers),
+      opts,
     })
-
-    socket.onclose = () => {
-      closed = true
-      if (wake) {
-        wake()
-        wake = null
-      }
-    }
-    socket.onmessage = (event: MessageEvent) => {
-      void handleFrame(String(event.data))
-    }
-
-    async function handleFrame(raw: string): Promise<void> {
-      const frame = JSON.parse(raw) as {
-        kind: string
-        id: number
-        name?: string
-        params?: unknown
-        status?: string
-        data?: unknown
-        error?: unknown
-      }
-      if (frame.kind === 'result') {
-        const action = idToAction.get(frame.id) ?? ''
-        const result =
-          frame.status === 'error'
-            ? { status: 'error', error: frame.error }
-            : { status: 'ok', data: frame.data }
-        push({ [action]: result } as ResultMap<R, ParamsMap<R>>)
-      } else if (frame.kind === 'client_call') {
-        const handler = frame.name ? handlers[frame.name] : undefined
-        if (!handler) {
-          socket.send(
-            JSON.stringify({
-              kind: 'client_result',
-              id: frame.id,
-              error: { code: 404, message: `no handler for ${frame.name}` },
-            }),
-          )
-          return
-        }
-        try {
-          const data = await handler(frame.params)
-          socket.send(
-            JSON.stringify({ kind: 'client_result', id: frame.id, data }),
-          )
-        } catch (error) {
-          socket.send(
-            JSON.stringify({
-              kind: 'client_result',
-              id: frame.id,
-              error: { code: 500, message: asError(error).message },
-            }),
-          )
-        }
-      }
-    }
-
-    async function* gen(): AsyncGenerator<ResultMap<R, ParamsMap<R>>> {
-      for (;;) {
-        while (queue.length) yield queue.shift()!
-        if (closed) return
-        await new Promise<void>((resolve) => {
-          wake = resolve
-        })
-      }
-    }
-
-    return {
-      async send(params) {
-        await ready
-        for (const action of Object.keys(params)) {
-          const id = nextId++
-          idToAction.set(id, action)
-          socket.send(
-            JSON.stringify({
-              kind: 'call',
-              id,
-              action,
-              params: (params as Record<string, unknown>)[action],
-            }),
-          )
-        }
-      },
-      stream: gen(),
-      close: () => socket.close(),
-    }
-  }
 
   const actions = new Proxy({} as ActionsProxy<R>, {
     get(_target, name: string) {
@@ -352,6 +241,20 @@ export function createClient<R>(options: ClientOptions<R>): Client<R> {
 
 function mergeHeaders(base: HeadersMap, extra?: HeadersMap): HeadersMap {
   return { ...base, ...(extra ?? {}) }
+}
+
+/**
+ * Own, function-valued handlers only (no prototype names like `toString`; an
+ * explicit `undefined` doesn't erase a base handler).
+ */
+function handlerMap(
+  ...sources: (object | undefined)[]
+): Map<string, (params: unknown) => unknown> {
+  const map = new Map<string, (params: unknown) => unknown>()
+  for (const source of sources)
+    for (const [name, handler] of Object.entries(source ?? {}))
+      if (typeof handler === 'function') map.set(name, handler)
+  return map
 }
 
 function toWsUrl(url: string): string {

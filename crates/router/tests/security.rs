@@ -22,7 +22,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::executor::block_on;
@@ -287,10 +286,7 @@ async fn session_ignores_hostile_frames_without_panicking() {
     session2.handle(&json!({
         "kind": "call", "id": 1, "action": <greet as Endpoint>::ACTION, "params": { "name": "ok" }
     }));
-    let result = tokio::time::timeout(Duration::from_secs(2), out2.recv())
-        .await
-        .expect("session deadlocked after hostile frames")
-        .expect("session produced no result");
+    let result = next_frame(&mut out2).await;
     assert_eq!(result["kind"], "result");
     assert_eq!(result["status"], "ok");
     assert_eq!(result["data"], json!("ok"));

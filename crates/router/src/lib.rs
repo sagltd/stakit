@@ -21,6 +21,7 @@ mod cx;
 mod endpoint;
 mod error;
 mod middleware;
+mod pubsub;
 mod reply;
 mod router;
 mod session;
@@ -32,9 +33,12 @@ pub use cx::Cx;
 pub use endpoint::{Endpoint, Kind};
 pub use error::{Error, ErrorCodes, ResponseError};
 pub use middleware::{ActionExt, Guarded, Middleware, StreamActionExt, StreamGuarded};
+pub use pubsub::broker::{Broker, InMemoryBroker};
+pub use pubsub::channel::{Authorize, Channel, DeviceChannel, MAX_TOPIC_BYTES, UserChannel};
+pub use pubsub::hub::{BrokerSink, Hub};
 pub use reply::{ErrorBody, Frame, Reply};
 pub use router::{Builder, Router};
-pub use session::Session;
+pub use session::{CloseReason, Identity, Session, SessionConfig};
 
 // Convenience re-exports from `stakit-model` so a single `stakit-router`
 // dependency gives you the validation + TypeScript traits/types too. Note: the

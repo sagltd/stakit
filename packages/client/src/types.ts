@@ -27,8 +27,13 @@ export type ActionResult<T> =
 
 // ── shape extraction (infer-based, so the generated Router needs no index sig) ─
 
-type ServerActionsOf<R> = R extends { serverActions: infer S } ? S : never
+/** The router's `serverActions` map. */
+export type ServerActionsOf<R> = R extends { serverActions: infer S }
+  ? S
+  : never
 type ClientActionsOf<R> = R extends { clientActions: infer C } ? C : never
+/** The router's subscribable `channels` map (`name -> key type`). */
+export type ChannelsOf<R> = R extends { channels: infer C } ? C : never
 
 /** A partial map of `action -> params` accepted by `fetch` / `stream`. */
 export type ParamsMap<R> = {
@@ -55,6 +60,17 @@ export type ClientActionHandlers<R> = {
   ) =>
     | (ClientActionsOf<R>[K] extends { return: infer Ret } ? Ret : never)
     | Promise<ClientActionsOf<R>[K] extends { return: infer Ret } ? Ret : never>
+}
+
+/**
+ * Handlers for client actions the server *publishes* on a channel (return
+ * values are ignored). Separate from `ClientActionHandlers`, which answer
+ * `client_call`s.
+ */
+export type PublishHandlers<R> = {
+  [K in keyof ClientActionsOf<R>]: (
+    params: ClientActionsOf<R>[K] extends { params: infer P } ? P : never,
+  ) => unknown
 }
 
 /** A file payload for multipart upload. */

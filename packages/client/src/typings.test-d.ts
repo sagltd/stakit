@@ -17,6 +17,7 @@ interface TestRouter {
   clientActions: {
     showToast: { params: { text: string }; return: string }
   }
+  channels: { room: { id: string } }
 }
 
 type Expect<T extends true> = T
@@ -119,6 +120,36 @@ void _resultMap
 void _fetchOption
 void _methodOption
 void _errorData
+void _socket
+
+// socket calls and subscriptions are typed from the generated Router
+async function _socket(): Promise<void> {
+  const conn = client.connect()
+  const reply = await conn.call('greet', { name: 'a' })
+  if (isOk(reply)) {
+    type _R = Expect<Equal<typeof reply.data, { message: string }>>
+    const _result: _R = true
+    void _result
+  }
+  conn.subscribe('room', { id: 'r1' })
+  // @ts-expect-error — unknown channel
+  conn.subscribe('lobby', { id: 'r1' })
+  // @ts-expect-error — wrong key shape
+  conn.subscribe('room', { roomId: 'r1' })
+  // @ts-expect-error — wrong params
+  await conn.call('greet', { nope: 1 })
+  client.connect({
+    defineClientActions: { showToast: ({ text }) => text },
+    publishHandlers: { showToast: ({ text }) => void text },
+  })
+  // @ts-expect-error — publish handler params are typed
+  client.connect({ publishHandlers: { showToast: ({ nope }) => nope } })
+  const plain = createClient<{ serverActions: TestRouter['serverActions'] }>({
+    url: 'x',
+  }).connect()
+  // @ts-expect-error — a router without channels has nothing to subscribe to
+  plain.subscribe('room', { id: 'r1' })
+}
 
 // an error body may carry a structured payload, typed `unknown` until narrowed,
 // and a stable machine-readable `type` to branch on

@@ -5,13 +5,24 @@
 // `isOk` / `isError`; only real network failures reject (or hit `onError`).
 
 export { createClient } from './client'
-export type { Client, Connection } from './client'
+export type { Client } from './client'
+export type {
+  Connection,
+  ConnectOpts,
+  GapReason,
+  PublishMessage,
+  SocketStatus,
+  Subscription,
+  WebSocketFactory,
+  WebSocketLike,
+} from './socket'
 export { isError, isOk } from './guards'
 export { TransportError } from './transport-error'
 export type { TransportErrorDetails } from './transport-error'
 export type {
   ActionResult,
   CallOpts,
+  ChannelsOf,
   ClientActionHandlers,
   ClientOptions,
   ErrorBody,
@@ -22,5 +33,6 @@ export type {
   HeadersMap,
   HttpMethod,
   ParamsMap,
+  PublishHandlers,
   ResultMap,
 } from './types'

@@ -54,6 +54,7 @@ pub struct Connection {
 
 /// A frame received from the server over a [`Connection`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ServerFrame {
     /// A result for a call (matched to its `id`). `data` is left untyped because
     /// one connection multiplexes many actions; deserialize it yourself.
@@ -76,6 +77,35 @@ pub enum ServerFrame {
         action: String,
         /// The (untyped) params.
         data: Value,
+    },
+    /// A pub/sub message on a subscribed topic. A `seq` that isn't the last
+    /// one + 1, or a new `epoch`, means messages were missed: resync.
+    Publish {
+        /// The topic it was published on.
+        topic: String,
+        /// The client action name.
+        name: String,
+        /// Per-topic sequence number.
+        seq: u64,
+        /// Topic history epoch.
+        epoch: u64,
+        /// The (untyped) params.
+        params: Value,
+    },
+    /// The topic's history reset (server lost messages): resync, then continue
+    /// from `epoch` / `seq`.
+    Reset {
+        /// The topic.
+        topic: String,
+        /// The new epoch.
+        epoch: u64,
+        /// The new sequence number.
+        seq: u64,
+    },
+    /// The server removed this subscription (e.g. membership revoked).
+    Unsubscribed {
+        /// The topic.
+        topic: String,
     },
 }
 
@@ -148,6 +178,52 @@ impl Connection {
         Ok(id)
     }
 
+    /// Authenticates the session (`auth` frame); the answer is a
+    /// [`ServerFrame::Result`] tagged with the returned id.
+    ///
+    /// # Errors
+    /// Returns `Err` if encoding or sending fails.
+    pub async fn auth<T: Serialize>(&mut self, params: T) -> Result<u64, TransportError> {
+        let params = serde_json::to_value(&params).map_err(TransportError::Encode)?;
+        self.send_frame("auth", json!({ "params": params })).await
+    }
+
+    /// Subscribes to `channel` with `key`; the [`ServerFrame::Result`] for the
+    /// returned id carries `{ topic, epoch, seq }` (or the denial).
+    ///
+    /// # Errors
+    /// Returns `Err` if encoding or sending fails.
+    pub async fn subscribe<K: Serialize>(
+        &mut self,
+        channel: &str,
+        key: K,
+    ) -> Result<u64, TransportError> {
+        let key = serde_json::to_value(&key).map_err(TransportError::Encode)?;
+        self.send_frame("subscribe", json!({ "channel": channel, "key": key }))
+            .await
+    }
+
+    /// Unsubscribes from `topic` (as returned by the subscribe result).
+    ///
+    /// # Errors
+    /// Returns `Err` if sending fails.
+    pub async fn unsubscribe(&mut self, topic: &str) -> Result<u64, TransportError> {
+        self.send_frame("unsubscribe", json!({ "topic": topic }))
+            .await
+    }
+
+    /// Sends a `{ kind, id, ...fields }` request frame with a fresh id.
+    async fn send_frame(&mut self, kind: &str, mut fields: Value) -> Result<u64, TransportError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        if let Some(map) = fields.as_object_mut() {
+            map.insert("kind".to_owned(), json!(kind));
+            map.insert("id".to_owned(), json!(id));
+        }
+        self.send_value(&fields).await?;
+        Ok(id)
+    }
+
     /// Answers a [`ServerFrame::ClientCall`] with success data.
     ///
     /// # Errors
@@ -169,21 +245,32 @@ impl Connection {
     }
 
     /// Reads the next frame from the server, or `None` when the socket closes.
+    /// Server heartbeat `ping` frames are answered (`pong`) transparently.
     ///
     /// # Errors
     /// Returns `Err` on a websocket-level failure.
     pub async fn recv(&mut self) -> Option<Result<ServerFrame, TransportError>> {
         loop {
-            match self.stream.next().await? {
-                Ok(Message::Text(text)) => return Some(parse_frame(text.as_bytes())),
-                Ok(Message::Binary(bytes)) => return Some(parse_frame(bytes.as_ref())),
+            let frame = match self.stream.next().await? {
+                Ok(Message::Text(text)) => parse_frame(text.as_bytes()),
+                Ok(Message::Binary(bytes)) => parse_frame(bytes.as_ref()),
                 // Keepalive: answer server pings (the split sink isn't auto-ponged).
                 Ok(Message::Ping(payload)) => {
                     let _ = self.sink.send(Message::Pong(payload)).await;
+                    continue;
                 }
-                Ok(Message::Pong(_) | Message::Frame(_)) => {}
+                Ok(Message::Pong(_) | Message::Frame(_)) => continue,
                 Ok(Message::Close(_)) => return None,
                 Err(error) => return Some(Err(TransportError::WebSocket(error.to_string()))),
+            };
+            match frame {
+                Ok(None) => {
+                    if let Err(error) = self.send_value(&json!({ "kind": "pong" })).await {
+                        return Some(Err(error));
+                    }
+                }
+                Ok(Some(frame)) => return Some(Ok(frame)),
+                Err(error) => return Some(Err(error)),
             }
         }
     }
@@ -219,11 +306,39 @@ impl Connection {
     }
 }
 
-/// Parses a server frame from raw bytes.
-fn parse_frame(bytes: &[u8]) -> Result<ServerFrame, TransportError> {
+fn text_field(value: &Value, name: &str) -> String {
+    value
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn number_field(value: &Value, name: &str) -> u64 {
+    value.get(name).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// Parses a server frame from raw bytes; `None` for a heartbeat `ping`.
+fn parse_frame(bytes: &[u8]) -> Result<Option<ServerFrame>, TransportError> {
     let value: Value = serde_json::from_slice(bytes).map_err(TransportError::Decode)?;
-    let id = value.get("id").and_then(Value::as_u64).unwrap_or(0);
-    match value.get("kind").and_then(Value::as_str) {
+    let id = number_field(&value, "id");
+    let frame = match value.get("kind").and_then(Value::as_str) {
+        Some("ping") => return Ok(None),
+        Some("publish") => ServerFrame::Publish {
+            topic: text_field(&value, "topic"),
+            name: text_field(&value, "name"),
+            seq: number_field(&value, "seq"),
+            epoch: number_field(&value, "epoch"),
+            params: value.get("params").cloned().unwrap_or(Value::Null),
+        },
+        Some("reset") => ServerFrame::Reset {
+            topic: text_field(&value, "topic"),
+            epoch: number_field(&value, "epoch"),
+            seq: number_field(&value, "seq"),
+        },
+        Some("unsubscribed") => ServerFrame::Unsubscribed {
+            topic: text_field(&value, "topic"),
+        },
         Some("result") => {
             let result = if value.get("status").and_then(Value::as_str) == Some("error") {
                 let error: ErrorBody = value
@@ -243,20 +358,17 @@ fn parse_frame(bytes: &[u8]) -> Result<ServerFrame, TransportError> {
             } else {
                 ActionResult::Ok(value.get("data").cloned().unwrap_or(Value::Null))
             };
-            Ok(ServerFrame::Result { id, result })
+            ServerFrame::Result { id, result }
         }
-        Some("end") => Ok(ServerFrame::End { id }),
-        Some("client_call") => Ok(ServerFrame::ClientCall {
+        Some("end") => ServerFrame::End { id },
+        Some("client_call") => ServerFrame::ClientCall {
             id,
-            action: value
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
+            action: text_field(&value, "name"),
             data: value.get("params").cloned().unwrap_or(Value::Null),
-        }),
-        _ => Err(TransportError::WebSocket("unknown frame kind".to_owned())),
-    }
+        },
+        _ => return Err(TransportError::WebSocket("unknown frame kind".to_owned())),
+    };
+    Ok(Some(frame))
 }
 
 /// Rewrites an `http(s)` url to `ws(s)`; leaves `ws(s)` untouched.

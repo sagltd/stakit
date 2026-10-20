@@ -61,6 +61,9 @@ export interface ClientActionResults {
   showToast: string;
 }
 
+export interface Channels {
+}
+
 export interface Router {
   serverActions: {
     [K in keyof ActionParameters]: {
@@ -75,4 +78,5 @@ export interface Router {
       return: ClientActionResults[K];
     };
   };
+  channels: Channels;
 }

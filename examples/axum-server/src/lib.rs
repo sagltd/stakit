@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use axum::Router as AxumRouter;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRequest as _, Multipart, Query, Request, State};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
@@ -350,39 +350,71 @@ async fn stream_handler(
 }
 
 // ---- websocket duplex: GET /ws ----
+//
+// Production adapters should also check the `Origin` header against an
+// allow-list before upgrading whenever auth can ride on cookies (browsers send
+// them cross-site: cross-site websocket hijacking), and cap connections per IP
+// before authentication.
 async fn ws(
     State(state): State<AppState>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let req = req_from(&headers, Vec::new());
-    upgrade.on_upgrade(move |socket| handle_ws(state, req, socket))
+    // Reject oversized messages in the socket layer, before they are buffered.
+    let limit = state.router.session_config().max_frame_bytes;
+    upgrade
+        .max_message_size(limit)
+        .max_frame_size(limit)
+        .on_upgrade(move |socket| handle_ws(state, req, socket))
 }
 
 async fn handle_ws(state: AppState, req: Req, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
     let mut session = state.router.session(req);
-    let mut outgoing = session.outgoing();
+    let Some(mut outgoing) = session.outgoing() else {
+        return;
+    };
     let session = Arc::new(session);
 
+    // Outgoing frames are pre-serialized JSON text; when the server closes the
+    // session (idle, slow consumer, auth timeout…) flush what's queued, then
+    // send the close frame with its reason.
+    let closer = Arc::clone(&session);
     let send = tokio::spawn(async move {
-        while let Some(frame) = outgoing.recv().await {
-            if sink
-                .send(Message::Text(frame.to_string().into()))
-                .await
-                .is_err()
-            {
-                break;
+        loop {
+            tokio::select! {
+                frame = outgoing.recv() => {
+                    let Some(frame) = frame else { break };
+                    let Ok(text) = Utf8Bytes::try_from(frame) else { continue };
+                    if sink.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                reason = closer.closed() => {
+                    while let Ok(frame) = outgoing.try_recv() {
+                        if let Ok(text) = Utf8Bytes::try_from(frame) {
+                            let _ = sink.send(Message::Text(text)).await;
+                        }
+                    }
+                    let close = CloseFrame { code: reason.code(), reason: reason.as_str().into() };
+                    let _ = sink.send(Message::Close(Some(close))).await;
+                    break;
+                }
             }
         }
     });
 
-    while let Some(Ok(msg)) = stream.next().await {
-        if let Message::Text(text) = msg
-            && let Ok(value) = serde_json::from_str::<Value>(&text)
-        {
-            session.handle(&value);
+    // Stop reading as soon as the server closed the session.
+    let reading = async {
+        while let Some(Ok(msg)) = stream.next().await {
+            if let Message::Text(text) = msg {
+                session.handle_bytes(text.as_bytes());
+            }
         }
+    };
+    tokio::select! {
+        () = reading => send.abort(),
+        _ = session.closed() => { let _ = send.await; }
     }
-    send.abort();
 }

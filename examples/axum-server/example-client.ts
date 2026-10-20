@@ -29,10 +29,14 @@ if (isOk(g.greet)) console.log('  greet ->', g.greet.data.message)
 
 console.log('== HTTP unary: validation error ==')
 const v = await client.fetch({ greet: { name: '' } })
-if (isError(v.greet)) console.log('  greet("") -> error', v.greet.error.code, v.greet.error.message)
+if (isError(v.greet))
+  console.log('  greet("") -> error', v.greet.error.code, v.greet.error.message)
 
 console.log('== HTTP: MANY actions in ONE request ==')
-const many = await client.fetch({ greet: { name: 'alice', userId: 1 }, version: null })
+const many = await client.fetch({
+  greet: { name: 'alice', userId: 1 },
+  version: null,
+})
 if (isOk(many.greet)) console.log('  greet   ->', many.greet.data.message)
 if (isOk(many.version)) console.log('  version ->', many.version.data)
 
@@ -54,7 +58,8 @@ await conn.send({ progress: { n: 3 } })
 let results = 0
 for await (const frame of conn.stream) {
   if ('progress' in frame) {
-    const result = (frame as Record<string, { status: string; data: unknown }>).progress
+    const result = (frame as Record<string, { status: string; data: unknown }>)
+      .progress
     console.log('  progress item ->', result.data)
     results++
   }

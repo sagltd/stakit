@@ -78,7 +78,7 @@ async fn main() {
                     ServerFrame::Result { result, .. } => {
                         println!("  progress item -> {result:?}");
                     }
-                    ServerFrame::End { .. } => {}
+                    _ => {}
                 }
             }
         }

@@ -122,5 +122,9 @@ guard.
    client action and awaits its reply (id→oneshot pending-map). Actions run as
    spawned tasks so a `client_call` can suspend mid-action. Requires a Tokio
    runtime; the rest of the router stays runtime-free.
+5. **Pub/sub + lifecycle** — ✅ done: typed channels (`Channel` + `Authorize`),
+   `cx.publish` / `cx.client_call_device`, per-node `Hub` + `Broker` (in-memory,
+   Postgres `LISTEN/NOTIFY`), auth frame + heartbeat/idle/caps. See
+   `docs/pubsub.md`.
 
 One action per call (clearer than ggtype's batched map); batching can come later.

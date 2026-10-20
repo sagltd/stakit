@@ -17,7 +17,7 @@ use stakit_model::Model;
 
 #[path = "support/fixtures.rs"]
 mod fixtures;
-use fixtures::{Admin, Count, RequireAdmin, count, open_session, payload};
+use fixtures::{Admin, Count, RequireAdmin, count, next_frame, open_session, payload};
 use stakit_router::{
     Action, ActionExt as _, ClientAction, Cx, Endpoint, Error, Frame, Middleware, ResponseError,
     Router, StreamActionExt, action, err,
@@ -413,7 +413,7 @@ async fn duplex_client_call_roundtrip() {
     );
 
     // The action calls back into the client (`client_call`); we receive that frame.
-    let call = outgoing.recv().await.unwrap();
+    let call = next_frame(&mut outgoing).await;
     assert_eq!(call["kind"], "client_call");
     assert_eq!(call["name"], "showToast");
     assert_eq!(call["params"]["text"], "bob");
@@ -423,11 +423,12 @@ async fn duplex_client_call_roundtrip() {
     session.handle(&json!({ "kind": "client_result", "id": call_id, "data": "delivered" }));
 
     // The action's result comes back tagged with the original call id.
-    let result = outgoing.recv().await.unwrap();
+    let result = next_frame(&mut outgoing).await;
     assert_eq!(result["kind"], "result");
     assert_eq!(result["id"], 1);
     assert_eq!(result["status"], "ok");
     assert_eq!(result["data"]["message"], "delivered");
+    assert!(result.get("more").is_none(), "a unary reply is final");
 }
 
 #[tokio::test]
@@ -436,11 +437,15 @@ async fn duplex_streams_over_websocket() {
 
     session.handle(&json!({ "kind": "call", "id": 7, "action": <count as Endpoint>::ACTION, "params": { "n": 2 } }));
 
-    let f0 = outgoing.recv().await.unwrap();
+    let f0 = next_frame(&mut outgoing).await;
     assert_eq!(f0["kind"], "result");
     assert_eq!(f0["data"], json!(0));
-    let _f1 = outgoing.recv().await.unwrap();
-    let end = outgoing.recv().await.unwrap();
+    assert_eq!(
+        f0["more"], true,
+        "stream items are marked so clients keep waiting"
+    );
+    let _f1 = next_frame(&mut outgoing).await;
+    let end = next_frame(&mut outgoing).await;
     assert_eq!(end["kind"], "end");
     assert_eq!(end["id"], 7);
 }
@@ -454,18 +459,18 @@ async fn duplex_stream_action_can_call_client_actions() {
 
     for expected in 0..2u64 {
         // server → client call
-        let call = outgoing.recv().await.unwrap();
+        let call = next_frame(&mut outgoing).await;
         assert_eq!(call["kind"], "client_call");
         assert_eq!(call["name"], "showToast");
         let call_id = call["id"].as_u64().unwrap();
         // client replies; the suspended stream resumes and yields its item
         session.handle(&json!({ "kind": "client_result", "id": call_id, "data": "ok" }));
-        let item = outgoing.recv().await.unwrap();
+        let item = next_frame(&mut outgoing).await;
         assert_eq!(item["kind"], "result");
         assert_eq!(item["data"], json!(expected));
     }
 
-    let end = outgoing.recv().await.unwrap();
+    let end = next_frame(&mut outgoing).await;
     assert_eq!(end["kind"], "end");
     assert_eq!(end["id"], 1);
 }
@@ -509,11 +514,11 @@ async fn client_call_times_out_when_unanswered() {
     );
 
     // The server→client call goes out...
-    let call = outgoing.recv().await.unwrap();
+    let call = next_frame(&mut outgoing).await;
     assert_eq!(call["kind"], "client_call");
 
     // ...we never reply. The action's `client_call` times out → 504 result.
-    let result = outgoing.recv().await.unwrap();
+    let result = next_frame(&mut outgoing).await;
     assert_eq!(result["kind"], "result");
     assert_eq!(result["id"], 1);
     assert_eq!(result["status"], "error");

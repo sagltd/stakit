@@ -48,7 +48,8 @@ function client() {
 test('http unary', async () => {
   const r = await client().fetch({ greet: { name: 'sam' } })
   expect(isOk(r.greet)).toBe(true)
-  if (isOk(r.greet)) expect(r.greet.data.message).toBe('Hello, sam! (admin=true)')
+  if (isOk(r.greet))
+    expect(r.greet.data.message).toBe('Hello, sam! (admin=true)')
 })
 
 test('http validation error', async () => {
@@ -58,8 +59,12 @@ test('http validation error', async () => {
 })
 
 test('http many actions in one request', async () => {
-  const r = await client().fetch({ greet: { name: 'alice', userId: 1 }, version: null })
-  if (isOk(r.greet)) expect(r.greet.data.message).toBe('Hello, alice! (admin=true)')
+  const r = await client().fetch({
+    greet: { name: 'alice', userId: 1 },
+    version: null,
+  })
+  if (isOk(r.greet))
+    expect(r.greet.data.message).toBe('Hello, alice! (admin=true)')
   if (isOk(r.version)) expect(r.version.data).toBe('stakit-example/0.1.0')
 })
 

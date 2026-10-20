@@ -104,11 +104,56 @@ Server → client:
 ```jsonc
 { "kind": "result", "id": 1, "status": "ok",    "data":  <value> }
 { "kind": "result", "id": 1, "status": "error", "error": { … } }
+{ "kind": "result", "id": 1, "status": "ok", "data": <item>, "more": true } // stream item
 { "kind": "end",    "id": 1 }                                     // stream action done
 { "kind": "client_call", "id": 7, "name": "showToast", "params": <value> }   // server invokes client
 ```
 
 `id` is a per-connection monotonic integer chosen by whichever side initiates.
+
+### Session lifecycle + pub/sub frames
+
+Client → server (each request frame is answered by a `result` with its `id`):
+
+```jsonc
+{ "kind": "auth",        "id": 1, "params": <value> }                  // → result ok | error (then close)
+{ "kind": "subscribe",   "id": 2, "channel": "room", "key": { "id": "r1" } }
+                                   // → result { "topic": "room:id=r1", "epoch": 81723, "seq": 4 }
+{ "kind": "unsubscribe", "id": 3, "topic": "room:id=r1" }             // → result true | false
+{ "kind": "pong" }                                                    // heartbeat reply
+```
+
+Server → client:
+
+```jsonc
+{ "kind": "ping" }                                                    // every 25s; answer `pong`
+{ "kind": "publish", "topic": "room:id=r1", "name": "message", "seq": 5, "epoch": 81723, "params": <value> }
+{ "kind": "reset", "topic": "user:id=u1", "epoch": 90211, "seq": 0 }   // history lost: resync
+{ "kind": "unsubscribed", "topic": "room:id=r1", "reason": "kicked" }  // removed; "reset": resubscribe
+```
+
+- When the server installs an auth hook, a session must send `auth` within 5s;
+  until it succeeds `call` / `subscribe` / `unsubscribe` get a `401` result.
+- The subscribe ack is always sent before any publish on that topic.
+- `publish.name` is a client action name: clients run their *publish*
+  handler for it (never the `client_call` handler) and the subscription's
+  message hook.
+- `unsubscribed` with reason `reset`: the server lost broker messages and
+  dropped the subscription for re-authorization — subscribe again.
+- `seq` increments by one per publish on a topic; a jump, or a different
+  `epoch`, means messages were missed. Both stay below 2^53 (exact in JS).
+- Inbound frames are capped at 64 KiB. Any inbound frame counts as liveness;
+  a session with none for 60s is closed.
+- A second `auth` while one is in flight or after success gets `409` and
+  never closes the session.
+- Client error replies (`client_result` with `error`) are clamped to a
+  4xx/5xx code and a 256-character message.
+- Server-initiated closes use these websocket close codes: `4001` auth timeout,
+  `4003` unauthorized, `4010` superseded (the device connected again),
+  `4011` revoked — do not reconnect after these three; `4029` too many
+  connections, `4009` slow consumer, `1008` rate limited (reconnect after a
+  backoff of at least 5s); `4008` idle; `1009` frame too large. Inbound
+  frames are limited to 100 per second.
 
 ## Files
 

@@ -1,0 +1,30 @@
+[package]
+name = "stakit-pubsub-postgres"
+description = "Postgres LISTEN/NOTIFY broker for stakit-router pub/sub (multi-node fan-out + cross-node client calls)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+stakit-router.workspace = true
+sqlx = { workspace = true, features = ["postgres"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+bytes.workspace = true
+futures.workspace = true
+hashbrown.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+tracing.workspace = true
+getrandom.workspace = true
+hmac = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+postgresql_embedded.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[lints]
+workspace = true
