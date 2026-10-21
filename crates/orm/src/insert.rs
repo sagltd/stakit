@@ -38,10 +38,11 @@ pub trait Insertable {
 }
 
 /// How a single column is updated when a conflict fires.
-#[derive(Clone, Copy)]
 enum UpdateMode {
     /// `col = excluded.col` — overwrite with the incoming value.
     Excluded,
+    /// A typed scalar assignment.
+    Expression(Box<crate::expr::Operand>),
     /// `col = coalesce(excluded.col, <table>.col)` — take the incoming value, but
     /// keep the stored one when the incoming value is `NULL`.
     CoalesceExisting,
@@ -51,7 +52,6 @@ enum UpdateMode {
 }
 
 /// One column's update rule in a `DO UPDATE` / `ON DUPLICATE KEY UPDATE` clause.
-#[derive(Clone, Copy)]
 struct ColumnUpdate {
     column: &'static str,
     mode: UpdateMode,
@@ -77,6 +77,7 @@ struct Conflict {
     /// index via `ON DUPLICATE KEY UPDATE`).
     targets: SmallVec<[&'static str; 2]>,
     action: ConflictAction,
+    predicate: Option<crate::expr::Predicate>,
 }
 
 /// An `INSERT` under construction.
@@ -111,6 +112,7 @@ impl<N: Insertable> Insert<N> {
         self.conflict = Some(Conflict {
             targets: smallvec::smallvec![column.name],
             action: ConflictAction::Nothing,
+            predicate: None,
         });
         self
     }
@@ -122,6 +124,7 @@ impl<N: Insertable> Insert<N> {
         self.conflict = Some(Conflict {
             targets: smallvec::smallvec![column.name],
             action: ConflictAction::UpdateAll,
+            predicate: None,
         });
         self
     }
@@ -142,6 +145,7 @@ impl<N: Insertable> Insert<N> {
             insert: self,
             targets: key.columns(),
             updates: SmallVec::new(),
+            predicate: None,
         }
     }
 
@@ -208,7 +212,7 @@ impl<N: Insertable> Insert<N> {
             row.bind_values(&included, &mut writer);
             writer.push(")");
         }
-        if let Some(conflict) = &conflict {
+        if let Some(conflict) = conflict {
             write_conflict(&mut writer, conflict, N::TABLE, &columns)?;
         }
         if let Some(write_returning) = returning {
@@ -422,9 +426,44 @@ pub struct Upsert<N> {
     insert: Insert<N>,
     targets: SmallVec<[&'static str; 2]>,
     updates: SmallVec<[ColumnUpdate; 8]>,
+    predicate: Option<crate::expr::Predicate>,
 }
 
 impl<N: Insertable> Upsert<N> {
+    /// Assign a typed SQL expression on conflict. The expression must match the
+    /// destination column type. All literal values remain parameter-bound.
+    ///
+    /// ```compile_fail
+    /// use stakit_orm::{Insert, prelude::*};
+    /// #[derive(Table)] #[table(name = "counters")]
+    /// struct Counter { #[column(pk)] id: i64, count: i32 }
+    /// Insert::new(vec![CounterNew { id: 1, count: 0 }])
+    ///     .on_conflict(Counter::id).set_expr(Counter::count, "wrong type");
+    /// ```
+    pub fn set_expr<T, Ty, E: crate::expr::IntoExpr<Ty>>(
+        mut self,
+        column: crate::schema::Col<T, Ty>,
+        expression: E,
+    ) -> Self {
+        self.updates.push(ColumnUpdate {
+            column: column.name,
+            mode: UpdateMode::Expression(Box::new(expression.into_operand())),
+        });
+        self
+    }
+
+    /// Guard only the conflict UPDATE, after its SET list. Inserts are unaffected;
+    /// a rejected update affects zero rows and returns no RETURNING row.
+    /// Repeated calls combine with AND. `MySQL` returns `Error::Unsupported` rather
+    /// than dropping the guard. `do_nothing` discards it.
+    pub fn where_conflict(mut self, predicate: crate::expr::Predicate) -> Self {
+        self.predicate = Some(match self.predicate {
+            Some(previous) => crate::expr::and(previous, predicate),
+            None => predicate,
+        });
+        self
+    }
+
     /// On conflict, set `column = excluded.column` (overwrite with the incoming
     /// value).
     pub fn set<T, Ty>(mut self, column: crate::schema::Col<T, Ty>) -> Self {
@@ -464,6 +503,7 @@ impl<N: Insertable> Upsert<N> {
         self.insert.conflict = Some(Conflict {
             targets: self.targets,
             action: ConflictAction::Nothing,
+            predicate: None,
         });
         self.insert
     }
@@ -475,6 +515,7 @@ impl<N: Insertable> Upsert<N> {
         self.insert.conflict = Some(Conflict {
             targets: self.targets,
             action: ConflictAction::UpdateAll,
+            predicate: self.predicate,
         });
         self.insert
     }
@@ -487,6 +528,7 @@ impl<N: Insertable> Upsert<N> {
         self.insert.conflict = Some(Conflict {
             targets: self.targets,
             action: ConflictAction::UpdateAllExcept(columns.columns().into_iter().collect()),
+            predicate: self.predicate,
         });
         self.insert
     }
@@ -499,13 +541,18 @@ impl<N: Insertable> Upsert<N> {
             mut insert,
             targets,
             updates,
+            predicate,
         } = self;
         let action = if updates.is_empty() {
             ConflictAction::Nothing
         } else {
             ConflictAction::UpdateColumns(updates)
         };
-        insert.conflict = Some(Conflict { targets, action });
+        insert.conflict = Some(Conflict {
+            targets,
+            action,
+            predicate,
+        });
         insert
     }
 
@@ -564,6 +611,7 @@ fn write_update(
     writer.push(" = ");
     match update.mode {
         UpdateMode::Excluded => incoming(writer)?,
+        UpdateMode::Expression(expression) => expression.write_into(writer)?,
         UpdateMode::CoalesceExisting => {
             writer.push("coalesce(");
             incoming(writer)?;
@@ -582,14 +630,14 @@ fn write_update(
 
 fn write_conflict(
     writer: &mut SqlWriter,
-    conflict: &Conflict,
+    conflict: Conflict,
     table: &str,
     columns: &[&'static str],
 ) -> Result<()> {
     // Resolve the action into a concrete column-update list. `UpdateAll` expands
     // to every non-target inserted column overwritten with its `excluded` value; an
     // empty list (or `Nothing`) means no `SET` clause.
-    let resolved: SmallVec<[ColumnUpdate; 16]> = match &conflict.action {
+    let resolved: SmallVec<[ColumnUpdate; 16]> = match conflict.action {
         ConflictAction::Nothing => SmallVec::new(),
         ConflictAction::UpdateAll => columns
             .iter()
@@ -609,7 +657,7 @@ fn write_conflict(
                 mode: UpdateMode::Excluded,
             })
             .collect(),
-        ConflictAction::UpdateColumns(updates) => updates.iter().copied().collect(),
+        ConflictAction::UpdateColumns(updates) => updates.into_iter().collect(),
     };
     let do_nothing = resolved.is_empty();
 
@@ -617,6 +665,9 @@ fn write_conflict(
     // on any unique/primary index. The incoming value is `values(col)`; a bare `col`
     // refers to the stored row.
     if writer.upsert_on_duplicate_key() {
+        if !do_nothing && conflict.predicate.is_some() {
+            writer.mark_unsupported("guarded conflict update (unsupported by MySQL)");
+        }
         writer.push(" on duplicate key update ");
         if do_nothing {
             // MySQL lacks `DO NOTHING`; self-assign a key column as a harmless no-op.
@@ -632,11 +683,11 @@ fn write_conflict(
             }
             return Ok(());
         }
-        for (index, update) in resolved.iter().enumerate() {
+        for (index, update) in resolved.into_iter().enumerate() {
             if index > 0 {
                 writer.push(", ");
             }
-            write_update(writer, *update, table, true)?;
+            write_update(writer, update, table, true)?;
         }
         return Ok(());
     }
@@ -656,11 +707,15 @@ fn write_conflict(
         return Ok(());
     }
     writer.push(" do update set ");
-    for (index, update) in resolved.iter().enumerate() {
+    for (index, update) in resolved.into_iter().enumerate() {
         if index > 0 {
             writer.push(", ");
         }
-        write_update(writer, *update, table, false)?;
+        write_update(writer, update, table, false)?;
+    }
+    if let Some(predicate) = conflict.predicate {
+        writer.push(" where ");
+        predicate.write(writer)?;
     }
     Ok(())
 }
@@ -689,7 +744,7 @@ mod tests {
 
     fn render(
         dialect: &'static dyn Dialect,
-        conflict: &Conflict,
+        conflict: Conflict,
         columns: &[&'static str],
     ) -> String {
         let mut writer = SqlWriter::with_dialect(dialect);
@@ -698,11 +753,11 @@ mod tests {
         sql
     }
 
-    fn do_update(updates: &[(&'static str, UpdateMode)]) -> ConflictAction {
+    fn do_update<const N: usize>(updates: [(&'static str, UpdateMode); N]) -> ConflictAction {
         ConflictAction::UpdateColumns(
             updates
-                .iter()
-                .map(|&(column, mode)| ColumnUpdate { column, mode })
+                .into_iter()
+                .map(|(column, mode)| ColumnUpdate { column, mode })
                 .collect(),
         )
     }
@@ -712,8 +767,9 @@ mod tests {
     #[test]
     fn pg_composite_key_selective_update_with_coalesce() {
         let conflict = Conflict {
+            predicate: None,
             targets: target(&["user_id", "device_id"]),
-            action: do_update(&[
+            action: do_update([
                 ("platform", UpdateMode::Excluded),
                 ("last_seen", UpdateMode::Excluded),
                 ("location", UpdateMode::CoalesceExisting),
@@ -721,7 +777,7 @@ mod tests {
         };
         let sql = render(
             &PostgresDialect,
-            &conflict,
+            conflict,
             &["user_id", "device_id", "platform", "last_seen", "location"],
         );
         assert_eq!(
@@ -733,10 +789,11 @@ mod tests {
     #[test]
     fn pg_do_update_all_skips_target_columns() {
         let conflict = Conflict {
+            predicate: None,
             targets: target(&["email"]),
             action: ConflictAction::UpdateAll,
         };
-        let sql = render(&PostgresDialect, &conflict, &["email", "name", "id"]);
+        let sql = render(&PostgresDialect, conflict, &["email", "name", "id"]);
         assert_eq!(
             sql,
             r#" on conflict ("email") do update set "name" = excluded."name", "id" = excluded."id""#
@@ -746,32 +803,35 @@ mod tests {
     #[test]
     fn pg_do_nothing_renders_target_list() {
         let conflict = Conflict {
+            predicate: None,
             targets: target(&["user_id", "device_id"]),
             action: ConflictAction::Nothing,
         };
-        let sql = render(&PostgresDialect, &conflict, &["user_id", "device_id"]);
+        let sql = render(&PostgresDialect, conflict, &["user_id", "device_id"]);
         assert_eq!(sql, r#" on conflict ("user_id", "device_id") do nothing"#);
     }
 
     #[test]
     fn pg_do_update_all_with_only_target_falls_back_to_do_nothing() {
         let conflict = Conflict {
+            predicate: None,
             targets: target(&["email"]),
             action: ConflictAction::UpdateAll,
         };
-        let sql = render(&PostgresDialect, &conflict, &["email"]);
+        let sql = render(&PostgresDialect, conflict, &["email"]);
         assert_eq!(sql, r#" on conflict ("email") do nothing"#);
     }
 
     #[test]
     fn pg_do_update_all_with_composite_target_skips_all_key_columns() {
         let conflict = Conflict {
+            predicate: None,
             targets: target(&["user_id", "device_id"]),
             action: ConflictAction::UpdateAll,
         };
         let sql = render(
             &PostgresDialect,
-            &conflict,
+            conflict,
             &["user_id", "device_id", "platform", "last_seen"],
         );
         assert_eq!(
@@ -783,12 +843,13 @@ mod tests {
     #[test]
     fn pg_do_update_all_except_skips_target_and_listed() {
         let conflict = Conflict {
+            predicate: None,
             targets: target(&["user_id", "device_id"]),
             action: ConflictAction::UpdateAllExcept(std::iter::once("created_at").collect()),
         };
         let sql = render(
             &PostgresDialect,
-            &conflict,
+            conflict,
             &["user_id", "device_id", "platform", "created_at"],
         );
         assert_eq!(
@@ -800,10 +861,11 @@ mod tests {
     #[test]
     fn pg_set_add_increments_the_stored_value() {
         let conflict = Conflict {
+            predicate: None,
             targets: target(&["id"]),
-            action: do_update(&[("balance", UpdateMode::AddExcluded)]),
+            action: do_update([("balance", UpdateMode::AddExcluded)]),
         };
-        let sql = render(&PostgresDialect, &conflict, &["id", "balance"]);
+        let sql = render(&PostgresDialect, conflict, &["id", "balance"]);
         assert_eq!(
             sql,
             r#" on conflict ("id") do update set "balance" = "devices"."balance" + excluded."balance""#
@@ -815,15 +877,16 @@ mod tests {
     #[test]
     fn mysql_selective_update_with_coalesce_uses_values() {
         let conflict = Conflict {
+            predicate: None,
             targets: target(&["user_id", "device_id"]),
-            action: do_update(&[
+            action: do_update([
                 ("platform", UpdateMode::Excluded),
                 ("location", UpdateMode::CoalesceExisting),
             ]),
         };
         let sql = render(
             &MySqlDialect,
-            &conflict,
+            conflict,
             &["user_id", "device_id", "platform", "location"],
         );
         assert_eq!(
@@ -835,10 +898,11 @@ mod tests {
     #[test]
     fn mysql_set_add_increments_with_values() {
         let conflict = Conflict {
+            predicate: None,
             targets: target(&["id"]),
-            action: do_update(&[("balance", UpdateMode::AddExcluded)]),
+            action: do_update([("balance", UpdateMode::AddExcluded)]),
         };
-        let sql = render(&MySqlDialect, &conflict, &["id", "balance"]);
+        let sql = render(&MySqlDialect, conflict, &["id", "balance"]);
         assert_eq!(
             sql,
             " on duplicate key update `balance` = `balance` + values(`balance`)"
@@ -848,10 +912,11 @@ mod tests {
     #[test]
     fn mysql_do_update_all_uses_values() {
         let conflict = Conflict {
+            predicate: None,
             targets: target(&["email"]),
             action: ConflictAction::UpdateAll,
         };
-        let sql = render(&MySqlDialect, &conflict, &["email", "name", "id"]);
+        let sql = render(&MySqlDialect, conflict, &["email", "name", "id"]);
         assert_eq!(
             sql,
             " on duplicate key update `name` = values(`name`), `id` = values(`id`)"
@@ -861,20 +926,22 @@ mod tests {
     #[test]
     fn mysql_do_update_all_with_only_target_is_noop_self_assign() {
         let conflict = Conflict {
+            predicate: None,
             targets: target(&["email"]),
             action: ConflictAction::UpdateAll,
         };
-        let sql = render(&MySqlDialect, &conflict, &["email"]);
+        let sql = render(&MySqlDialect, conflict, &["email"]);
         assert_eq!(sql, " on duplicate key update `email` = `email`");
     }
 
     #[test]
     fn mysql_do_nothing_self_assigns_first_target() {
         let conflict = Conflict {
+            predicate: None,
             targets: target(&["user_id", "device_id"]),
             action: ConflictAction::Nothing,
         };
-        let sql = render(&MySqlDialect, &conflict, &["user_id", "device_id", "name"]);
+        let sql = render(&MySqlDialect, conflict, &["user_id", "device_id", "name"]);
         assert_eq!(sql, " on duplicate key update `user_id` = `user_id`");
     }
 }

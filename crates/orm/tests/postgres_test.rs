@@ -939,3 +939,267 @@ async fn native_date_time_arrays_round_trip_on_postgres() {
 
     postgres.stop().await.ok();
 }
+
+#[tokio::test]
+async fn guarded_upsert_locked_budget_is_unchanged() {
+    let (_postgres, db) = setup().await;
+    let owner = Uuid::new_v4();
+    db.insert(UserNew {
+        id: owner,
+        email: "budget@x.test".into(),
+        name: "Budget".into(),
+        active: true,
+    })
+    .exec()
+    .await
+    .unwrap();
+    let id = Uuid::new_v4();
+    db.insert(PostNew {
+        id,
+        author_id: owner,
+        title: "locked".into(),
+        views: 3,
+    })
+    .exec()
+    .await
+    .unwrap();
+    // The guard is evaluated while PostgreSQL holds the conflicting row lock.
+    let affected = db
+        .insert(PostNew {
+            id,
+            author_id: owner,
+            title: "incoming".into(),
+            views: 1,
+        })
+        .on_conflict(Post::id)
+        .set_add(Post::views)
+        .where_conflict(lt(stored(Post::views), 3_i32))
+        .exec()
+        .await
+        .unwrap();
+    assert_eq!(
+        affected, 0,
+        "a locked budget must reject the conflict update"
+    );
+}
+
+#[path = "support/guarded_upsert.rs"]
+mod guarded_upsert;
+
+#[tokio::test]
+async fn guarded_upsert_login_windows_and_concurrent_budget() {
+    use guarded_upsert::{Attempt, attempt_row, reserve};
+    let (_postgres, db) = setup_guarded_attempts().await;
+    // Fresh inserts bypass a false update guard.
+    assert_eq!(
+        reserve(db.insert(attempt_row("first", "key")), 300, 0)
+            .exec()
+            .await
+            .unwrap(),
+        1
+    );
+    let first = db
+        .select(Attempt::all())
+        .from::<Attempt>()
+        .one()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reserve(db.insert(attempt_row("second", "key")), 300, 3)
+            .returning(Attempt::failed_count)
+            .one()
+            .await
+            .unwrap(),
+        2
+    );
+    let active = db
+        .select(Attempt::all())
+        .from::<Attempt>()
+        .one()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.window_started_at, first.window_started_at);
+    assert_eq!(active.id, "first");
+    // A burst of concurrent conflicts consumes exactly the remaining budget.
+    let results = futures::future::join_all((0..20).map(|index| {
+        let db = db.clone();
+        async move {
+            reserve(
+                db.insert(attempt_row(&format!("burst-{index}"), "key")),
+                300,
+                5,
+            )
+            .exec()
+            .await
+            .unwrap()
+        }
+    }))
+    .await;
+    assert_eq!(results.iter().sum::<u64>(), 3);
+    assert!(
+        reserve(db.insert(attempt_row("locked", "key")), 300, 5)
+            .returning(Attempt::id)
+            .all()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        reserve(db.insert(attempt_row("locked-one", "key")), 300, 5)
+            .returning(Attempt::id)
+            .one()
+            .await,
+        Err(stakit_orm::Error::NotFound)
+    ));
+    db.update::<Attempt>()
+        .set(Attempt::window_started_at, db_now_minus_seconds(600))
+        .filter(eq(Attempt::identifier, "key"))
+        .exec()
+        .await
+        .unwrap();
+    let expired = db
+        .select(Attempt::window_started_at)
+        .from::<Attempt>()
+        .one()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reserve(db.insert(attempt_row("reset", "key")), 300, 5)
+            .exec()
+            .await
+            .unwrap(),
+        1
+    );
+    let reset = db
+        .select(Attempt::all())
+        .from::<Attempt>()
+        .one()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reset.failed_count, 1);
+    assert!(reset.window_started_at > expired);
+}
+
+#[tokio::test]
+async fn guarded_upsert_verification_resends_reset_increment_and_serialize() {
+    use guarded_upsert::{Verification, resend, verification_row};
+    let (_postgres, db) = setup().await;
+    embedded_pg::run(db.pool().unwrap(), &[
+        "create table verifications (id text primary key, user_id text not null, purpose text not null, method text not null, code text not null, target text, created_at timestamptz not null default now(), tries integer not null default 0, resend_count integer not null default 0, unique(user_id, purpose))",
+    ]).await;
+    resend(db.insert(verification_row("first", "old")), 300)
+        .exec()
+        .await
+        .unwrap();
+    db.update::<Verification>()
+        .set(Verification::tries, 4_i32)
+        .exec()
+        .await
+        .unwrap();
+    let mut incoming = verification_row("second", "new");
+    incoming.method = "phone".into();
+    incoming.target = None;
+    resend(db.insert(incoming), 300).exec().await.unwrap();
+    let active = db
+        .select(Verification::all())
+        .from::<Verification>()
+        .one()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            active.id.as_str(),
+            active.method.as_str(),
+            active.code.as_str()
+        ),
+        ("first", "phone", "new")
+    );
+    assert_eq!(
+        (active.tries, active.resend_count, active.target),
+        (0, 1, None)
+    );
+    let results = futures::future::join_all((0..12).map(|index| {
+        let db = db.clone();
+        async move {
+            resend(
+                db.insert(verification_row(&format!("resend-{index}"), "burst")),
+                300,
+            )
+            .exec()
+            .await
+            .unwrap()
+        }
+    }))
+    .await;
+    assert_eq!(results.iter().sum::<u64>(), 12);
+    let count = db
+        .select(Verification::resend_count)
+        .from::<Verification>()
+        .one()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 13);
+    db.update::<Verification>()
+        .set(Verification::created_at, db_now_minus_seconds(600))
+        .exec()
+        .await
+        .unwrap();
+    let expired = db
+        .select(Verification::created_at)
+        .from::<Verification>()
+        .one()
+        .await
+        .unwrap()
+        .unwrap();
+    let reset = resend(db.insert(verification_row("reset", "fresh")), 300)
+        .returning((Verification::resend_count, Verification::created_at))
+        .one()
+        .await
+        .unwrap();
+    assert_eq!(reset.0, 0);
+    assert!(reset.1 > expired);
+}
+
+async fn setup_guarded_attempts() -> (postgresql_embedded::PostgreSQL, Db) {
+    let (postgres, db) = setup().await;
+    embedded_pg::run(db.pool().unwrap(), &[
+        "create table login_attempts (id text primary key, identifier text unique not null, failed_count integer not null default 0, window_started_at timestamptz not null default now())",
+    ]).await;
+    (postgres, db)
+}
+
+#[tokio::test]
+async fn guarded_upsert_login_window_exact_cutoff() {
+    use guarded_upsert::{Attempt, attempt_row, reserve};
+    let (_postgres, db) = setup_guarded_attempts().await;
+    reserve(db.insert(attempt_row("first", "key")), 300, 5)
+        .exec()
+        .await
+        .unwrap();
+    // Exact equality at the cutoff is expired (transaction-stable database now).
+    db.transaction(|tx| async move {
+        tx.update::<Attempt>()
+            .set(Attempt::window_started_at, db_now_minus_seconds(300))
+            .set(Attempt::failed_count, 5_i32)
+            .exec()
+            .await
+            .unwrap();
+        assert_eq!(
+            reserve(tx.insert(attempt_row("boundary", "key")), 300, 5)
+                .returning(Attempt::failed_count)
+                .one()
+                .await
+                .unwrap(),
+            1
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+}

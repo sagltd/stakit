@@ -930,3 +930,278 @@ fn ts_rank_stored_skips_to_tsvector() {
         "stored form must not recompute: {sql}"
     );
 }
+
+#[test]
+fn guarded_case_upsert_renders_update_where_after_assignments() {
+    use stakit_orm::Insert;
+    let sql = Insert::new(vec![uuid_posts::PostNew {
+        id: uid(),
+        author_id: uid(),
+        title: "attempt".into(),
+        views: 1,
+    }])
+    .on_conflict(Post::id)
+    .set_expr(
+        Post::views,
+        case_when(
+            lt(stored(Post::views), 3_i32),
+            add(stored(Post::views), 1_i32),
+            1_i32,
+        ),
+    )
+    .set_expr(Post::title, excluded(Post::title))
+    .where_conflict(lt(stored(Post::views), 3_i32))
+    .to_sql()
+    .unwrap();
+    assert_eq!(
+        sql,
+        r#"insert into "posts" ("id", "author_id", "title", "views") values ($1, $2, $3, $4) on conflict ("id") do update set "views" = case when "posts"."views" < $5 then ("posts"."views" + $6) else $7 end, "title" = excluded."title" where "posts"."views" < $8"#
+    );
+}
+
+#[path = "support/guarded_upsert.rs"]
+mod guarded_upsert;
+
+#[test]
+fn full_login_reservation_uses_database_time_and_update_only_guard() {
+    use guarded_upsert::{attempt_row, reserve};
+    let sql = reserve(
+        stakit_orm::Insert::new(vec![attempt_row("id", "key")]),
+        300,
+        5,
+    )
+    .to_sql()
+    .unwrap();
+    assert_eq!(
+        sql,
+        r#"insert into "login_attempts" ("id", "identifier", "failed_count") values ($1, $2, $3) on conflict ("identifier") do update set "failed_count" = case when "login_attempts"."window_started_at" <= now() - ($4::bigint * interval '1 second') then $5 else ("login_attempts"."failed_count" + $6) end, "window_started_at" = case when "login_attempts"."window_started_at" <= now() - ($7::bigint * interval '1 second') then now() else "login_attempts"."window_started_at" end where ("login_attempts"."window_started_at" <= now() - ($8::bigint * interval '1 second') or "login_attempts"."failed_count" < $9)"#
+    );
+}
+
+#[test]
+fn full_verification_resend_resets_tries_and_counts_with_case() {
+    use guarded_upsert::{resend, verification_row};
+    let sql = resend(
+        stakit_orm::Insert::new(vec![verification_row("id", "code")]),
+        600,
+    )
+    .to_sql()
+    .unwrap();
+    assert_eq!(
+        sql,
+        r#"insert into "verifications" ("id", "user_id", "purpose", "method", "code", "target", "tries", "resend_count") values ($1, $2, $3, $4, $5, $6, $7, $8) on conflict ("user_id", "purpose") do update set "method" = excluded."method", "code" = excluded."code", "target" = excluded."target", "tries" = $9, "resend_count" = case when "verifications"."created_at" <= now() - ($10::bigint * interval '1 second') then $11 else ("verifications"."resend_count" + $12) end, "created_at" = excluded."created_at""#
+    );
+}
+
+/// Record terminal SQL and actual bind values without opening a database.
+struct StatementCapture {
+    dialect: &'static dyn stakit_orm::Dialect,
+    statement: std::sync::Mutex<Option<(String, stakit_orm::BindBuffer)>>,
+}
+
+impl stakit_orm::Driver for StatementCapture {
+    fn dialect(&self) -> &'static dyn stakit_orm::Dialect {
+        self.dialect
+    }
+    fn execute(
+        &self,
+        sql: String,
+        binds: stakit_orm::BindBuffer,
+    ) -> futures::future::BoxFuture<'_, stakit_orm::Result<u64>> {
+        *self.statement.lock().unwrap() = Some((sql, binds));
+        Box::pin(async { Ok(0) })
+    }
+    fn fetch<'a>(
+        &'a self,
+        sql: String,
+        binds: stakit_orm::BindBuffer,
+        _sink: &'a mut dyn stakit_orm::RowSink,
+    ) -> futures::future::BoxFuture<'a, stakit_orm::Result<()>> {
+        *self.statement.lock().unwrap() = Some((sql, binds));
+        Box::pin(async { Ok(()) })
+    }
+    fn stream(
+        &self,
+        _sql: String,
+        _binds: stakit_orm::BindBuffer,
+    ) -> futures::stream::BoxStream<'_, stakit_orm::Result<stakit_orm::driver::BoxRow>> {
+        Box::pin(futures::stream::empty())
+    }
+    fn begin(
+        &self,
+    ) -> futures::future::BoxFuture<'_, stakit_orm::Result<Box<dyn stakit_orm::TxConn>>> {
+        Box::pin(async { Err(stakit_orm::Error::Unsupported("capture transactions")) })
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn capture(dialect: &'static dyn stakit_orm::Dialect) -> (Db, std::sync::Arc<StatementCapture>) {
+    let driver = std::sync::Arc::new(StatementCapture {
+        dialect,
+        statement: std::sync::Mutex::new(None),
+    });
+    (Db::from_driver(driver.clone()), driver)
+}
+
+#[tokio::test]
+async fn full_login_bind_order_includes_case_guard_and_returning() {
+    use guarded_upsert::{Attempt, attempt_row, reserve};
+    use stakit_orm::Value::{I32, I64, Text};
+    let (db, driver) = capture(&stakit_orm::PostgresDialect);
+    reserve(db.insert(attempt_row("id' injection", "key")), 300, 5)
+        .returning(Attempt::failed_count)
+        .all()
+        .await
+        .unwrap();
+    let (sql, binds) = driver.statement.lock().unwrap().take().unwrap();
+    assert!(sql.ends_with("< $9) returning \"login_attempts\".\"failed_count\""));
+    assert!(!sql.contains("injection"));
+    assert_eq!(
+        binds.as_slice(),
+        &[
+            Text("id' injection".into()),
+            Text("key".into()),
+            I32(1),
+            I64(300),
+            I32(1),
+            I32(1),
+            I64(300),
+            I64(300),
+            I32(5)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn full_verification_bind_order_keeps_code_and_cutoff_bound() {
+    use guarded_upsert::{Verification, resend, verification_row};
+    use stakit_orm::Value::{I32, I64, Text};
+    let (db, driver) = capture(&stakit_orm::PostgresDialect);
+    resend(db.insert(verification_row("id", "code' injection")), 600)
+        .returning(Verification::code)
+        .all()
+        .await
+        .unwrap();
+    let (sql, binds) = driver.statement.lock().unwrap().take().unwrap();
+    assert!(sql.ends_with("returning \"verifications\".\"code\""));
+    assert!(!sql.contains("injection"));
+    assert_eq!(
+        binds.as_slice(),
+        &[
+            Text("id".into()),
+            Text("user".into()),
+            Text("signin".into()),
+            Text("email".into()),
+            Text("code' injection".into()),
+            Text("recipient@example.test".into()),
+            I32(0),
+            I32(0),
+            I32(0),
+            I64(600),
+            I32(0),
+            I32(1)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn guarded_upsert_dialects_fail_closed_or_preserve_guard() {
+    use guarded_upsert::{Attempt, attempt_row, reserve};
+    use stakit_orm::{Insert, MySqlDialect, SqliteDialect, TursoDialect};
+    // Timestamp helpers are explicitly PostgreSQL-only on every other dialect.
+    for dialect in [
+        &SqliteDialect as &dyn stakit_orm::Dialect,
+        &TursoDialect,
+        &MySqlDialect,
+    ] {
+        let (db, driver) = capture(dialect);
+        assert!(matches!(
+            reserve(db.insert(attempt_row("id", "key")), 300, 5)
+                .exec()
+                .await,
+            Err(stakit_orm::Error::Unsupported(_))
+        ));
+        assert!(driver.statement.lock().unwrap().is_none());
+    }
+    let (mysql, driver) = capture(&MySqlDialect);
+    assert!(matches!(
+        mysql
+            .insert(attempt_row("id", "key"))
+            .on_conflict(Attempt::identifier)
+            .set(Attempt::failed_count)
+            .where_conflict(lt(Attempt::failed_count, 5_i32))
+            .exec()
+            .await,
+        Err(stakit_orm::Error::Unsupported(_))
+    ));
+    assert!(driver.statement.lock().unwrap().is_none());
+    // CASE, incoming references, and guarded UPDATE are supported by SQLite/Turso.
+    for dialect in [&SqliteDialect as &dyn stakit_orm::Dialect, &TursoDialect] {
+        let (db, driver) = capture(dialect);
+        db.insert(attempt_row("id", "key"))
+            .on_conflict(Attempt::identifier)
+            .set_expr(Attempt::failed_count, conditional_incoming_count())
+            .where_conflict(lt(Attempt::failed_count, 5_i32))
+            .where_conflict(gt(Attempt::failed_count, 0_i32))
+            .exec()
+            .await
+            .unwrap();
+        let (sql, binds) = driver.statement.lock().unwrap().take().unwrap();
+        assert!(sql.contains("where (\"login_attempts\".\"failed_count\" < ?6 and \"login_attempts\".\"failed_count\" > ?7)"));
+        assert_eq!(binds.len(), 7);
+    }
+    // Empty SET and explicit DO NOTHING never retain an UPDATE-only guard.
+    for sql in [
+        Insert::new(vec![attempt_row("id", "key")])
+            .on_conflict(Attempt::identifier)
+            .where_conflict(lt(Attempt::failed_count, 0_i32))
+            .to_sql()
+            .unwrap(),
+        Insert::new(vec![attempt_row("id", "key")])
+            .on_conflict(Attempt::identifier)
+            .set(Attempt::failed_count)
+            .where_conflict(lt(Attempt::failed_count, 0_i32))
+            .do_nothing()
+            .to_sql()
+            .unwrap(),
+    ] {
+        assert!(sql.ends_with("do nothing"));
+        assert!(!sql.contains("where"));
+    }
+}
+
+#[tokio::test]
+async fn guarded_upsert_shortcuts_keep_update_guard_and_mysql_case_uses_values() {
+    use guarded_upsert::{Attempt, attempt_row};
+    for except in [false, true] {
+        let builder = stakit_orm::Insert::new(vec![attempt_row("id", "key")])
+            .on_conflict(Attempt::identifier)
+            .where_conflict(lt(Attempt::failed_count, 5_i32));
+        let sql = if except {
+            builder.do_update_all_except(Attempt::id).to_sql().unwrap()
+        } else {
+            builder.do_update_all().to_sql().unwrap()
+        };
+        assert!(sql.ends_with("where \"login_attempts\".\"failed_count\" < $4"));
+    }
+    let (db, driver) = capture(&stakit_orm::MySqlDialect);
+    db.insert(attempt_row("id", "key"))
+        .on_conflict(Attempt::identifier)
+        .set_expr(Attempt::failed_count, conditional_incoming_count())
+        .exec()
+        .await
+        .unwrap();
+    let (sql, _) = driver.statement.lock().unwrap().take().unwrap();
+    assert!(sql.contains("on duplicate key update `failed_count` = case when `login_attempts`.`failed_count` < ? then values(`failed_count`) else ? end"));
+}
+
+fn conditional_incoming_count() -> Scalar<i32> {
+    use guarded_upsert::Attempt;
+    case_when(
+        lt(stored(Attempt::failed_count), 5_i32),
+        excluded(Attempt::failed_count),
+        0_i32,
+    )
+}
