@@ -11,7 +11,9 @@ use serde_json::{Map, Value, json};
 use crate::cache::{
     CacheCapabilities, CacheStrategy, CacheTarget, CacheTtl, ExplicitCacheCapabilities,
 };
-use crate::message::{AssistantContent, Image, Message, Thinking, ToolResultPart, UserContent};
+use crate::message::{
+    AssistantContent, Document, Image, Message, Thinking, ToolResultPart, UserContent,
+};
 use crate::provider::http::{
     HttpConfig, api_error, ensure_success, http_client_builders, pick_model, send, wire_count,
 };
@@ -254,7 +256,10 @@ fn build_body(model: &str, req: &ChatRequest, stream: bool) -> Value {
                 &mut cache_budget
             )),
         );
-        body.insert("tool_choice".into(), map_tool_choice(&req.tool_choice));
+        body.insert(
+            "tool_choice".into(),
+            map_tool_choice(&req.tool_choice, req.parallel_tool_calls),
+        );
     }
     if let Some(system) = &req.system {
         body.insert(
@@ -428,15 +433,19 @@ fn map_tools(
         .collect()
 }
 
-fn map_tool_choice(choice: &ToolChoice) -> Value {
-    // Parallel tool use is left enabled (the API default) in every arm — we
-    // never send `disable_parallel_tool_use`, so the model may batch tool calls.
-    match choice {
+fn map_tool_choice(choice: &ToolChoice, parallel: Option<bool>) -> Value {
+    // Parallel tool use stays enabled (the API default) unless the request
+    // explicitly turned it off; `none` takes no such flag.
+    let mut mapped = match choice {
         ToolChoice::Auto => json!({ "type": "auto" }),
         ToolChoice::Any | ToolChoice::Required => json!({ "type": "any" }),
-        ToolChoice::None => json!({ "type": "none" }),
+        ToolChoice::None => return json!({ "type": "none" }),
         ToolChoice::Tool(name) => json!({ "type": "tool", "name": name }),
+    };
+    if parallel == Some(false) {
+        mapped["disable_parallel_tool_use"] = json!(true);
     }
+    mapped
 }
 
 /// Maps the conversation, placing a rolling `cache_control` breakpoint on the
@@ -501,6 +510,9 @@ fn map_message(message: &Message) -> Value {
                     UserContent::Image(src) => {
                         blocks.push(json!({ "type": "image", "source": map_image(src) }));
                     }
+                    UserContent::Document(doc) => {
+                        blocks.push(json!({ "type": "document", "source": map_document(doc) }));
+                    }
                     UserContent::ToolResult { .. } => {}
                 }
             }
@@ -538,6 +550,18 @@ fn map_tool_result_part(part: &ToolResultPart) -> Value {
     match part {
         ToolResultPart::Text(t) => json!({ "type": "text", "text": t }),
         ToolResultPart::Image(img) => json!({ "type": "image", "source": map_image(img) }),
+    }
+}
+
+fn map_document(doc: &Document) -> Value {
+    match doc {
+        Document::Url { url } => json!({ "type": "url", "url": &**url }),
+        Document::Base64 { media_type, data } => {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+            json!({ "type": "base64", "media_type": &**media_type, "data": b64 })
+        }
+        Document::FileId { file_id } => json!({ "type": "file", "file_id": &**file_id }),
     }
 }
 

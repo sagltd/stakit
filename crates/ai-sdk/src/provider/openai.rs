@@ -9,7 +9,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::message::{AssistantContent, Image, Message, ToolResultPart, UserContent};
+use crate::message::{AssistantContent, Document, Image, Message, ToolResultPart, UserContent};
 use crate::provider::http::{
     HttpConfig, api_error, ensure_success, http_client_builders, pick_model, send, wire_count,
 };
@@ -220,6 +220,9 @@ fn build_body(model: &str, req: &ChatRequest, stream: bool) -> Value {
     if !req.tools.is_empty() {
         body.insert("tools".into(), json!(map_tools(&req.tools)));
         body.insert("tool_choice".into(), map_tool_choice(&req.tool_choice));
+        if let Some(parallel) = req.parallel_tool_calls {
+            body.insert("parallel_tool_calls".into(), json!(parallel));
+        }
     }
     if let Some(temp) = req.temperature.filter(|_| capabilities.sampling_params) {
         body.insert("temperature".into(), json!(temp));
@@ -267,10 +270,12 @@ fn map_user_parts(parts: &[UserContent], out: &mut Vec<Value>) {
             }));
         }
     }
-    // Check if there are any images in this user turn.
-    let has_images = parts.iter().any(|p| matches!(p, UserContent::Image(_)));
-    if has_images {
-        // Emit a multi-part content array combining text and images.
+    // Images and documents need a multi-part content array.
+    let multipart = parts
+        .iter()
+        .any(|p| matches!(p, UserContent::Image(_) | UserContent::Document(_)));
+    if multipart {
+        // Emit a multi-part content array combining text, images and files.
         let mut content_parts: Vec<Value> = Vec::new();
         for p in parts {
             match p {
@@ -280,6 +285,7 @@ fn map_user_parts(parts: &[UserContent], out: &mut Vec<Value>) {
                 UserContent::Image(img) => {
                     content_parts.push(map_image_block(img));
                 }
+                UserContent::Document(doc) => content_parts.push(map_document_part(doc)),
                 UserContent::ToolResult { .. } => {}
             }
         }
@@ -297,6 +303,33 @@ fn map_user_parts(parts: &[UserContent], out: &mut Vec<Value>) {
             .join("\n");
         if !text.is_empty() {
             out.push(json!({ "role": "user", "content": text }));
+        }
+    }
+}
+
+/// Maps a [`Document`] to an `OpenAI` `file` content part. Chat Completions
+/// has no URL form, so a URL document degrades to its address as text.
+fn map_document_part(doc: &Document) -> Value {
+    match doc {
+        Document::Url { url } => json!({ "type": "text", "text": &**url }),
+        Document::FileId { file_id } => {
+            json!({ "type": "file", "file": { "file_id": &**file_id } })
+        }
+        Document::Base64 { media_type, data } => {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+            let filename = if &**media_type == "application/pdf" {
+                "document.pdf"
+            } else {
+                "document"
+            };
+            json!({
+                "type": "file",
+                "file": {
+                    "filename": filename,
+                    "file_data": format!("data:{};base64,{b64}", &**media_type),
+                },
+            })
         }
     }
 }

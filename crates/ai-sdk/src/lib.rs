@@ -43,7 +43,7 @@ pub use loop_event::{
 };
 pub use mcp::{McpConfig, McpServer, McpTool, McpToolSet, McpTransport};
 pub use message::{
-    AssistantContent, Image, Message, SystemPrompt, Thinking, ToolResultPart, UserContent,
+    AssistantContent, Document, Image, Message, SystemPrompt, Thinking, ToolResultPart, UserContent,
 };
 pub use middleware::AgentMiddleware;
 pub use provider::{
