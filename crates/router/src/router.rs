@@ -63,7 +63,7 @@ where
     /// The shared global context, for work that runs beside the router
     /// (background jobs) with the same state the actions see.
     #[must_use]
-    pub fn app(&self) -> &Arc<G> {
+    pub const fn app(&self) -> &Arc<G> {
         &self.app
     }
 

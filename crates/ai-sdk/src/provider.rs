@@ -171,6 +171,11 @@ pub struct ChatRequest {
     /// still depend on provider capacity and prefix matching. `None` uses the
     /// provider's default routing and accounting scope.
     pub cache_key: Option<Arc<str>>,
+    /// Whether the model may call several tools in one turn. `None` keeps the
+    /// provider default (parallel). `Some(false)` maps to Anthropic's
+    /// `tool_choice.disable_parallel_tool_use` and `OpenAI`'s
+    /// `parallel_tool_calls: false`.
+    pub parallel_tool_calls: Option<bool>,
     /// Raw per-provider passthrough merged into the request body.
     pub extra: serde_json::Map<String, Value>,
 }
@@ -200,6 +205,7 @@ impl ChatRequest {
             thinking: ThinkingConfig::Off,
             cache: CacheStrategy::Auto,
             cache_key: None,
+            parallel_tool_calls: None,
             extra: serde_json::Map::new(),
         }
     }

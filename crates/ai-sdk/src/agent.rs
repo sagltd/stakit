@@ -1015,6 +1015,7 @@ impl<Ctx: Send + Sync + 'static> Agent<Ctx> {
             thinking: crate::provider::ThinkingConfig::Off,
             cache: self.cache.clone(),
             cache_key,
+            parallel_tool_calls: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -1448,7 +1449,7 @@ fn message_bytes(message: &Message) -> usize {
                         ToolResultPart::Image(_) => 0,
                     })
                     .sum(),
-                UserContent::Image(_) => 0,
+                UserContent::Image(_) | UserContent::Document(_) => 0,
             })
             .sum(),
         Message::Assistant(blocks) => blocks

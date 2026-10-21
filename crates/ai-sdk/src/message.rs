@@ -55,6 +55,9 @@ pub enum UserContent {
     Text(Arc<str>),
     /// An image input.
     Image(Image),
+    /// A document input (PDF or other file), as Anthropic `document` blocks
+    /// and `OpenAI` `file` content parts.
+    Document(Document),
     /// The result of a tool call, referencing the originating [`AssistantContent::ToolUse`] by `id`.
     ToolResult {
         /// Correlates with the `id` of the assistant `ToolUse` block.
@@ -138,6 +141,33 @@ pub enum Image {
     },
 }
 
+/// A provider-neutral document (PDF, plain text, …) reference inside a message.
+///
+/// Anthropic sends it as a `document` block; `OpenAI` Chat Completions as a
+/// `file` content part. `OpenAI` has no URL form, so [`Document::Url`] is for
+/// Anthropic only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Document {
+    /// A public URL the provider fetches (Anthropic only).
+    Url {
+        /// The document URL.
+        url: Arc<str>,
+    },
+    /// An id from a provider Files API.
+    FileId {
+        /// The file identifier.
+        file_id: Arc<str>,
+    },
+    /// Inline bytes.
+    Base64 {
+        /// MIME type, e.g. `application/pdf`.
+        media_type: Arc<str>,
+        /// Raw bytes (cheap to clone).
+        data: Bytes,
+    },
+}
+
 /// The request-level system prompt, with an optional cache breakpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemPrompt {
@@ -199,6 +229,18 @@ mod tests {
         let json = serde_json::to_value(&img).unwrap();
         let back: Image = serde_json::from_value(json).unwrap();
         assert!(matches!(back, Image::Base64 { .. }));
+    }
+
+    #[test]
+    fn document_base64_roundtrips() {
+        let doc = Document::Base64 {
+            media_type: "application/pdf".into(),
+            data: bytes::Bytes::from_static(b"%PDF"),
+        };
+        let json = serde_json::to_value(&doc).unwrap();
+        assert_eq!(json["type"], "base64");
+        let back: Document = serde_json::from_value(json).unwrap();
+        assert_eq!(back, doc);
     }
 
     #[test]
