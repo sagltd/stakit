@@ -737,7 +737,9 @@ fn emit_insertable(name: &Ident, table: &str, columns: &[ColumnModel]) -> proc_m
 
     quote! {
         #[doc = concat!("Insert companion for [`", stringify!(#name), "`]: defaulted columns are `Option` (omit to use the DB default).")]
-        #[allow(missing_docs)]
+        // Mirrors the row struct's field names, so a row whose columns share a suffix
+        // (`*_id`) would trip this lint in code the user cannot annotate.
+        #[allow(missing_docs, clippy::struct_field_names)]
         pub struct #new_ident {
             #(#new_fields,)*
         }
