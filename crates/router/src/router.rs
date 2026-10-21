@@ -60,6 +60,13 @@ where
     G: Send + Sync + 'static,
     R: Send + Sync + 'static,
 {
+    /// The shared global context, for work that runs beside the router
+    /// (background jobs) with the same state the actions see.
+    #[must_use]
+    pub fn app(&self) -> &Arc<G> {
+        &self.app
+    }
+
     /// Starts building a router.
     #[must_use]
     pub fn builder() -> Builder<G, R> {
