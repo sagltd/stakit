@@ -74,6 +74,12 @@ impl SqlWriter {
         }
     }
 
+    /// The active backend name, as supplied by its dialect.
+    #[must_use]
+    pub fn dialect_name(&self) -> &'static str {
+        self.dialect.name()
+    }
+
     /// Whether this backend supports `PostGIS` spatial SQL (`ST_*` functions and
     /// the `<->` KNN operator). Only Postgres (with the extension) does.
     #[must_use]

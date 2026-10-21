@@ -41,6 +41,22 @@ pub enum Operand {
     },
     /// A backend-neutral value bound as a placeholder.
     Value(Value),
+    /// Incoming column in an upsert (`excluded.col` or `MySQL` `values(col)`).
+    Excluded {
+        /// Column name.
+        name: &'static str,
+    },
+    /// A searched CASE expression with an explicit ELSE branch.
+    Case {
+        /// Condition.
+        condition: Box<Predicate>,
+        /// True branch.
+        then_value: Box<Self>,
+        /// False branch.
+        else_value: Box<Self>,
+    },
+    /// `PostgreSQL` database transaction timestamp, optionally minus bound seconds.
+    DatabaseNow(Option<i64>),
     /// `(lhs <op> rhs)` — numeric arithmetic, built with [`add`] / [`sub`].
     Arith {
         /// Left operand.
@@ -56,6 +72,43 @@ impl Operand {
     pub(crate) fn write_into(self, writer: &mut SqlWriter) -> Result<(), IdentError> {
         match self {
             Self::Column { table, name } => writer.push_qualified(table, name),
+            Self::Excluded { name } => {
+                if writer.upsert_on_duplicate_key() {
+                    writer.push("values(");
+                    writer.push_ident(name)?;
+                    writer.push(")");
+                } else {
+                    writer.push("excluded.");
+                    writer.push_ident(name)?;
+                }
+                Ok(())
+            }
+            Self::Case {
+                condition,
+                then_value,
+                else_value,
+            } => {
+                writer.push("case when ");
+                condition.write(writer)?;
+                writer.push(" then ");
+                then_value.write_into(writer)?;
+                writer.push(" else ");
+                else_value.write_into(writer)?;
+                writer.push(" end");
+                Ok(())
+            }
+            Self::DatabaseNow(seconds) => {
+                if writer.dialect_name() != "postgres" {
+                    writer.mark_unsupported("database timestamp expressions (Postgres only)");
+                }
+                writer.push("now()");
+                if let Some(seconds) = seconds {
+                    writer.push(" - (");
+                    writer.push_bind(Value::I64(seconds));
+                    writer.push("::bigint * interval '1 second')");
+                }
+                Ok(())
+            }
             Self::Value(value) => {
                 writer.push_bind(value);
                 Ok(())
@@ -70,6 +123,74 @@ impl Operand {
             }
         }
     }
+}
+
+/// A typed scalar SQL expression. Values are bound, and references come from columns.
+pub struct Scalar<Ty> {
+    operand: Operand,
+    marker: core::marker::PhantomData<fn() -> Ty>,
+}
+
+impl<Ty> IntoExpr<Ty> for Scalar<Ty> {
+    fn into_operand(self) -> Operand {
+        self.operand
+    }
+}
+
+fn scalar<Ty>(operand: Operand) -> Scalar<Ty> {
+    Scalar {
+        operand,
+        marker: core::marker::PhantomData,
+    }
+}
+
+/// Explicitly reference the stored row (qualified by its table).
+#[must_use]
+pub const fn stored<T, Ty>(column: Col<T, Ty>) -> Col<T, Ty> {
+    column
+}
+
+/// Reference the incoming row in an upsert assignment. `MySQL` uses `values(col)`.
+#[must_use]
+pub fn excluded<T, Ty>(column: Col<T, Ty>) -> Scalar<Ty> {
+    scalar(Operand::Excluded { name: column.name })
+}
+
+/// A searched `CASE WHEN condition THEN then_value ELSE else_value END`.
+/// Both branches must have the same column type; nested cases are supported.
+///
+/// ```compile_fail
+/// use stakit_orm::prelude::*;
+/// let invalid = case_when::<i32, _, _>(raw_pred("true"), 1_i32, "wrong type");
+/// ```
+pub fn case_when<Ty, A: IntoExpr<Ty>, B: IntoExpr<Ty>>(
+    condition: Predicate,
+    then_value: A,
+    else_value: B,
+) -> Scalar<Ty> {
+    scalar(Operand::Case {
+        condition: Box::new(condition),
+        then_value: Box::new(then_value.into_operand()),
+        else_value: Box::new(else_value.into_operand()),
+    })
+}
+
+/// `PostgreSQL` transaction time (`now()`), never the application clock.
+/// Other backends return `Error::Unsupported` when the statement is built.
+#[must_use]
+pub fn db_now() -> Scalar<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>> {
+    scalar(Operand::DatabaseNow(None))
+}
+
+/// `PostgreSQL` transaction time minus a bound number of seconds.
+///
+/// Negative seconds move the cutoff into the future. Other backends return
+/// `Error::Unsupported`; the interval is never interpolated into SQL.
+#[must_use]
+pub fn db_now_minus_seconds(
+    seconds: i64,
+) -> Scalar<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>> {
+    scalar(Operand::DatabaseNow(Some(seconds)))
 }
 
 /// Column types that support `+` / `-` in SQL expressions.
