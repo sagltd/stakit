@@ -10,6 +10,8 @@
 //! `rmcp` crate, or a custom one) plugs in; [`McpToolSet`] adapts a connected
 //! transport's tools into the registry.
 
+pub(crate) mod http;
+
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -144,6 +146,12 @@ pub struct McpTool {
     pub description: String,
     /// JSON Schema for the tool's arguments.
     pub input_schema: Value,
+    /// The server declared the tool read-only (`readOnlyHint`); false when
+    /// it did not say.
+    pub read_only: bool,
+    /// The server's `destructiveHint`; true when it did not say (assume the
+    /// worst).
+    pub destructive: bool,
 }
 
 /// A connected MCP client. Implement this over any MCP transport (`rmcp`, a
@@ -285,6 +293,8 @@ mod tests {
                     name: "search".into(),
                     description: "search the web".into(),
                     input_schema: json!({ "type": "object" }),
+                    read_only: false,
+                    destructive: true,
                 }])
             })
         }

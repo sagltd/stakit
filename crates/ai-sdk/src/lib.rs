@@ -41,6 +41,10 @@ pub use llm::{Extraction, ExtractionError, LLM};
 pub use loop_event::{
     AgentEvent, Finish, Outcome, PendingToolCall, Step, StopCond, ToolCallRecord, ToolOutcome,
 };
+pub use mcp::http::{
+    MAX_RESPONSE_BYTES as MCP_MAX_RESPONSE_BYTES, McpHttp, McpHttpClient, McpHttpRequest,
+    McpHttpResponse,
+};
 pub use mcp::{McpConfig, McpServer, McpTool, McpToolSet, McpTransport};
 pub use message::{
     AssistantContent, Document, Image, Message, SystemPrompt, Thinking, ToolResultPart, UserContent,
