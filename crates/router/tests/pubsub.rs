@@ -610,3 +610,28 @@ fn reserved_channel_names_are_refused() {
     }
     let _ = Router::<App, Req>::builder().ctx(App).channel::<Fake>();
 }
+
+#[tokio::test]
+async fn hub_call_device_reaches_the_device_without_a_cx() {
+    let router = router();
+    let (device, mut device_out) = authed(&router, "alice/desk-1").await;
+    let hub = router.hub().clone();
+    let call = tokio::spawn(async move { hub.call_device::<Locate>("alice", "desk-1", ()).await });
+
+    let frame = next_frame(&mut device_out).await;
+    assert_eq!(frame["name"], "locate");
+    device.handle(&json!({ "kind": "client_result", "id": frame["id"], "data": "desk" }));
+    assert_eq!(call.await.unwrap().unwrap(), "desk");
+}
+
+#[tokio::test]
+async fn hub_call_device_never_reaches_another_users_device() {
+    let router = router();
+    let (_device, _out) = authed(&router, "alice/desk-1").await;
+    let error = router
+        .hub()
+        .call_device::<Locate>("mallory", "desk-1", ())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, 404);
+}

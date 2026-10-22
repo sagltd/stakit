@@ -150,7 +150,7 @@ impl<G, R> Cx<G, R> {
 }
 
 /// Encodes typed params, runs the JSON-level `call`, decodes the typed reply.
-async fn typed_call<C, F, Fut>(params: C::Params, call: F) -> Result<C::Return, Error>
+pub(crate) async fn typed_call<C, F, Fut>(params: C::Params, call: F) -> Result<C::Return, Error>
 where
     C: ClientAction,
     F: FnOnce(Value) -> Fut,
