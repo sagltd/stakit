@@ -25,11 +25,25 @@ async fn setup() -> (postgresql_embedded::PostgreSQL, sqlx::PgPool) {
     (postgres, pool)
 }
 
+/// The guarded `create role` `diff::create_role_sql` emits for `app_user`: a
+/// no-op when the role already exists.
+const CREATE_APP_USER: &str = "do $role$
+begin
+    if exists (select from pg_roles where rolname = 'app_user') then
+        raise notice 'role % already exists, keeping its attributes', 'app_user';
+    else
+        create role \"app_user\" login;
+    end if;
+exception when insufficient_privilege then
+    raise exception 'role % does not exist and this role may not create it (%): create it first', 'app_user', sqlerrm;
+end
+$role$;";
+
 /// The forward (up) migration `stakit-orm-cli` generates for the RLS schema below.
 /// Roles first, then the table object (table → grant → enable rls → policies), each a
 /// separate statement — mirrors `diff::create_role_sql` + `diff::create_object_sql`.
 const UP: &[&str] = &[
-    r#"create role "app_user" login;"#,
+    CREATE_APP_USER,
     "create table \"posts\" (\n    \"id\" bigint not null,\n    \"author_id\" text not null,\n    \"title\" text not null,\n    primary key (\"id\")\n);",
     r#"grant select, insert on "posts" to "app_user";"#,
     r#"alter table "posts" enable row level security;"#,
@@ -203,5 +217,55 @@ async fn tx_set_config_sets_transaction_scoped_rls_context() {
     .await
     .expect("read after");
 
+    postgres.stop().await.ok();
+}
+
+#[tokio::test]
+async fn generated_create_role_keeps_a_role_provisioned_out_of_band() {
+    let (postgres, pool) = setup().await;
+    // A managed Postgres creates the login role itself, and its migration role
+    // has no CREATEROLE.
+    embedded_pg::run(
+        &pool,
+        &[
+            r#"create role "app_user" login;"#,
+            r#"create role "migrator" nocreaterole;"#,
+        ],
+    )
+    .await;
+    let mut conn = pool.acquire().await.expect("acquire connection");
+    sqlx::query(r#"set role "migrator""#)
+        .execute(&mut *conn)
+        .await
+        .expect("set role migrator");
+
+    sqlx::query(CREATE_APP_USER)
+        .execute(&mut *conn)
+        .await
+        .expect("an existing role is kept");
+
+    sqlx::query("reset role")
+        .execute(&mut *conn)
+        .await
+        .expect("reset role");
+    sqlx::query(r#"drop role "app_user""#)
+        .execute(&mut *conn)
+        .await
+        .expect("drop app_user");
+    sqlx::query(r#"set role "migrator""#)
+        .execute(&mut *conn)
+        .await
+        .expect("set role migrator");
+    let missing = sqlx::query(CREATE_APP_USER)
+        .execute(&mut *conn)
+        .await
+        .expect_err("a missing role needs CREATEROLE");
+    assert!(missing.to_string().contains("create it first"), "{missing}");
+
+    sqlx::query("reset role")
+        .execute(&mut *conn)
+        .await
+        .expect("reset role");
+    drop(conn);
     postgres.stop().await.ok();
 }
