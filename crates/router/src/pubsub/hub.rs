@@ -321,6 +321,30 @@ impl Hub {
             .await
     }
 
+    /// Typed form of the device call for background jobs (no `Cx`): runs client
+    /// action `C` on the connection holding `user`'s `device`, awaiting its reply.
+    /// A device is addressed by `(user, device)`, so it can never reach another
+    /// user's connection. Errors as [`Cx::client_call_device`](crate::Cx::client_call_device).
+    ///
+    /// # Errors
+    /// `404` when no connection holds the device (and the broker knows it), `504`
+    /// on timeout or an unknowing broker, the device's own error, or a reply that
+    /// fails to deserialize.
+    pub async fn call_device<C>(
+        &self,
+        user: &str,
+        device: &str,
+        params: C::Params,
+    ) -> Result<C::Return, Error>
+    where
+        C: ClientAction,
+    {
+        crate::cx::typed_call::<C, _, _>(params, |params| {
+            self.client_call_device(user, device, C::NAME, params)
+        })
+        .await
+    }
+
     /// Hands `payload` to the broker without waiting (best effort).
     fn broadcast(&self, topic: String, payload: Bytes) {
         let broker = Arc::clone(&self.inner.broker);
