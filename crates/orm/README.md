@@ -448,7 +448,7 @@ struct Post {
 `cargo stakit-orm gen add_posts_rls` emits:
 
 ```sql
-create role "app_user" login;
+do $role$ begin if exists (select from pg_roles where rolname = 'app_user') then ... else create role "app_user" login; end if; ... $role$;
 create table "posts" ( ... );
 grant select, insert, update, delete on "posts" to "app_user";
 alter table "posts" enable row level security;
@@ -493,8 +493,11 @@ with a quoted/validated role name when a policy keys on the role rather than a G
   as the table owner the policies won't apply. Add `force_rls` to subject the owner too,
   and have the app connect as a non-owner role (e.g. `app_user`).
 - **Roles are cluster-global, not per-database.** `create role "app_user"` affects the
-  whole Postgres cluster — generating the same role from two databases in one cluster will
-  collide, and `drop role` fails while the role owns objects elsewhere. For shared
+  whole Postgres cluster. The generated `create role` is guarded: when the role already
+  exists (created by an operator, a managed Postgres, or another database) it is kept with
+  its attributes unchanged and a `NOTICE`, so a migration role without `CREATEROLE` works
+  once the role is provisioned, and two databases may declare the same role. `drop role`
+  (the down migration) still fails while the role holds privileges elsewhere. For shared
   clusters, manage roles out of band and reference them (a `gen`-time warning fires if a
   grant/policy names a role you didn't declare).
 - Dropping a policy or removing `rls`/`force_rls` **widens access** — `gen` prints a

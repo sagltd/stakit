@@ -556,24 +556,54 @@ fn privilege_list(privileges: &[Privilege]) -> String {
         .join(", ")
 }
 
+/// Quote a SQL string literal (single-quote, doubling embedded quotes).
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// A dollar-quote tag (`$role$`, `$role_$`, …) that does not occur in `body`.
+fn dollar_tag(body: &str) -> String {
+    let mut tag = "$role$".to_owned();
+    while body.contains(&tag) {
+        tag.insert(tag.len() - 1, '_');
+    }
+    tag
+}
+
+/// `CREATE ROLE`, guarded so it is a no-op when the role already exists.
+///
+/// Roles are cluster-global and often provisioned out of band (a managed
+/// Postgres creates the login user, and the migration role may lack
+/// `CREATEROLE`), so an existing role is kept as is (its attributes are not
+/// changed) with a `NOTICE`. When the role is missing and the migration role
+/// may not create it, the error says to create it first.
 fn create_role_sql(role: &Role) -> String {
-    let mut sql = format!("create role {}", quote(&role.name));
+    let mut create = format!("create role {}", quote(&role.name));
     // Only positive attributes are emitted; `CREATE ROLE` already defaults to
     // NOLOGIN/NOCREATEDB/NOCREATEROLE/NOBYPASSRLS.
     if role.login {
-        sql.push_str(" login");
+        create.push_str(" login");
     }
     if role.createdb {
-        sql.push_str(" createdb");
+        create.push_str(" createdb");
     }
     if role.createrole {
-        sql.push_str(" createrole");
+        create.push_str(" createrole");
     }
     if role.bypassrls {
-        sql.push_str(" bypassrls");
+        create.push_str(" bypassrls");
     }
-    sql.push(';');
-    sql
+    let name = quote_literal(&role.name);
+    let body = format!(
+        "\nbegin\n    if exists (select from pg_roles where rolname = {name}) then\n        \
+         raise notice 'role % already exists, keeping its attributes', {name};\n    \
+         else\n        {create};\n    end if;\n\
+         exception when insufficient_privilege then\n    \
+         raise exception 'role % does not exist and this role may not create it (%): create it first', {name}, sqlerrm;\n\
+         end\n"
+    );
+    let tag = dollar_tag(&body);
+    format!("do {tag}{body}{tag};")
 }
 
 /// `ALTER ROLE` spelling every attribute explicitly (positive or negative) so the
@@ -1244,9 +1274,10 @@ mod tests {
         app.bypassrls = true;
         let new = schema_with(Vec::new(), vec![app]);
         let changes = diff(&Schema::default(), &new, &mut NeverRename);
-        assert_eq!(
-            up_sql(&changes),
-            r#"create role "app_user" login bypassrls;"#
+        let up = up_sql(&changes);
+        assert!(
+            up.contains("        create role \"app_user\" login bypassrls;\n"),
+            "got: {up}"
         );
         assert_eq!(down_sql(&changes), r#"drop role "app_user";"#);
     }
@@ -1255,7 +1286,42 @@ mod tests {
     fn role_with_no_attributes_is_plain_create() {
         let new = schema_with(Vec::new(), vec![role("readonly")]);
         let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
-        assert_eq!(up, r#"create role "readonly";"#);
+        assert!(
+            up.contains("        create role \"readonly\";\n"),
+            "got: {up}"
+        );
+    }
+
+    #[test]
+    fn create_role_is_skipped_when_the_role_already_exists() {
+        // Managed Postgres provisions the login role out of band, and the
+        // migration role may lack CREATEROLE: an existing role is kept.
+        let new = schema_with(Vec::new(), vec![role("app_user")]);
+        let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
+        assert_eq!(
+            up,
+            "do $role$\n\
+             begin\n    \
+             if exists (select from pg_roles where rolname = 'app_user') then\n        \
+             raise notice 'role % already exists, keeping its attributes', 'app_user';\n    \
+             else\n        \
+             create role \"app_user\";\n    \
+             end if;\n\
+             exception when insufficient_privilege then\n    \
+             raise exception 'role % does not exist and this role may not create it (%): \
+             create it first', 'app_user', sqlerrm;\n\
+             end\n$role$;"
+        );
+    }
+
+    #[test]
+    fn create_role_quotes_the_name_as_a_literal_and_avoids_its_dollar_tag() {
+        let new = schema_with(Vec::new(), vec![role("o'neil$role$")]);
+        let up = up_sql(&diff(&Schema::default(), &new, &mut NeverRename));
+        assert!(up.starts_with("do $role_$\n"), "got: {up}");
+        assert!(up.ends_with("$role_$;"), "got: {up}");
+        assert!(up.contains("rolname = 'o''neil$role$'"), "got: {up}");
+        assert!(up.contains(r#"create role "o'neil$role$";"#), "got: {up}");
     }
 
     #[test]
