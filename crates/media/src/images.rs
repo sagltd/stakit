@@ -19,8 +19,9 @@ pub struct Thumbnail {
     pub blurhash: String,
 }
 
-/// Cap on decoded pixels (a 50-megapixel photo is fine; a decompression bomb is not).
-const MAX_PIXELS: u64 = 100_000_000;
+/// Cap on decoded pixels, checked from the header before any decoding (a 40-megapixel
+/// photo is ~160 MB of RGBA; a decompression bomb is refused).
+const MAX_PIXELS: u64 = 40_000_000;
 
 fn decode(bytes: &[u8]) -> Result<DynamicImage, MediaError> {
     let reader = ImageReader::new(Cursor::new(bytes))
@@ -175,5 +176,19 @@ mod tests {
     #[test]
     fn sanitize_rejects_garbage() {
         assert!(sanitize(b"GIF89a-not-really").is_err());
+    }
+
+    #[test]
+    fn an_oversize_image_is_rejected_before_decoding() {
+        let flat = DynamicImage::ImageLuma8(image::GrayImage::new(7000, 6000));
+        let mut out = Vec::new();
+        flat.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("encode");
+        for error in [
+            sanitize(&out).expect_err("sanitize").to_string(),
+            thumbnail(&out, 320).expect_err("thumbnail").to_string(),
+        ] {
+            assert!(error.contains("too large"), "{error}");
+        }
     }
 }
