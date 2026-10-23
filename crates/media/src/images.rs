@@ -73,6 +73,48 @@ pub fn thumbnail(bytes: &[u8], max_edge: u32) -> Result<Thumbnail, MediaError> {
     })
 }
 
+/// A re-encoded, metadata-free copy of a picture.
+#[derive(Debug, Clone)]
+pub struct Sanitized {
+    /// The encoded bytes: JPEG, or PNG when any pixel is transparent.
+    pub bytes: Vec<u8>,
+    /// `image/jpeg` or `image/png`.
+    pub mime: &'static str,
+}
+
+/// JPEG quality of a sanitized photo.
+const SANITIZE_JPEG_QUALITY: u8 = 90;
+
+/// Decode `bytes` (JPEG, PNG, GIF or WebP), apply its EXIF orientation and re-encode
+/// it from pixels alone, so no EXIF, XMP, IPTC, GPS, ICC or text chunk survives.
+/// Opaque images become JPEG, images with transparency stay PNG. Animated inputs
+/// keep only their first frame.
+///
+/// # Errors
+/// [`MediaError::Image`] when the bytes are not a decodable image (never passed through).
+pub fn sanitize(bytes: &[u8]) -> Result<Sanitized, MediaError> {
+    let image = decode(bytes)?;
+    let mut out = Vec::new();
+    if image.color().has_alpha() && image.to_rgba8().pixels().any(|pixel| pixel.0[3] < 255) {
+        image
+            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .map_err(|error| MediaError::Image(error.to_string()))?;
+        return Ok(Sanitized {
+            bytes: out,
+            mime: "image/png",
+        });
+    }
+    let encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, SANITIZE_JPEG_QUALITY);
+    DynamicImage::ImageRgb8(image.to_rgb8())
+        .write_with_encoder(encoder)
+        .map_err(|error| MediaError::Image(error.to_string()))?;
+    Ok(Sanitized {
+        bytes: out,
+        mime: "image/jpeg",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +149,31 @@ mod tests {
     #[test]
     fn garbage_is_an_error_not_a_panic() {
         assert!(thumbnail(b"not an image", 320).is_err());
+    }
+
+    #[test]
+    fn sanitize_turns_an_opaque_image_into_a_clean_jpeg() {
+        let clean = sanitize(&png(40, 20)).expect("sanitize");
+        assert_eq!(clean.mime, "image/jpeg");
+        assert_eq!(&clean.bytes[..3], &[0xFF, 0xD8, 0xFF]);
+    }
+
+    #[test]
+    fn sanitize_keeps_transparency_as_png() {
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([1, 2, 3, 0]),
+        ));
+        let mut out = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("encode");
+        assert_eq!(sanitize(&out).expect("sanitize").mime, "image/png");
+    }
+
+    #[test]
+    fn sanitize_rejects_garbage() {
+        assert!(sanitize(b"GIF89a-not-really").is_err());
     }
 }
