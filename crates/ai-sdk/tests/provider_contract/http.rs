@@ -1,15 +1,11 @@
 //! One bounded loopback HTTP exchange, shared by adapter contract probes.
 use serde_json::Value;
-use std::{
-    io::Write,
-    net::TcpListener,
-    sync::mpsc,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{io::Write, net::TcpListener, sync::mpsc, thread, time::Duration};
 
 #[path = "../support/http_request.rs"]
 mod http_request;
+#[path = "../support/http_socket.rs"]
+mod http_socket;
 use http_request::read_request;
 
 pub(super) struct HttpFixture {
@@ -40,28 +36,7 @@ pub(super) fn http(status: u16, content_type: &str, body: Vec<u8>) -> HttpFixtur
     );
     let (sender, received) = mpsc::channel();
     let task = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut socket = loop {
-            match listener.accept() {
-                Ok((socket, _)) => break socket,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
-                {
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(_) => return,
-            }
-        };
-        socket
-            .set_nonblocking(false)
-            .expect("blocking accepted socket");
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("read deadline");
-        socket
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .expect("write deadline");
+        let mut socket = http_socket::accept(&listener);
         let (bytes, header_end) = read_request(&mut socket, 1024 * 1024);
         let request = serde_json::from_slice(&bytes[header_end..]).expect("request JSON");
         sender.send(request).expect("request receiver");

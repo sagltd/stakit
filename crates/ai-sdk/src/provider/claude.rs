@@ -15,11 +15,12 @@ use crate::message::{
     AssistantContent, Document, Image, Message, Thinking, ToolResultPart, UserContent,
 };
 use crate::provider::http::{
-    HttpConfig, api_error, ensure_success, http_client_builders, pick_model, send, wire_count,
+    HttpConfig, ensure_success, http_client_builders, pick_model, read_response_json, send,
+    wire_count,
 };
 use crate::provider::{
     ChatRequest, ChatResponse, EventStream, Provider, ProviderCapabilities, StopReason,
-    ThinkingConfig, ToolChoice, ToolDef, parse_retry_after,
+    ThinkingConfig, ToolChoice, ToolDef,
 };
 use crate::usage::Usage;
 use crate::{ProviderError, SystemPrompt};
@@ -135,20 +136,11 @@ impl Provider for ClaudeModel {
             request.fit_to(&rules_for(&model).capabilities);
             request.validate_cache(&self.cache_capabilities_for(&model))?;
             let body = build_body(&model, &request, false);
-            let resp = self.send(&body).await?;
-            let status = resp.status();
-            let retry_after = parse_retry_after(resp.headers());
-            let text = resp
-                .text()
-                .await
-                .map_err(|e| ProviderError::Transport(e.to_string()))?;
-            if !status.is_success() {
-                return Err(api_error(status.as_u16(), &text, retry_after));
-            }
-            let value: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Decode {
-                err: e.to_string(),
-                body: text.clone(),
-            })?;
+            let value = read_response_json(
+                self.send(&body).await?,
+                self.client.config.response_byte_limit,
+            )
+            .await?;
             parse_response(&value)
         })
     }
@@ -162,7 +154,11 @@ impl Provider for ClaudeModel {
             request.fit_to(&rules_for(&model).capabilities);
             request.validate_cache(&self.cache_capabilities_for(&model))?;
             let body = build_body(&model, &request, true);
-            let resp = ensure_success(self.send(&body).await?).await?;
+            let resp = ensure_success(
+                self.send(&body).await?,
+                self.client.config.response_byte_limit,
+            )
+            .await?;
             Ok(sse::decode(resp.bytes_stream()))
         })
     }

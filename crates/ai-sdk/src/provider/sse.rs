@@ -3,7 +3,7 @@ use futures::{Stream, StreamExt};
 
 use crate::{EventStream, ProviderError, StreamEvent};
 
-pub(super) const MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub(super) use crate::provider::MAX_STREAM_FRAME_BYTES as MAX_FRAME_BYTES;
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Frame {
     pub(super) event: Option<String>,

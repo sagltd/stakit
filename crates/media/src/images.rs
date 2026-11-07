@@ -88,6 +88,7 @@ const SANITIZE_JPEG_QUALITY: u8 = 90;
 
 /// Decode `bytes` (JPEG, PNG, GIF or WebP), apply its EXIF orientation and re-encode
 /// it from pixels alone, so no EXIF, XMP, IPTC, GPS, ICC or text chunk survives.
+///
 /// Opaque images become JPEG, images with transparency stay PNG. Animated inputs
 /// keep only their first frame.
 ///

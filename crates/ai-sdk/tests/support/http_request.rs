@@ -2,7 +2,6 @@
 //! the provider unit tests and the adapter contract probes.
 
 use std::io::Read;
-
 /// Reads headers (at most 64 KiB) and a `Content-Length` body of at most
 /// `max_body` bytes. Returns the request bytes and where the body starts.
 pub(crate) fn read_request(socket: &mut impl Read, max_body: usize) -> (Vec<u8>, usize) {

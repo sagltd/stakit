@@ -1,10 +1,13 @@
 //! HTTP plumbing shared by the built-in Claude and `OpenAI` providers: the
 //! connection settings a client carries, request sending, and error mapping.
 
+use futures::StreamExt as _;
 use serde_json::Value;
 
 use crate::ProviderError;
-use crate::provider::{ChatRequest, parse_retry_after};
+use crate::provider::{ChatRequest, DEFAULT_RESPONSE_BYTE_LIMIT, parse_retry_after};
+
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 /// Connection settings of a built-in provider client. The API key never
 /// leaks through `{:?}`: clients format via [`HttpConfig::debug`].
@@ -14,6 +17,7 @@ pub(crate) struct HttpConfig {
     pub(crate) base_url: String,
     pub(crate) endpoint: Option<String>,
     pub(crate) http: Option<reqwest::Client>,
+    pub(crate) response_byte_limit: usize,
 }
 
 impl HttpConfig {
@@ -24,6 +28,7 @@ impl HttpConfig {
             base_url: base_url.to_owned(),
             endpoint: None,
             http: crate::provider::http_client(),
+            response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
         }
     }
 
@@ -78,6 +83,19 @@ macro_rules! http_client_builders {
             self
         }
 
+        /// Caps a successful non-streamed HTTP response body as bytes arrive.
+        /// Defaults to [`crate::DEFAULT_RESPONSE_BYTE_LIMIT`] (8 MiB). Error
+        /// bodies use the smaller of this limit and 64 KiB; oversized errors
+        /// preserve status and retry hints but omit the provider message.
+        /// A zero limit rejects any nonempty body. Successful SSE streams use
+        /// the separate `MAX_STREAM_*` payload limits, not this total-byte cap.
+        /// These limits exclude transport, allocator and parsed JSON overhead.
+        #[must_use]
+        pub const fn with_response_byte_limit(mut self, limit: usize) -> Self {
+            self.config.response_byte_limit = limit;
+            self
+        }
+
         /// Uses `http` for every request instead of the shared default client, e.g.
         /// one with a custom DNS resolver or proxy. The caller owns its retry and
         /// redirect policy.
@@ -129,18 +147,64 @@ pub(crate) fn api_error(
     }
 }
 
+/// Reads at most `limit` bytes, rejecting excess before appending the chunk.
+/// The response is dropped immediately on failure, even without EOF or length.
+pub(crate) async fn read_response_bytes(
+    resp: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, ProviderError> {
+    let mut body = Vec::new();
+    let mut chunks = resp.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|error| ProviderError::Transport(error.to_string()))?;
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(ProviderError::Decode {
+                err: format!("provider response body exceeds {limit} bytes"),
+                body: String::new(),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Passes a successful response through; turns a 4xx/5xx into
 /// [`ProviderError::Api`] (used before decoding a stream).
 pub(crate) async fn ensure_success(
     resp: reqwest::Response,
+    limit: usize,
 ) -> Result<reqwest::Response, ProviderError> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
     let retry_after = parse_retry_after(resp.headers());
-    let text = resp.text().await.unwrap_or_default();
-    Err(api_error(status.as_u16(), &text, retry_after))
+    let body = read_response_bytes(resp, limit.min(MAX_ERROR_BODY_BYTES))
+        .await
+        .unwrap_or_default();
+    Err(api_error(
+        status.as_u16(),
+        &String::from_utf8_lossy(&body),
+        retry_after,
+    ))
+}
+
+/// Validates status and decodes one bounded JSON response without retaining
+/// provider content in decoding errors.
+pub(crate) async fn read_response_json(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Value, ProviderError> {
+    let response = ensure_success(response, limit).await?;
+    let bytes = read_response_bytes(response, limit).await?;
+    serde_json::from_slice(&bytes).map_err(|error| ProviderError::Decode {
+        err: format!(
+            "invalid provider response JSON at line {} column {}",
+            error.line(),
+            error.column()
+        ),
+        body: String::new(),
+    })
 }
 
 /// The request's model id when set, else the handle's bound `model`.

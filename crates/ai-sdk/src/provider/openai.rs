@@ -11,11 +11,11 @@ use serde_json::{Map, Value, json};
 
 use crate::message::{AssistantContent, Document, Image, Message, ToolResultPart, UserContent};
 use crate::provider::http::{
-    HttpConfig, api_error, ensure_success, http_client_builders, pick_model, send, wire_count,
+    HttpConfig, api_error, ensure_success, http_client_builders, pick_model, read_response_json,
+    send, wire_count,
 };
 use crate::provider::{
     ChatRequest, ChatResponse, EventStream, Provider, StopReason, ToolChoice, ToolDef,
-    parse_retry_after,
 };
 use crate::usage::Usage;
 use crate::{CacheCapabilities, ProviderCapabilities, ProviderError, SystemPrompt};
@@ -121,29 +121,11 @@ impl Provider for OpenAiModel {
             request.validate_cache(&self.cache_capabilities_for(&model))?;
             let body = build_body(&model, &request, false);
             validate_body(&body)?;
-            let resp = self.send(&body).await?;
-            let status = resp.status();
-            let retry_after = parse_retry_after(resp.headers());
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| ProviderError::Transport(e.to_string()))?;
-            if !status.is_success() {
-                return Err(api_error(
-                    status.as_u16(),
-                    &String::from_utf8_lossy(&bytes),
-                    retry_after,
-                ));
-            }
-            let value: Value =
-                serde_json::from_slice(&bytes).map_err(|error| ProviderError::Decode {
-                    err: format!(
-                        "invalid OpenAI response JSON at line {} column {}",
-                        error.line(),
-                        error.column()
-                    ),
-                    body: String::new(),
-                })?;
+            let value = read_response_json(
+                self.send(&body).await?,
+                self.client.config.response_byte_limit,
+            )
+            .await?;
             parse_response(&value)
         })
     }
@@ -157,7 +139,11 @@ impl Provider for OpenAiModel {
             request.validate_cache(&self.cache_capabilities_for(&model))?;
             let body = build_body(&model, &request, true);
             validate_body(&body)?;
-            let resp = ensure_success(self.send(&body).await?).await?;
+            let resp = ensure_success(
+                self.send(&body).await?,
+                self.client.config.response_byte_limit,
+            )
+            .await?;
             Ok(sse::decode(resp.bytes_stream()))
         })
     }

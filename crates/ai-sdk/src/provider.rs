@@ -32,15 +32,24 @@ mod test_util;
 
 pub use capabilities::{ProviderCapabilities, ThinkingSupport};
 
+/// Default raw JSON response-body limit for the built-in HTTP providers.
+/// Configurable per client; independent of the streaming content limits below.
+pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 8 * 1024 * 1024;
+/// Maximum bytes in one SSE line or event payload for built-in providers.
+/// These are payload limits, not bounds on allocator, JSON or transport memory.
+pub const MAX_STREAM_FRAME_BYTES: usize = 1024 * 1024;
 /// Maximum bytes retained for one complete streamed assistant block.
-pub(crate) const MAX_STREAM_BLOCK_BYTES: usize = 1024 * 1024;
-/// Maximum complete assistant content retained for one response.
-pub(crate) const MAX_STREAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// Excludes allocator and parsed JSON overhead.
+pub const MAX_STREAM_BLOCK_BYTES: usize = 1024 * 1024;
+/// Maximum accumulated streamed assistant content (Claude) or tool content (`OpenAI`).
+///
+/// Excludes allocator and parsed JSON overhead. This does not cap total wire
+/// bytes or text deltas forwarded without retention.
+pub const MAX_STREAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum concurrently open provider content blocks.
-#[cfg(any(feature = "claude", feature = "openai"))]
-pub(crate) const MAX_STREAM_OPEN_BLOCKS: usize = 64;
+pub const MAX_STREAM_OPEN_BLOCKS: usize = 64;
 /// Maximum complete blocks in one response, including empty blocks.
-pub(crate) const MAX_STREAM_RESPONSE_BLOCKS: usize = 1024;
+pub const MAX_STREAM_RESPONSE_BLOCKS: usize = 1024;
 
 /// Exact content bytes retained for replay (including opaque signatures).
 pub(crate) fn assistant_content_bytes(content: &AssistantContent) -> usize {
